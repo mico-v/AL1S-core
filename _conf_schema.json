@@ -1,0 +1,18 @@
+{
+  "type": "object",
+  "properties": {
+    "enabled": {
+      "title": "是否启用插件",
+      "type": "boolean",
+      "description": "禁用后插件将不会执行命令处理。",
+      "default": true
+    },
+    "greeting": {
+      "title": "问候语",
+      "type": "string",
+      "description": "执行 /al1s 命令时返回的默认文本。",
+      "default": "AL1S Core 已连接。"
+    }
+  },
+  "required": []
+}

@@ -1,0 +1,7 @@
+name: astrbot_plugin_al1s_core
+version: v0.1.0
+display_name: AL1S-Core
+desc: AL1S Core 插件基础模板
+author: AL1S
+repo: https://github.com/mico-v/AL1S-core
+astrbot_version: ">=4.16,<5"
