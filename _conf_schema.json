@@ -1,18 +1,45 @@
 {
-  "type": "object",
-  "properties": {
-    "enabled": {
-      "title": "是否启用插件",
-      "type": "boolean",
-      "description": "禁用后插件将不会执行命令处理。",
-      "default": true
-    },
-    "greeting": {
-      "title": "问候语",
-      "type": "string",
-      "description": "执行 /al1s 命令时返回的默认文本。",
-      "default": "AL1S Core 已连接。"
-    }
+  "enable_global_markdown_killer": {
+    "description": "全局 Markdown 移除",
+    "type": "bool",
+    "default": false,
+    "hint": "开启后将清理所有最终发送文本中的 Markdown 格式（不限定 LLM 输出）。"
   },
-  "required": []
+  "enable_llm_line_split": {
+    "description": "按空行分段发送 AI 回复",
+    "type": "bool",
+    "default": false,
+    "hint": "开启后，优先按 Markdown 文章结构（标题/正文/表格）切分；若未识别到标题则按空行逐段发送。"
+  },
+  "split_chars_per_second": {
+    "description": "字数延迟系数（字数/秒）",
+    "type": "int",
+    "default": 80,
+    "hint": "用于计算延迟，值越小间隔越长，例如 80 表示 80 字约等于 1 秒。"
+  },
+  "split_interval_min_seconds": {
+    "description": "最小分段间隔（秒）",
+    "type": "float",
+    "default": 0.5,
+    "hint": "段落之间至少等待多久（秒）。"
+  },
+  "split_interval_max_seconds": {
+    "description": "最大分段间隔（秒）",
+    "type": "float",
+    "default": 3.0,
+    "hint": "段落之间最多等待多久（秒）。"
+  },
+
+  "enabled": {
+    "title": "是否启用插件",
+    "type": "bool",
+    "description": "禁用后插件将不会执行命令处理。",
+    "default": true
+  },
+  "greeting": {
+    "title": "问候语",
+    "type": "string",
+    "description": "执行 /al1s 命令时返回的默认文本。",
+    "default": "AL1S Core 已连接。"
+  }
 }
