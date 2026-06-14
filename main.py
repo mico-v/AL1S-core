@@ -1,613 +1,334 @@
 import asyncio
-import re
-import unicodedata
+import sys
+import zipfile
+from datetime import datetime
+from pathlib import Path
+import time
 
 from astrbot.api import logger
-from astrbot.api.provider import LLMResponse
+from astrbot.core import file_token_service
 from astrbot.api.event import AstrMessageEvent, filter
-from astrbot.api.star import Context, Star, register
+from astrbot.api.message_components import File
+from astrbot.api.provider import LLMResponse
+from astrbot.api.star import Context, Star, StarTools, register
+
+from al1s_config import AL1SPluginConfig
+from al1s_cache import EssenceCacheManager
+from al1s_essence import EssenceService
+from output_spec import OutputSpec
+
+PLUGIN_DIR = Path(__file__).resolve().parent
+if str(PLUGIN_DIR) not in sys.path:
+    sys.path.insert(0, str(PLUGIN_DIR))
+
+PLUGIN_VERSION = "v0.3.4"
 
 
 @register(
     "astrbot_plugin_al1s_core",
     "AL1S",
     "AL1S Core 插件，提供 Markdown 清理与 AI 空行分段输出功能。",
-    "v0.2.6",
+    PLUGIN_VERSION,
 )
 class AL1SCorePlugin(Star):
+    VERSION = PLUGIN_VERSION
+
     def __init__(self, context: Context, config: dict):
         super().__init__(context)
-        self.config = config
+        self.config = AL1SPluginConfig(config)
+        self.output_spec = OutputSpec(self.config.as_dict())
+        self.data_dir = StarTools.get_data_dir("astrbot_plugin_al1s_core")
+        self._cache = EssenceCacheManager(self.data_dir / "essence_cache")
+        self._essence = EssenceService(self.config, self._cache)
 
     async def initialize(self):
         logger.info("AL1S Core 插件已初始化。")
 
-    def _is_enabled(self) -> bool:
-        return bool(self.config.get("enabled", True))
-
-    def _clean_text(self, text: str) -> str:
-        """Remove common Markdown syntax while keeping readable text."""
-        # 移除代码块 (保留内容)
-        text = re.sub(r"```(?:[a-zA-Z0-9+\-]*\s+)?([\s\S]*?)```", r"\1", text)
-
-        # 移除行内代码 `code` -> code
-        text = re.sub(r"`([^`]+)`", r"\1", text)
-
-        # 移除图片 ![alt](url) -> alt (避免残留 !)
-        text = re.sub(r"!\[([^\]]*)\]\([^)]+\)", r"\1", text)
-
-        # 移除普通链接 [text](url) -> text
-        text = re.sub(r"\[([^\]]+)\]\([^)]+\)", r"\1", text)
-
-        # 移除粗体
-        text = re.sub(r"\*\*(.*?)\*\*", r"\1", text)
-        text = re.sub(r"__(.*?)__", r"\1", text)
-
-        # 移除斜体（保守处理，减少误伤）
-        text = re.sub(r"(?<!\*)\*(?!\s)(.*?)(?<!\s)\*(?!\*)", r"\1", text)
-        text = re.sub(r"(?<!\w)_(?!\s)(.*?)(?<!\s)_(?!\w)", r"\1", text)
-
-        # 移除删除线
-        text = re.sub(r"~~(.*?)~~", r"\1", text)
-
-        # 移除标题
-        text = re.sub(r"^(#{1,6})\s+(.*)", r"\2", text, flags=re.MULTILINE)
-
-        # 移除引用（处理嵌套）
-        text = re.sub(r"^(?:>\s*)+(.*)", r"\1", text, flags=re.MULTILINE)
-
-        # 移除列表标记（行首 -、*、+）
-        text = re.sub(r"^\s*[-*+]\s+(.*)", r"\1", text, flags=re.MULTILINE)
-
-        # 移除有序列表标记（行首 1. 2.）
-        text = re.sub(r"^\s*\d+[.)]\s+(.*)", r"\1", text, flags=re.MULTILINE)
-
-        # 移除任务列表标记（- [x]）
-        text = re.sub(r"^\s*[-*+]\s+\[[xX ]\]\s+(.*)", r"\1", text, flags=re.MULTILINE)
-
-        return text
-
-    def _is_block_divider(self, line: str) -> bool:
-        """识别只包含分隔符的行（可作为段落边界）。"""
-        if not line:
-            return False
-        stripped = line.strip()
-        return bool(
-            re.fullmatch(r"[-*`_=]{3,}", stripped)
-            or re.fullmatch(r"\|(?:\s*[-:]{3,}\s*\|?)+\s*", stripped)
-        )
-
-    def _is_markdown_heading_line(self, line: str) -> bool:
-        if not line:
-            return False
-
-        cleaned = line.strip()
-        if not cleaned:
-            return False
-
-        if re.match(r"^\s*#{1,6}\s+\S+", cleaned):
-            return True
-
-        patterns = [
-            r"^\s*[✦•·*]+\s*[第]?(?:"
-            r"[0-9]+|[一二三四五六七八九十百千万零〇两壹贰叁肆伍陆柒捌玖拾佰仟]+|[IVXLCDM]+)\s*[、。·•]\s*\S+$",
-            r"^\s*[第]?(?:"
-            r"[0-9]+|[一二三四五六七八九十百千万零〇两壹贰叁肆伍陆柒捌玖拾佰仟]+|[IVXLCDM]+)\s*[、。·•]\s*\S+$",
-            r"^\s*[✦•·*]+\s*[一二三四五六七八九十百千万零〇两壹贰叁肆伍陆柒捌玖拾佰仟]+\s*[章节回卷篇卷]\s*[：:、。·•]?\s*\S+$",
-            r"^\s*[一二三四五六七八九十百千万零〇两壹贰叁肆伍陆柒捌玖拾佰仟]+\s*[章节回卷篇卷]\s*[：:、。·•]?\s*\S+$",
-            r"^\s*[✦•*]?\s*[\u4e00-\u9fff]{1,10}\s*[·•]\s*\S+$",
-            r"^[💖💗💘💙💚💛💜🤍🖤🤎❤️🧡💝💌✦]\s*[\u4e00-\u9fffA-Za-z0-9].*?[\u4e00-\u9fffA-Za-z0-9💖💗💘💙💚💛💜🤍🖤🤎❤️🧡💝💌]$",
-            r"^\s*[✦•*]+\s*\S{2,40}\s*[：:]\s*$",
-        ]
-
-        return any(re.match(pattern, cleaned) for pattern in patterns)
-
-    def _is_list_line(self, line: str) -> bool:
-        return bool(
-            re.match(
-                r"^\s*(?:\d{1,3}[.)、]\s+|[-+*]\s+|[-+*]\s+\[[xX ]\]\s+|[-+*]\s*\|\s*|[•·]\s+)",
-                line,
-            )
-        )
-
-    def _normalize_list_line(self, line: str) -> str:
-        if not line:
-            return ""
-
-        normalized = line
-        normalized = re.sub(r"^\s*[-+*]\s+\[[xX ]\]\s+", "", normalized)
-        normalized = re.sub(r"^\s*\d{1,3}[.)、]\s+", "", normalized)
-        normalized = re.sub(r"^\s*[-+*]\s*\|\s*", "", normalized)
-        normalized = re.sub(r"^\s*[-+*]\s+", "", normalized)
-        normalized = re.sub(r"^\s*[•·]\s+", "", normalized)
-        return normalized.strip()
-
-    def _is_box_table_line(self, line: str) -> bool:
-        if not line:
-            return False
-
-        if not any(ch in line for ch in "┌┐└┘├┤┬┴┼─━│"):
-            return False
-
-        for ch in line:
-            if ch in {"\r", "\n"}:
-                return False
-            if ch.isspace():
-                continue
-            if ch in "┌┐└┘├┤┬┴┼─━│╭╮╯╰╏╎╵╷":  # 常见框线字符
-                continue
-            if ch in {
-                "┏",
-                "┓",
-                "┗",
-                "┛",
-                "╔",
-                "╗",
-                "╚",
-                "╝",
-                "╠",
-                "╣",
-                "╦",
-                "╩",
-                "╬",
-                "╭",
-                "╮",
-                "╯",
-                "╰",
-            }:
-                continue
-            if ch.isprintable():
-                continue
-            return False
-
-        return True
-
-    def _extract_box_table_lines(self, lines, start_index: int):
-        index = start_index
-        if index >= len(lines):
-            return None, start_index
-
-        table_lines = []
-        while index < len(lines):
-            raw = lines[index]
-            line = raw.rstrip("\r\n")
-            if not line:
-                break
-            if self._is_block_divider(line):
-                break
-            if not self._is_box_table_line(line):
-                break
-            table_lines.append(line)
-            index += 1
-
-        if len(table_lines) < 2:
-            return None, start_index
-
-        return table_lines, index
-
-    def _is_box_border_only_line(self, line: str) -> bool:
-        stripped = line.strip()
-        if not stripped:
-            return False
-
-        border_only_chars = set(
-            "┌┐└┘├┤┬┴┼─━╭╮╯╰╏╎╵╷╔╗╚╝╠╣╦╩╬║═"
-        )
-        for ch in stripped:
-            if ch in border_only_chars or ch.isspace():
-                continue
-            return False
-        return True
-
-    def _normalize_box_table(self, table_text: str) -> str:
-        raw_rows = [line.rstrip() for line in table_text.split("\n") if line.rstrip()]
-        if not raw_rows:
-            return table_text.strip()
-
-        normalized_rows = []
-        for line in raw_rows:
-            if self._is_box_border_only_line(line):
-                continue
-
-            has_vertical = any(ch in "│║╎╏" for ch in line)
-            pieces = []
-            for ch in line:
-                if ch in "│║╎╏":
-                    pieces.append("|")
-                    continue
-                if ch in {"┌", "┐", "└", "┘", "├", "┤", "┬", "┴", "┼", "─", "━", "╭", "╮", "╯", "╰", "╵", "╷", "╠", "╣", "╦", "╩", "╬", "╔", "╗", "╚", "╝", "═", "║"}:
-                    continue
-                pieces.append(ch)
-
-            text = "".join(pieces).strip()
-            if not text:
-                continue
-            if has_vertical:
-                text = text.strip("|").strip()
-                text = re.sub(r"\s*\|\s*", " | ", text).strip()
-            normalized_rows.append(text)
-
-        return "\n".join(normalized_rows)
-
-    def _normalize_box_table_from_text(self, text: str) -> str:
-        lines = [line.rstrip("\r") for line in text.split("\n")]
-        if not lines:
-            return text.strip()
-
-        output_lines = []
-        index = 0
-        while index < len(lines):
-            raw_line = lines[index]
-            if not raw_line.strip() or not self._is_box_table_line(raw_line):
-                output_lines.append(raw_line.rstrip())
-                index += 1
-                continue
-
-            block = []
-            while index < len(lines) and self._is_box_table_line(lines[index]):
-                block.append(lines[index].rstrip())
-                index += 1
-
-            if len(block) >= 2:
-                normalized = self._normalize_box_table("\n".join(block))
-                if normalized:
-                    output_lines.append(normalized)
-            else:
-                output_lines.extend(block)
-
-        return "\n".join(output_lines)
-
-    def _is_table_row(self, raw_line: str) -> bool:
-        line = raw_line.strip()
-        if not line:
-            return False
-        if line.count("|") < 2:
-            return False
-        return bool(re.fullmatch(r"^\s*\|(?:[^|\r\n]*\|)+\s*$", line))
-
-    def _is_table_divider_row(self, raw_line: str) -> bool:
-        line = raw_line.strip()
-        if not line:
-            return False
-        return bool(re.fullmatch(r"^\s*\|(?:\s*:?-{3,}:?\s*\|)+\s*$", line))
-
-    def _extract_table_lines(self, lines, start_index: int):
-        index = start_index
-        if index >= len(lines):
-            return None, start_index
-
-        table_lines = []
-        data_row_count = 0
-        while index < len(lines):
-            raw = lines[index]
-            line = raw.strip()
-
-            if self._is_table_divider_row(line):
-                if data_row_count > 0:
-                    index += 1
-                    continue
-                break
-
-            if not line or self._is_block_divider(line):
-                break
-
-            if not self._is_table_row(line):
-                break
-
-            table_lines.append(raw.rstrip("\r"))
-            data_row_count += 1
-            index += 1
-
-        if data_row_count < 2:
-            return None, start_index
-
-        return table_lines, index
-
-    def _parse_table_rows(self, text: str):
-        lines = [line.strip() for line in text.split("\n") if line.strip()]
-        if len(lines) < 2:
-            return []
-
-        table_rows = []
-        for idx, line in enumerate(lines):
-            if self._is_table_divider_row(line):
-                continue
-            if not self._is_table_row(line):
-                return []
-
-            cells = [cell.strip() for cell in line.strip("|").split("|")]
-            if cells:
-                table_rows.append(cells)
-
-        if len(table_rows) < 2:
-            return []
-
-        return table_rows
-
-    def _display_width(self, text: str) -> int:
-        width = 0
-        for char in text:
-            if char == "\t":
-                width += 4
-                continue
-            ea = unicodedata.east_asian_width(char)
-            if ea in {"F", "W"}:
-                width += 2
-            elif ea == "A":
-                width += 2
-            else:
-                width += 1
-        return width
-
-    def _format_table_row(self, cells, width_list):
-        pieces = []
-        for idx, cell in enumerate(cells):
-            text = (cell or "").strip()
-            pad = max(0, width_list[idx] - self._display_width(text))
-            pieces.append(f" {text}{' ' * pad} ")
-        return "|" + "|".join(pieces) + "|"
-
-    def _format_markdown_table(self, table_text: str) -> str:
-        rows = self._parse_table_rows(table_text)
-        if not rows:
-            return table_text.strip()
-
-        max_cols = max(len(r) for r in rows)
-        normalized_rows = [r + [""] * (max_cols - len(r)) for r in rows]
-        col_widths = [0] * max_cols
-
-        for row in normalized_rows:
-            for idx, cell in enumerate(row):
-                width = self._display_width((cell or "").strip())
-                if width > col_widths[idx]:
-                    col_widths[idx] = width
-
-        output_rows = []
-        for idx, row in enumerate(normalized_rows):
-            output_rows.append(self._format_table_row(row, col_widths))
-            if idx == 0 and len(normalized_rows) > 1:
-                output_rows.append(
-                    "|"
-                    + "|".join(
-                        f" {'-' * max(3, col_widths[c])} "
-                        for c in range(max_cols)
-                    )
-                    + "|"
-                )
-
-        return "\n".join(output_rows)
-
-    def _build_segments(self, text):
-        raw_lines = (text or "").replace("\r\n", "\n").split("\n")
-        has_heading = any(
-            self._is_markdown_heading_line(line) for line in raw_lines if line.strip()
-        )
-        parsed_blocks = []
-        i = 0
-
-        def add_text_block(lines) -> None:
-            block = "\n".join([ln.strip() for ln in lines if ln.strip()])
-            if block:
-                parsed_blocks.append(("text", block))
-
-        while i < len(raw_lines):
-            raw_line = raw_lines[i]
-            line = raw_line.rstrip("\r")
-
-            if not line.strip() or self._is_block_divider(line):
-                i += 1
-                continue
-
-            box_lines, box_next_index = self._extract_box_table_lines(raw_lines, i)
-            if box_lines:
-                parsed_blocks.append(("box_table", "\n".join(box_lines)))
-                i = box_next_index
-                continue
-
-            table_lines, next_index = self._extract_table_lines(raw_lines, i)
-            if table_lines:
-                parsed_blocks.append(("table", "\n".join(table_lines).strip()))
-                i = next_index
-                continue
-
-            if self._is_markdown_heading_line(line):
-                parsed_blocks.append(("heading", line.strip()))
-                i += 1
-                continue
-
-            if self._is_list_line(line):
-                list_lines = []
-                while i < len(raw_lines):
-                    current = raw_lines[i].rstrip("\r")
-                    if self._is_list_line(current):
-                        normalized = self._normalize_list_line(current)
-                        if normalized:
-                            list_lines.append(normalized)
-                        i += 1
-                    else:
-                        break
-                if list_lines:
-                    parsed_blocks.append(("text", "\n".join(list_lines)))
-                continue
-
-            paragraph_lines = []
-            while i < len(raw_lines):
-                current = raw_lines[i].rstrip("\r")
-                if not current.strip() or self._is_block_divider(current):
-                    if has_heading:
-                        i += 1
-                        continue
-                    break
-
-                table_lines, next_index = self._extract_table_lines(raw_lines, i)
-                if table_lines:
-                    break
-
-                if self._is_markdown_heading_line(current):
-                    if has_heading:
-                        break
-                if self._is_list_line(current):
-                    break
-
-                box_lines, box_next_index = self._extract_box_table_lines(raw_lines, i)
-                if box_lines:
-                    break
-
-                paragraph_lines.append(current)
-                i += 1
-
-            if paragraph_lines:
-                add_text_block(paragraph_lines)
-            else:
-                i += 1
-
-        merged = []
-        index = 0
-        while index < len(parsed_blocks):
-            block_type, block_text = parsed_blocks[index]
-
-            if has_heading and block_type == "heading":
-                heading = block_text.strip()
-                section_chunks = [heading]
-                index += 1
-                while index < len(parsed_blocks):
-                    next_type, next_text = parsed_blocks[index]
-                    if next_type == "heading":
-                        break
-                    if next_type in ("table", "box_table"):
-                        if section_chunks:
-                            merged.append({"type": "text", "text": "\n".join(section_chunks)})
-                            section_chunks = []
-                        merged.append({"type": next_type, "text": next_text})
-                    elif next_type == "text" and next_text.strip():
-                        section_chunks.append(next_text.strip())
-                    index += 1
-                if section_chunks:
-                    merged.append({"type": "text", "text": "\n".join(section_chunks)})
-                continue
-
-            if not has_heading and block_type == "text" and index + 1 < len(parsed_blocks):
-                next_type, next_text = parsed_blocks[index + 1]
-                if next_type == "box_table":
-                    merged.append({"type": "text", "text": f"{block_text}\n{next_text}"})
-                    index += 2
-                    continue
-
-            if block_type == "heading" and index + 1 < len(parsed_blocks):
-                next_type, next_text = parsed_blocks[index + 1]
-                if next_type not in ("heading", "table", "box_table"):
-                    merged.append({"type": "text", "text": f"{block_text}\n{next_text}"})
-                    index += 2
-                    continue
-
-            if block_type in ("table", "box_table"):
-                merged.append({"type": block_type, "text": block_text})
-            else:
-                merged.append({"type": "text", "text": block_text})
-
-            index += 1
-
-        return [segment for segment in merged if segment.get("text", "").strip()]
-
-    def _send_segment(self, event: AstrMessageEvent, segment: dict):
-        kind = segment.get("type")
-        if kind == "table":
-            return event.plain_result(self._format_markdown_table(segment.get("text", "")))
-        if kind == "box_table":
-            return event.plain_result(self._normalize_box_table(segment.get("text", "")))
-        text = segment.get("text", "").strip()
-        if text and any(ch in text for ch in "┌┐└┘├┤┬┴┼─━│╭╮╯╰╏╎╵╷"):
-            normalized = self._normalize_box_table_from_text(text)
-            if normalized:
-                return event.plain_result(normalized)
-
-        return event.plain_result(text)
-
-    def _extract_text(self, result) -> str:
-        chain = getattr(result, "chain", None)
-        if not chain:
-            return ""
-
-        text_parts = []
-        for comp in chain:
-            text = getattr(comp, "text", None)
-            if isinstance(text, str):
-                text_parts.append(text)
-        return "".join(text_parts)
-
-    def _clean_result_chain(self, result) -> bool:
-        changed = False
-        chain = getattr(result, "chain", None)
-        if not chain:
-            return False
-
-        for comp in chain:
-            text = getattr(comp, "text", None)
-            if not isinstance(text, str):
-                continue
-            cleaned = self._clean_text(text)
-            if cleaned != text:
-                comp.text = cleaned
-                changed = True
-                original_preview = text[:50].replace("\n", "\\n")
-                cleaned_preview = cleaned[:50].replace("\n", "\\n")
-                logger.warning(
-                    f"[AL1S Core] 检测到Markdown并移除: {original_preview}... -> {cleaned_preview}..."
-                )
-
-        return changed
-
-    def _is_llm_result(self, result) -> bool:
-        is_llm_result = getattr(result, "is_llm_result", None)
-        if callable(is_llm_result):
+    async def _build_file_component(self, file_path: Path) -> File:
+        """构造文件消息段。"""
+        astrbot_config = getattr(self.context, "_config", {})
+        if not isinstance(astrbot_config, dict):
+            astrbot_config = {}
+        callback_api_base = str(astrbot_config.get("callback_api_base", "")).strip()
+        callback_api_base = callback_api_base.rstrip("/")
+
+        if callback_api_base:
             try:
-                return bool(is_llm_result())
-            except Exception:
-                logger.exception("[AL1S Core] 检查 LLM 响应类型失败，已回退到 false。")
+                token = await file_token_service.register_file(str(file_path))
+                return File(name=file_path.name, url=f"{callback_api_base}/api/file/{token}")
+            except Exception as exc:
+                logger.warning(
+                    f"[AL1S Core] 文件服务注册失败，回退为本地路径发送（文件: {file_path}）：{exc}"
+                )
 
-        return False
+        return File(name=file_path.name, file=str(file_path))
 
-    def _calc_delay(self, text: str) -> float:
-        if not text:
-            return 0.0
+    def _chunk_plain_lines(self, lines: list[str], chunk_size: int = 15) -> list[str]:
+        return self._essence.chunk_plain_lines(lines, chunk_size=chunk_size)
 
-        chars_per_sec = self.config.get("split_chars_per_second", 80)
-        min_delay = self.config.get("split_interval_min_seconds", 0.5)
-        max_delay = self.config.get("split_interval_max_seconds", 3.0)
+    @filter.permission_type(filter.PermissionType.ADMIN)
+    @filter.command("精华消息", alias={"精华", "group_essence", "essence"})
+    @filter.event_message_type(filter.EventMessageType.GROUP_MESSAGE)
+    async def handle_group_essence_messages(self, event: AstrMessageEvent):
+        """获取当前群的群精华消息索引列表。"""
+        if not self.config.is_enabled():
+            yield event.plain_result("AL1S Core 当前已禁用。")
+            return
+
+        if not self._essence.has_onebot_api(event):
+            yield event.plain_result("当前平台未暴露 OneBot call_action，无法读取精华消息。")
+            return
+
+        group_id = event.get_group_id()
+        if not group_id:
+            yield event.plain_result("该指令仅支持群聊。")
+            return
+
+        limit, force_refresh = self._essence.parse_essence_command_flags(
+            event.message_str or ""
+        )
+        try:
+            data = await self._essence.get_essence_items(
+                event,
+                group_id,
+                force_refresh=force_refresh,
+            )
+        except Exception as exc:
+            logger.exception("[AL1S Core] 获取精华消息失败。")
+            yield event.plain_result(f"获取精华消息失败：{exc}")
+            return
+
+        if not isinstance(data, list):
+            yield event.plain_result("未获取到可解析的精华消息数据。")
+            return
+
+        if not data:
+            yield event.plain_result("当前群还没有精华消息。")
+            return
+
+        selected = data[:limit]
+        lines = [
+            f"群 {group_id} 精华消息（已显示 {len(selected)} / {len(data)}，上限 {limit}）",
+        ]
+        for index, item in enumerate(selected, 1):
+            if not isinstance(item, dict):
+                lines.append(f"{index}. 无法解析的记录")
+                continue
+            lines.append(self._essence.format_essence_line(index, item))
+
+        for chunk in self._chunk_plain_lines(lines, chunk_size=12):
+            yield event.plain_result(chunk)
+
+    @filter.permission_type(filter.PermissionType.ADMIN)
+    @filter.command("精华消息导出", alias={"导出精华", "export_essence"})
+    @filter.event_message_type(filter.EventMessageType.GROUP_MESSAGE)
+    async def handle_export_group_essence_messages(self, event: AstrMessageEvent):
+        """导出当前群所有精华消息及图片为 ZIP（MD + 图片）并发送。"""
+        if not self.config.is_enabled():
+            yield event.plain_result("AL1S Core 当前已禁用。")
+            return
+
+        if not self._essence.has_onebot_api(event):
+            yield event.plain_result("当前平台未暴露 OneBot call_action，无法导出精华消息。")
+            return
+
+        group_id = event.get_group_id()
+        if not group_id:
+            yield event.plain_result("该指令仅支持群聊。")
+            return
 
         try:
-            chars_per_sec = int(chars_per_sec)
-        except (TypeError, ValueError):
-            chars_per_sec = 80
+            _, force_refresh = self._essence.parse_essence_command_flags(event.message_str or "")
+            items = await self._essence.get_essence_items(
+                event,
+                group_id,
+                force_refresh=force_refresh,
+            )
+        except Exception as exc:
+            logger.exception("[AL1S Core] 获取精华消息失败（导出）。")
+            yield event.plain_result(f"获取精华消息失败：{exc}")
+            return
 
-        if chars_per_sec <= 0:
-            chars_per_sec = 1
+        if not isinstance(items, list):
+            yield event.plain_result("未获取到可解析的精华消息数据。")
+            return
 
-        try:
-            min_delay = float(min_delay)
-            max_delay = float(max_delay)
-        except (TypeError, ValueError):
-            min_delay = 0.5
-            max_delay = 3.0
+        if not items:
+            yield event.plain_result("当前群还没有精华消息，导出取消。")
+            return
 
-        if max_delay < min_delay:
-            max_delay = min_delay
+        export_dir = self._essence.create_export_workspace(self.data_dir, str(group_id))
+        images_dir = export_dir / "images"
+        markdown_path = export_dir / "essence_messages.md"
+        zip_path = export_dir / f"essence_{group_id}_{datetime.now().strftime('%Y%m%d_%H%M%S')}.zip"
 
-        delay = len(text) / float(chars_per_sec)
-        if delay < min_delay:
-            delay = min_delay
-        if delay > max_delay:
-            delay = max_delay
-        return delay
+        image_count = 0
+        markdown_lines = self._essence.create_export_markdown_header(group_id, len(items))
+
+        for index, essence in enumerate(items, 1):
+            if not isinstance(essence, dict):
+                markdown_lines.append(f"## 精华消息 {index}")
+                markdown_lines.append("> 无法解析的记录")
+                markdown_lines.append("")
+                continue
+
+            message_id = str(
+                essence.get("message_id") or essence.get("msg_id") or essence.get("msgId") or ""
+            )
+            message_text = ""
+            image_sources = []
+            image_files = []
+            detail_error = None
+
+            try:
+                if message_id:
+                    msg_data = await self._essence.get_message_data(
+                        event,
+                        group_id,
+                        message_id,
+                        force_refresh=force_refresh,
+                    )
+                    if isinstance(msg_data, dict):
+                        msg_source = msg_data.get("message") or msg_data.get("raw_message") or ""
+                        message_text, image_sources = self._essence.parse_message_images(msg_source)
+                        if not message_text:
+                            message_text = str(
+                                msg_data.get("message_str")
+                                or msg_data.get("raw_message")
+                                or ""
+                            ).strip()
+            except Exception as exc:
+                detail_error = f"获取消息详情失败: {exc}"
+
+            if not message_text:
+                fallback_source = essence.get("message") or essence.get("raw_message") or ""
+                text_fallback, fallback_images = self._essence.parse_message_images(fallback_source)
+                if text_fallback:
+                    message_text = text_fallback
+                if not image_sources:
+                    image_sources = fallback_images
+
+            if not image_sources:
+                fallback_source = essence.get("message") or essence.get("raw_message") or ""
+                _, extra_sources = self._essence.parse_message_images(fallback_source)
+                image_sources.extend(extra_sources)
+
+            for image_index, source in enumerate(image_sources, 1):
+                filename, image_path = await self._essence.resolve_image_blob(
+                    event,
+                    source,
+                    image_index,
+                    index,
+                    images_dir,
+                )
+                if filename and image_path:
+                    image_files.append(filename)
+                    image_count += 1
+
+            markdown_lines.extend(
+                self._essence.build_markdown_lines_for_essence(
+                    index,
+                    essence,
+                    message_text,
+                    image_files,
+                    detail_error,
+                )
+            )
+
+        markdown_path.write_text("\n".join(markdown_lines).strip() + "\n", encoding="utf-8")
+
+        with zipfile.ZipFile(zip_path, "w", zipfile.ZIP_DEFLATED) as zf:
+            for path in export_dir.rglob("*"):
+                if path.is_file():
+                    zf.write(path, path.relative_to(export_dir))
+
+        if not zip_path.exists() or zip_path.stat().st_size == 0:
+            yield event.plain_result("导出失败：未生成压缩包。")
+            return
+
+        file_comp = await self._build_file_component(zip_path)
+        yield event.chain_result([file_comp])
+        yield event.plain_result(
+            f"精华导出完成：共 {len(items)} 条消息，成功提取图片 {image_count} 张，压缩包 {zip_path.name}"
+        )
+
+    @filter.permission_type(filter.PermissionType.ADMIN)
+    @filter.command("精华缓存", alias={"缓存精华", "essence_cache"})
+    @filter.event_message_type(filter.EventMessageType.GROUP_MESSAGE)
+    async def handle_essence_cache_status(self, event: AstrMessageEvent):
+        """查看当前群精华缓存状态。"""
+        if not self.config.is_enabled():
+            yield event.plain_result("AL1S Core 当前已禁用。")
+            return
+
+        group_id = event.get_group_id()
+        group_key = str(group_id or "global")
+        essence_cache = self._cache.get_essence_cache(group_key)
+
+        if isinstance(essence_cache, dict):
+            updated_at = self._essence.to_timestamp_text(int(essence_cache.get("updated_at", 0)))
+            synced_at = int(essence_cache.get("synced_at", 0) or 0)
+            total = self._cache.get_group_count()
+            msg_count = len(essence_cache.get("items", []) or [])
+            next_sync = synced_at + self.config.essence_sync_interval()
+        else:
+            updated_at = "未缓存"
+            next_sync = 0
+            total = self._cache.get_group_count()
+            msg_count = 0
+
+        message_cache_count = self._cache.get_group_message_cache_count(group_key)
+
+        image_cache_count = self._cache.get_image_cache_count()
+        stats = self._cache.get_stats()
+
+        lines = [
+            "精华缓存状态：",
+            f"- 当前群: {group_key}",
+            (
+                f"- 精华列表缓存: {msg_count} 条（更新时间: {updated_at}，下次增量同步: "
+                f"{max(0, next_sync - int(time.time())) if next_sync else 0}s）"
+            ),
+            f"- 当前群消息详情缓存: {message_cache_count} 条",
+            f"- 图片缓存文件: {image_cache_count} 个",
+            f"- 命中/未命中: 图片 {stats['image_hit']}/{stats['image_miss']}，消息 {stats['message_hit']}/{stats['message_miss']}，列表 {stats['essence_hit']}/{stats['essence_miss']}",
+            f"- 缓存策略: 列表采用增量同步间隔 {self.config.essence_sync_interval()}s，消息 {self.config.message_cache_ttl()}s，图片 {self.config.image_cache_ttl()}s",
+            f"- 当前已缓存群数: {total}",
+        ]
+        for chunk in self._chunk_plain_lines(lines, chunk_size=10):
+            yield event.plain_result(chunk)
+
+    @filter.permission_type(filter.PermissionType.ADMIN)
+    @filter.command("精华缓存清理", alias={"清理精华缓存", "clear_essence_cache"})
+    @filter.event_message_type(filter.EventMessageType.GROUP_MESSAGE)
+    async def handle_essence_cache_clear(self, event: AstrMessageEvent):
+        """清理精华缓存。可携带“全部”清空全局缓存。"""
+        if not self.config.is_enabled():
+            yield event.plain_result("AL1S Core 当前已禁用。")
+            return
+
+        cmd_text = str(event.message_str or "")
+        if any(kw in cmd_text for kw in ("全部", "所有", "all", "ALL", "clear_all")):
+            removed = await self._cache.clear_all_cache()
+            yield event.plain_result(f"精华缓存已清空，移除 {removed} 条缓存记录（含图片索引）。")
+            return
+
+        group_id = event.get_group_id()
+        if not group_id:
+            yield event.plain_result("该指令仅支持群聊，如需清空全部缓存请发送“全部”。")
+            return
+
+        removed = await self._cache.clear_group_cache(group_id)
+        yield event.plain_result(f"群 {group_id} 精华缓存清理完成，移除 {removed} 条记录（消息+列表）。")
 
     @filter.on_llm_response()
     async def on_llm_resp(self, event: AstrMessageEvent, resp: LLMResponse, *args):
-        """监听LLM回复并清理 Markdown 样式。"""
-        if not self._is_enabled() or not resp or not resp.completion_text:
+        """监听 LLM 回复并清理 Markdown 样式。"""
+        if not self.config.is_enabled() or not resp or not resp.completion_text:
             return
 
         original_text = resp.completion_text
-        cleaned_text = self._clean_text(original_text)
+        cleaned_text = self.output_spec.clean_text(original_text)
         if original_text == cleaned_text:
             return
 
@@ -621,29 +342,31 @@ class AL1SCorePlugin(Star):
     @filter.on_decorating_result()
     async def on_decorating_result(self, event: AstrMessageEvent):
         """处理最终输出：支持全局 Markdown 清理 + AI 空行分段发送。"""
-        if not self._is_enabled():
+        if not self.config.is_enabled():
             return
 
         result = event.get_result()
         if not result:
             return
 
-        # 全局移除 Markdown（支持非 LLM 的常规插件输出）
-        if bool(self.config.get("enable_global_markdown_killer", False)):
-            self._clean_result_chain(result)
+        if self.config.should_clean_global_markdown():
+            self.output_spec.clean_result_chain(result)
 
-        if not self._is_llm_result(result):
+        if not self.output_spec.is_llm_result(result):
             return
 
-        if not bool(self.config.get("enable_llm_line_split", False)):
+        if not self.config.should_split_llm():
             return
 
-        text = self._extract_text(result)
+        text = self.output_spec.extract_text(result)
         if not text:
             return
 
-        segments = self._build_segments(text)
-        if len(segments) <= 1 and segments and segments[0].get("type") == "text":
+        segments = self.output_spec.build_segments(text)
+        if not segments:
+            return
+
+        if len(segments) <= 1 and segments[0].get("type") == "text":
             return
 
         event.clear_result()
@@ -652,28 +375,28 @@ class AL1SCorePlugin(Star):
         for index, segment in enumerate(segments):
             if index > 0:
                 prev = segments[index - 1]
-                delay = self._calc_delay((prev.get("text") or "") if isinstance(prev, dict) else "")
+                delay = self.output_spec.calc_delay(
+                    (prev.get("text") or "") if isinstance(prev, dict) else ""
+                )
                 await asyncio.sleep(delay)
-            result = self._send_segment(event, segment)
-            await event.send(result)
+            send_result = self.output_spec.send_segment(event, segment)
+            await event.send(send_result)
 
             logger.info(
-                f"[AL1S Core] 已发送第 {index + 1}/{len(segments)} 条AI回复段落，长度 {len(segment.get('text', ''))}，延迟规则: 每 {self.config.get('split_chars_per_second', 80)} 字约 1 秒。"
+                f"[AL1S Core] 已发送第 {index + 1}/{len(segments)} 条AI回复段落，长度 {len(segment.get('text', ''))}，延迟规则: 每 {self.config.split_chars_per_second()} 字约 1 秒。"
             )
 
     @filter.command("al1s")
     async def handle_al1s(self, event: AstrMessageEvent):
         """基础功能演示：输出配置中的欢迎语。"""
-        if not self._is_enabled():
+        if not self.config.is_enabled():
             yield event.plain_result("AL1S Core 当前已禁用。")
             return
 
-        greeting = self.config.get("greeting", "AL1S Core 已连接。")
-        yield event.plain_result(greeting)
+        yield event.plain_result(self.config.greeting())
 
     @filter.command("al1s状态")
     async def handle_status(self, event: AstrMessageEvent):
         """输出插件版本与状态。"""
-        version = "v0.2.6"
-        enabled = "开启" if self._is_enabled() else "关闭"
-        yield event.plain_result(f"AL1S Core 运行中，状态：{enabled}，版本：{version}")
+        enabled = "开启" if self.config.is_enabled() else "关闭"
+        yield event.plain_result(f"AL1S Core 运行中，状态：{enabled}，版本：{PLUGIN_VERSION}")

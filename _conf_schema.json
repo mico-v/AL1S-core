@@ -29,6 +29,50 @@
     "default": 3.0,
     "hint": "段落之间最多等待多久（秒）。"
   },
+  "onebot_essence_list_default_limit": {
+    "title": "精华消息默认条数",
+    "type": "int",
+    "description": "执行 /精华消息 时默认返回条数（群聊）",
+    "default": 20,
+    "hint": "可通过消息参数指定数字，比如 /精华消息 10。"
+  },
+  "onebot_essence_list_max_limit": {
+    "title": "精华消息最大条数",
+    "type": "int",
+    "description": "单次查询可返回的最大条数上限。",
+    "default": 200,
+    "hint": "超出该上限的部分会自动截断。"
+  },
+  "onebot_essence_cache_ttl_seconds": {
+    "title": "精华列表缓存 TTL（兼容）",
+    "type": "int",
+    "default": 0,
+    "description": "兼容字段。非 0 时表示列表同步间隔（秒）。建议使用 onebot_essence_list_sync_interval_seconds。"
+  },
+  "onebot_essence_list_sync_interval_seconds": {
+    "title": "精华列表增量同步间隔",
+    "type": "int",
+    "default": 300,
+    "description": "列表缓存的增量同步间隔（秒）。到期后在下一次查询时执行接口增量更新。"
+  },
+  "onebot_essence_message_cache_ttl_seconds": {
+    "title": "精华消息详情缓存 TTL",
+    "type": "int",
+    "default": 0,
+    "description": "消息详情缓存过期时间（秒）。0 表示长期缓存，除手动清理外不失效。"
+  },
+  "onebot_essence_image_cache_ttl_seconds": {
+    "title": "精华图片缓存 TTL",
+    "type": "int",
+    "default": 0,
+    "description": "图片缓存过期时间（秒）。0 表示长期缓存，除手动清理外不失效。"
+  },
+  "onebot_essence_cache_max_groups": {
+    "title": "精华缓存群数量上限",
+    "type": "int",
+    "default": 20,
+    "description": "超过上限时，按最近更新时间保留最近的群缓存。"
+  },
 
   "enabled": {
     "title": "是否启用插件",
