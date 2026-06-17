@@ -5,6 +5,10 @@ from datetime import datetime
 from pathlib import Path
 import time
 
+PLUGIN_DIR = Path(__file__).resolve().parent
+if str(PLUGIN_DIR) not in sys.path:
+    sys.path.insert(0, str(PLUGIN_DIR))
+
 from astrbot.api import logger
 from astrbot.core import file_token_service
 from astrbot.api.event import AstrMessageEvent, filter
@@ -16,10 +20,6 @@ from al1s_config import AL1SPluginConfig
 from al1s_cache import EssenceCacheManager
 from al1s_essence import EssenceService
 from output_spec import OutputSpec
-
-PLUGIN_DIR = Path(__file__).resolve().parent
-if str(PLUGIN_DIR) not in sys.path:
-    sys.path.insert(0, str(PLUGIN_DIR))
 
 PLUGIN_VERSION = "v0.3.4"
 
