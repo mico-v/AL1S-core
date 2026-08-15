@@ -2,6 +2,16 @@
  * 配置：从环境变量解析 BotConfig。
  * 所有数字均为可选，非数字或负数时回退内置默认值。
  */
+/** AL1S 格式化功能配置（加在 LLM 回复管线上的可开关格式化层） */
+export interface Al1sFormatConfig {
+  enabled: boolean; // 总开关
+  globalMarkdownKiller: boolean; // 对所有最终文本清理 Markdown
+  lineSplit: boolean; // 按空行/结构分段发送
+  charsPerSecond: number; // 分段发送的字数/秒，越小间隔越长
+  minDelay: number; // 单段最小延时（秒）
+  maxDelay: number; // 单段最大延时（秒）
+}
+
 export interface BotConfig {
   wsUrl: string;
   accessToken?: string;
@@ -19,6 +29,8 @@ export interface BotConfig {
   maxToolIterations: number;
   enabledGroups: number[]; // 空数组 = 全部群
   maxSessions: number;
+  adminIds: number[]; // 管理员 QQ 号（BOT_ADMINS），空数组 = 不限制
+  al1sFormat: Al1sFormatConfig;
 }
 
 /** 默认人设 */
@@ -50,6 +62,14 @@ function numList(env: NodeJS.ProcessEnv, key: string): number[] {
     .filter((n) => !Number.isNaN(n));
 }
 
+/** 解析布尔环境变量：'true'/'1'/'on'/'yes' 视为真，其余（含缺失）为假 */
+function bool(env: NodeJS.ProcessEnv, key: string, fallback: boolean): boolean {
+  const raw = env[key];
+  if (raw === undefined || raw.trim() === '') return fallback;
+  const v = raw.trim().toLowerCase();
+  return v === 'true' || v === '1' || v === 'on' || v === 'yes';
+}
+
 /** 从环境变量加载配置（默认读 process.env） */
 export function loadConfig(env: NodeJS.ProcessEnv = process.env): BotConfig {
   return {
@@ -69,5 +89,14 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): BotConfig {
     maxToolIterations: num(env, 'MAX_TOOL_ITERATIONS', 5),
     enabledGroups: numList(env, 'ENABLED_GROUPS'),
     maxSessions: num(env, 'MAX_SESSIONS', 200),
+    adminIds: numList(env, 'BOT_ADMINS'),
+    al1sFormat: {
+      enabled: bool(env, 'AL1S_FORMAT_ENABLED', false),
+      globalMarkdownKiller: bool(env, 'AL1S_GLOBAL_MARKDOWN_KILLER', false),
+      lineSplit: bool(env, 'AL1S_LLM_LINE_SPLIT', false),
+      charsPerSecond: num(env, 'AL1S_SPLIT_CHARS_PER_SECOND', 80),
+      minDelay: num(env, 'AL1S_SPLIT_MIN_SECONDS', 0.5),
+      maxDelay: num(env, 'AL1S_SPLIT_MAX_SECONDS', 3.0),
+    },
   };
 }

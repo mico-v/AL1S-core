@@ -1,4 +1,24 @@
+# --- 依赖 ---
 node_modules/
+
+# --- 环境变量：本地密钥/配置，永不入库（.env.example 是模板，保留） ---
 .env
+.env.*
+!.env.example
+
+# --- 运行时数据 ---
+data/
+
+# --- 日志 ---
 *.log
+
+# --- 前端构建产物（管理后台） ---
+frontend/dist/
+frontend/node_modules/
+
+# --- 参考实现（仅本地参考） ---
 ref/
+
+# --- 系统/编辑器 ---
+.DS_Store
+Thumbs.db

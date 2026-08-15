@@ -7,10 +7,14 @@ import { helpPlugin } from './builtin/help';
 import { resetPlugin } from './builtin/reset';
 import { personaPlugin } from './builtin/persona';
 import { dicePlugin } from './example/dice';
+import { xxtPlugin } from './xxt/plugin';
+import { courseSchedulePlugin } from './courseSchedule/plugin';
 
 export function registerPlugins(registry: SkillRegistry): void {
   helpPlugin.register(registry);
   resetPlugin.register(registry);
   personaPlugin.register(registry);
   dicePlugin.register(registry);
+  xxtPlugin.register(registry);
+  courseSchedulePlugin.register(registry);
 }

@@ -3,9 +3,23 @@
  * - 工具 skill：供 LLM function calling 调用（模型自动触发）
  * - 斜杠命令：供群成员显式触发（/help、/reset 等）
  * 插件（Plugin）是 skill + 命令的打包单元，经 register 挂载到注册中心。
+ * 另提供消息/撤回通知钩子与 OneBot api 通道，供插件做后台监听（如防撤回、课堂提醒）。
  */
+import type {
+  OneBotMessageEvent,
+  OneBotNoticeEvent,
+  OutgoingMessage,
+  SnowLumaApiClient,
+  SnowLumaEventContext,
+} from '@snowluma/sdk';
 import type { SessionManager } from '../session/manager';
 import type { BotConfig } from '../config';
+import { logger } from '../logging/logger';
+
+const log = logger.child('registry');
+
+/** 后台消息/通知钩子的返回类型（同步或异步均可） */
+export type MaybePromise<T = void> = T | Promise<T>;
 
 /** 工具执行上下文：本次调用对应的会话与消息来源 */
 export interface SkillRunContext {
@@ -22,14 +36,25 @@ export interface Skill {
   run(args: Record<string, unknown>, ctx: SkillRunContext): Promise<string>;
 }
 
-/** 命令上下文：命令可访问回复通道、会话管理与配置 */
+/** 命令上下文：命令可访问回复通道、OneBot api、会话管理与配置 */
 export interface CommandContext {
   chatId: string;
+  groupId?: number; // 群聊命令时的群号
+  senderId?: number;
+  senderName?: string;
   rest: string;
-  reply(text: string): Promise<void>;
+  reply(text: string): Promise<void>; // 纯文本回复
+  send(message: OutgoingMessage): Promise<unknown>; // 富文本/图片/at 等消息段回复
+  api: SnowLumaApiClient; // 任意 OneBot action（发图、上传群文件、拉成员列表等）
   sessions: SessionManager;
   config: BotConfig;
 }
+
+/** 后台消息钩子：每条群/私聊消息都触发（含命令与未触发消息） */
+export type MessageHook = (event: OneBotMessageEvent, ctx: SnowLumaEventContext) => MaybePromise<void>;
+
+/** 后台通知钩子：每条 OneBot notice（如 group_recall 撤回）都触发 */
+export type NoticeHook = (event: OneBotNoticeEvent, ctx: SnowLumaEventContext) => MaybePromise<void>;
 
 /** 斜杠命令 */
 export interface Command {
@@ -49,15 +74,110 @@ export interface Plugin {
 export class SkillRegistry {
   private skills: Skill[] = [];
   private commands: Command[] = [];
+  private commandEnabled = new Map<string, boolean>();
+  private skillEnabled = new Map<string, boolean>();
+  private api?: SnowLumaApiClient;
+  private messageHooks: MessageHook[] = [];
+  private noticeHooks: NoticeHook[] = [];
 
-  /** 注册一个工具 skill */
+  /** 注册一个工具 skill（默认启用；保留已持久化的禁用状态） */
   registerSkill(skill: Skill): void {
     this.skills.push(skill);
+    if (!this.skillEnabled.has(skill.name)) this.skillEnabled.set(skill.name, true);
   }
 
-  /** 注册一个斜杠命令 */
+  /** 注册一个斜杠命令（默认启用；保留已持久化的禁用状态） */
   registerCommand(command: Command): void {
     this.commands.push(command);
+    if (!this.commandEnabled.has(command.name)) this.commandEnabled.set(command.name, true);
+  }
+
+  /** 运行时启停某个命令/skill（热生效：注册表常驻 + 分发过滤） */
+  setEnabled(kind: 'command' | 'skill', name: string, enabled: boolean): boolean {
+    const exists = kind === 'command' ? this.commands.some((c) => c.name === name) : this.skills.some((s) => s.name === name);
+    if (!exists) return false;
+    const map = kind === 'command' ? this.commandEnabled : this.skillEnabled;
+    map.set(name, enabled);
+    return true;
+  }
+
+  isCommandEnabled(name: string): boolean {
+    return this.commandEnabled.get(name) ?? true;
+  }
+
+  isSkillEnabled(name: string): boolean {
+    return this.skillEnabled.get(name) ?? true;
+  }
+
+  /** 启用的命令（/help、命令分发用） */
+  getEnabledCommands(): Command[] {
+    return this.commands.filter((c) => this.isCommandEnabled(c.name));
+  }
+
+  /** 启用的工具（agent 工具列表用） */
+  getEnabledSkills(): Skill[] {
+    return this.skills.filter((s) => this.isSkillEnabled(s.name));
+  }
+
+  /** 序列化启停状态（供持久化） */
+  serializeEnabled(): { commands: Record<string, boolean>; skills: Record<string, boolean> } {
+    const commands: Record<string, boolean> = {};
+    const skills: Record<string, boolean> = {};
+    for (const c of this.commands) commands[c.name] = this.isCommandEnabled(c.name);
+    for (const s of this.skills) skills[s.name] = this.isSkillEnabled(s.name);
+    return { commands, skills };
+  }
+
+  /** 从持久化恢复启停状态 */
+  restoreEnabled(data: { commands?: Record<string, boolean>; skills?: Record<string, boolean> } | null | undefined): void {
+    if (data?.commands) {
+      for (const [name, enabled] of Object.entries(data.commands)) this.commandEnabled.set(name, enabled);
+    }
+    if (data?.skills) {
+      for (const [name, enabled] of Object.entries(data.skills)) this.skillEnabled.set(name, enabled);
+    }
+  }
+
+  /** 注入 OneBot api 通道（bot.ts 在 start 时调用），后台钩子/定时器据此取 api */
+  setApi(client: SnowLumaApiClient): void {
+    this.api = client;
+  }
+
+  /** 取 OneBot api 通道（未注入时为 undefined） */
+  getApi(): SnowLumaApiClient | undefined {
+    return this.api;
+  }
+
+  /** 注册后台消息钩子（每条消息触发一次） */
+  addMessageHook(hook: MessageHook): void {
+    this.messageHooks.push(hook);
+  }
+
+  /** 注册后台通知钩子（每条 notice 触发一次） */
+  addNoticeHook(hook: NoticeHook): void {
+    this.noticeHooks.push(hook);
+  }
+
+  /** 顺序执行全部消息钩子；单个钩子抛错只记日志，不中断后续 */
+  async runMessageHooks(event: OneBotMessageEvent, ctx: SnowLumaEventContext): Promise<void> {
+    for (const hook of [...this.messageHooks]) {
+      try {
+        await hook(event, ctx);
+      } catch (err) {
+        log.error('消息钩子出错', { err: err instanceof Error ? err.message : String(err) });
+      }
+    }
+  }
+
+  /** 顺序执行全部通知钩子；单个钩子抛错只记日志，不中断后续 */
+  async runNoticeHooks(event: OneBotNoticeEvent, ctx: SnowLumaEventContext): Promise<void> {
+    for (const hook of [...this.noticeHooks]) {
+      try {
+        await hook(event, ctx);
+      } catch (err) {
+        log.error('通知钩子出错', { err: err instanceof Error ? err.message : String(err) });
+      }
+    }
   }
 
   /** 当前全部 skill（工具清单） */

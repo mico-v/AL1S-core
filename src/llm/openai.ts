@@ -57,12 +57,20 @@ function toOpenAITool(tool: LLMToolSchema): Record<string, unknown> {
 export class OpenAIProvider implements LLMProvider {
   private readonly baseUrl: string;
   private readonly apiKey?: string;
-  private readonly model: string;
+  private model: string;
 
   constructor(options: OpenAIProviderOptions) {
     this.baseUrl = options.baseUrl.replace(/\/+$/, ''); // 去掉末尾斜杠，避免拼接出双斜杠
     this.apiKey = options.apiKey || undefined;
     this.model = options.model;
+  }
+
+  /** 运行时切换模型（管理后台热更新；apiKey/baseUrl 需重启后由 ConfigStore 重新构造生效） */
+  setModel(model: string): void {
+    if (model && model !== this.model) {
+      this.model = model;
+      log.info('切换 LLM 模型', { model });
+    }
   }
 
   async *streamChat(options: LLMChatOptions): AsyncIterable<LLMStreamEvent> {

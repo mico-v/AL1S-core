@@ -13,12 +13,12 @@ export const helpPlugin: Plugin = {
       async handler(ctx) {
         const lines: string[] = [];
         lines.push('—— 可用命令 ——');
-        for (const c of registry.getCommands()) {
+        for (const c of registry.getEnabledCommands()) {
           lines.push(`/${c.name}：${c.description}`);
         }
         lines.push('');
         lines.push('—— 可用工具 ——');
-        for (const s of registry.getSkills()) {
+        for (const s of registry.getEnabledSkills()) {
           lines.push(`${s.name}：${s.description}`);
         }
         await ctx.reply(lines.join('\n'));

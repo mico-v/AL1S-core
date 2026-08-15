@@ -1,0 +1,9 @@
+/* 全局少量工具样式 */
+.font-mono {
+  font-family: 'SFMono-Regular', Consolas, 'Liberation Mono', Menlo, monospace;
+}
+
+.text-pre-wrap {
+  white-space: pre-wrap;
+  word-break: break-word;
+}

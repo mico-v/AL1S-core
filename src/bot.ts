@@ -1,50 +1,126 @@
 /**
  * Bot 类：持有 WebSocket 客户端、会话管理、skill 注册中心与 LLM provider。
  * 负责注册插件、绑定消息事件、获取登录昵称（写入 pipeline）、优雅关闭。
+ * 同时装配管理后台：运行时 ConfigStore、会话持久化、插件启停控制、AdminServer。
  */
 import { SnowLumaWebSocketClient } from '@snowluma/sdk';
+import { readFileSync } from 'node:fs';
 import type { BotConfig } from './config';
+import { ConfigStore } from './config/store';
 import { logger } from './logging/logger';
 import { OpenAIProvider } from './llm/openai';
 import { SessionManager } from './session/manager';
+import { SessionPersistence } from './session/persistence';
 import { SkillRegistry } from './skills/registry';
+import { PluginControl } from './plugins/control';
 import { registerPlugins } from './skills/plugins';
+import { Al1sFormatter } from './format/formatter';
 import { Pipeline } from './pipeline/pipeline';
+import { AdminServer } from './admin/server';
+import type { AdminContext } from './admin/router';
 
 const log = logger.child('bot');
 
+function readVersion(): string {
+  try {
+    const pkg = JSON.parse(readFileSync(new URL('../package.json', import.meta.url), 'utf-8')) as { version?: string };
+    return pkg.version ?? '0.0.0';
+  } catch {
+    return '0.0.0';
+  }
+}
+
 export class Bot {
   private readonly client: SnowLumaWebSocketClient;
+  private readonly configStore: ConfigStore;
   private readonly registry: SkillRegistry;
+  private readonly pluginControl: PluginControl;
   private readonly pipeline: Pipeline;
+  private readonly persistence: SessionPersistence;
+  private readonly adminServer?: AdminServer;
+  private readonly startedAt = Date.now();
+  private botNickname = '';
 
   constructor(config: BotConfig) {
+    // 先建 ConfigStore：加载 settings.json 覆盖层 → 再以可变 config 构造各组件（现读即热）
+    this.configStore = new ConfigStore();
+    const cfg = this.configStore.config;
+
     this.client = new SnowLumaWebSocketClient({
-      url: config.wsUrl,
-      accessToken: config.accessToken,
+      url: cfg.wsUrl,
+      accessToken: cfg.accessToken,
       reconnect: true,
     });
     this.registry = new SkillRegistry();
+    this.pluginControl = new PluginControl(this.registry);
+
     const sessions = new SessionManager({
-      tokenBudget: config.contextTokenBudget,
-      maxSessions: config.maxSessions,
+      tokenBudget: cfg.contextTokenBudget,
+      maxSessions: cfg.maxSessions,
+      getTokenBudget: () => cfg.contextTokenBudget,
+      getMaxSessions: () => cfg.maxSessions,
     });
+    this.persistence = new SessionPersistence(sessions);
+    this.persistence.attach(); // 会话磁盘恢复 + 防抖落盘
+
     // apiKey 缺失时也构造 provider：运行时请求会以 done.error 返回（llm-check 已提示）
     const provider = new OpenAIProvider({
-      baseUrl: config.llm.baseUrl,
-      apiKey: config.llm.apiKey,
-      model: config.llm.model,
+      baseUrl: cfg.llm.baseUrl,
+      apiKey: cfg.llm.apiKey,
+      model: cfg.llm.model,
     });
-    this.pipeline = new Pipeline({ config, provider, sessions, registry: this.registry });
+    // 模型切换热更新（apiKey/baseUrl 需重启后由 ConfigStore 重新应用）
+    this.configStore.registerApplier((store) => provider.setModel(store.config.llm.model));
+
+    const formatter = new Al1sFormatter(cfg.al1sFormat);
+    this.pipeline = new Pipeline({ config: cfg, provider, sessions, registry: this.registry, formatter });
+
+    // 管理后台（未配置 ADMIN_TOKEN 时不启动）
+    const adminPort = Number(process.env.ADMIN_PORT ?? 6185);
+    if (adminTokenEnabled()) {
+      const adminCtx: AdminContext = {
+        configStore: this.configStore,
+        registry: this.registry,
+        pluginControl: this.pluginControl,
+        sessions,
+        persistence: this.persistence,
+        isConnected: () => this.client.isConnected,
+        getLogin: async () => {
+          try {
+            return await this.client.getLoginInfo();
+          } catch {
+            return undefined;
+          }
+        },
+        getBotNickname: () => this.botNickname,
+        startedAt: this.startedAt,
+        version: readVersion(),
+        shutdown: () => this.stop(),
+      };
+      this.adminServer = new AdminServer(adminCtx, adminPort);
+    }
   }
 
   async start(): Promise<void> {
-    // 注册插件（skill 与命令）
+    // 注入 api 通道，再注册插件（插件可能在 register 时读取）
+    this.registry.setApi(this.client);
     registerPlugins(this.registry);
+    // 插件注册后再恢复启停状态（避免被 register 的默认启用覆盖）
+    this.pluginControl.attach();
 
-    // 绑定消息事件
-    this.client.onGroupMessage((event, ctx) => this.pipeline.handleGroupMessage(event, ctx));
-    this.client.onPrivateMessage((event, ctx) => this.pipeline.handlePrivateMessage(event, ctx));
+    this.adminServer ? void this.adminServer.start() : undefined;
+
+    // 绑定消息事件：先跑插件后台钩子（防撤回缓存/课堂提醒等），再走主 pipeline
+    this.client.onGroupMessage(async (event, ctx) => {
+      await this.registry.runMessageHooks(event, ctx);
+      await this.pipeline.handleGroupMessage(event, ctx);
+    });
+    this.client.onPrivateMessage(async (event, ctx) => {
+      await this.registry.runMessageHooks(event, ctx);
+      await this.pipeline.handlePrivateMessage(event, ctx);
+    });
+    // 通知事件（撤回、入群等）→ 插件通知钩子
+    this.client.onNotice((event, ctx) => this.registry.runNoticeHooks(event, ctx));
 
     // 连接状态日志
     this.client.on('open', () => log.info('已连接', { url: this.client.url }));
@@ -54,6 +130,7 @@ export class Bot {
     // 取登录昵称写入 pipeline（request 内部会自动发起连接，与下方 connect 幂等）
     try {
       const login = await this.client.getLoginInfo();
+      this.botNickname = login.nickname;
       this.pipeline.setBotNickname(login.nickname);
       log.info('登录账号', { userId: login.user_id, nickname: login.nickname });
     } catch (err) {
@@ -68,10 +145,20 @@ export class Bot {
     process.on('SIGTERM', () => this.stop());
   }
 
-  /** 优雅关闭：关闭 WebSocket 并退出 */
+  /** 优雅关闭：落盘会话、关闭 WebSocket 并退出 */
   stop(): void {
     log.info('正在关闭……');
+    try {
+      this.persistence.flushAll();
+    } catch (err) {
+      log.error('会话落盘失败', { err });
+    }
     this.client.close(1000, 'bye');
     process.exit(0);
   }
+}
+
+function adminTokenEnabled(): boolean {
+  const raw = process.env.ADMIN_TOKEN;
+  return raw !== undefined && raw.trim() !== '';
 }

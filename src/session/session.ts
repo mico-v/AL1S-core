@@ -21,6 +21,7 @@ export interface SessionOptions {
   chatId: string;
   tokenBudget: number;
   maxMessages?: number; // 环形日志上限，默认 200
+  onChange?: () => void; // 追加/清空/改人设时回调（持久化用）
 }
 
 export class ChatSession {
@@ -31,6 +32,7 @@ export class ChatSession {
   private readonly _tokenBudget: number;
   private readonly _maxMessages: number;
   private readonly _messages: LoggedMessage[] = []; // 旧 → 新
+  private readonly _onChange?: () => void;
   private _personaOverride: string | undefined;
   private _lastBotReplyTime: number | undefined;
 
@@ -38,6 +40,7 @@ export class ChatSession {
     this.chatId = options.chatId;
     this._tokenBudget = options.tokenBudget;
     this._maxMessages = Math.max(1, options.maxMessages ?? 200);
+    this._onChange = options.onChange;
   }
 
   /** 追加一条消息；time 缺失时补当前时间；环形超限丢最旧 */
@@ -46,15 +49,18 @@ export class ChatSession {
     if (msg.role === 'assistant') this._lastBotReplyTime = msg.time;
     this._messages.push(msg);
     while (this._messages.length > this._maxMessages) this._messages.shift();
+    this._onChange?.();
   }
 
   clear(): void {
     this._messages.length = 0;
     this._lastBotReplyTime = undefined;
+    this._onChange?.();
   }
 
   setPersonaOverride(text?: string): void {
     this._personaOverride = text || undefined;
+    this._onChange?.();
   }
 
   get personaOverride(): string | undefined {
@@ -65,8 +71,19 @@ export class ChatSession {
     return this._lastBotReplyTime;
   }
 
+  /** 最近活跃时间（epoch ms）；空会话为 0 */
+  get lastActivity(): number {
+    const last = this._messages[this._messages.length - 1];
+    return last ? last.time : 0;
+  }
+
   get size(): number {
     return this._messages.length;
+  }
+
+  /** 会话日志快照（旧 → 新） */
+  getSnapshot(): LoggedMessage[] {
+    return this._messages.map((m) => ({ ...m }));
   }
 
   /**

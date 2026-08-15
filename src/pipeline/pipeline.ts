@@ -5,13 +5,15 @@
  * 全程 try/catch，异常回复「内部出错了」，绝不冒泡到 SDK 事件循环。
  */
 import { at, text } from '@snowluma/sdk';
-import type { OneBotGroupMessageEvent, OneBotPrivateMessageEvent, SnowLumaEventContext } from '@snowluma/sdk';
+import type { OneBotGroupMessageEvent, OneBotMessageEvent, OneBotPrivateMessageEvent, SnowLumaEventContext } from '@snowluma/sdk';
 import { runAgentLoop } from '../agent/loop';
 import type { LLMMessage, LLMProvider } from '../llm/types';
 import { logger } from '../logging/logger';
+import { metrics } from '../metrics';
 import type { BotConfig } from '../config';
 import type { SessionManager } from '../session/manager';
 import type { SkillRegistry } from '../skills/registry';
+import type { OutputFormatter } from '../format/formatter';
 import { normalizeMessage } from './normalize';
 import { evaluateTrigger } from './trigger';
 
@@ -24,10 +26,16 @@ export interface PipelineDeps {
   sessions: SessionManager;
   registry: SkillRegistry;
   botNickname?: string;
+  formatter?: OutputFormatter; // 可开关的 LLM 输出格式化层
 }
 
 /** 单条回复的最大字数，超长分条发送 */
 const MAX_CHUNK = 500;
+
+/** 异步等待，用于分段发送的逐段延时 */
+function sleep(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
 
 /** 把长文本按段落/长度分条（每条 ≤limit 字，超长段落硬切） */
 function splitText(text: string, limit: number): string[] {
@@ -64,6 +72,7 @@ export class Pipeline {
   private readonly provider: LLMProvider;
   private readonly sessions: SessionManager;
   private readonly registry: SkillRegistry;
+  private readonly formatter?: OutputFormatter;
   private _botNickname: string;
 
   constructor(deps: PipelineDeps) {
@@ -71,6 +80,7 @@ export class Pipeline {
     this.provider = deps.provider;
     this.sessions = deps.sessions;
     this.registry = deps.registry;
+    this.formatter = deps.formatter;
     this._botNickname = deps.botNickname ?? '';
   }
 
@@ -92,6 +102,7 @@ export class Pipeline {
 
     const norm = normalizeMessage(event);
     const chatId = `g:${event.group_id}`;
+    metrics.messagesReceived++;
     log.debug('收到群消息', { group: event.group_id, user: event.user_id, atBot: norm.atBot, text: norm.text });
 
     // c) 命令分发：命令不记日志、不触发（同样兜底，异常回复「内部出错了」）
@@ -106,14 +117,14 @@ export class Pipeline {
 
     try {
       const senderName = event.sender.nickname || `用户${event.user_id}`;
-      // d) 记日志
+      // d) 记日志（时间统一毫秒：OneBot time 是秒）
       this.sessions.get(chatId).append({
         role: 'user',
         senderId: event.user_id,
         senderName,
         text: norm.text,
         atBot: norm.atBot,
-        time: event.time,
+        time: event.time * 1000,
       });
 
       // e) 触发判定
@@ -152,6 +163,7 @@ export class Pipeline {
   ): Promise<void> {
     const norm = normalizeMessage(event);
     const chatId = `p:${event.user_id}`;
+    metrics.messagesReceived++;
     log.debug('收到私聊消息', { user: event.user_id, text: norm.text });
 
     if (norm.text.startsWith('/')) {
@@ -171,7 +183,7 @@ export class Pipeline {
         senderName,
         text: norm.text,
         atBot: false,
-        time: event.time,
+        time: event.time * 1000,
       });
 
       const s = this.sessions.get(chatId);
@@ -194,17 +206,30 @@ export class Pipeline {
     const name = head.slice(1); // 去掉开头的 '/'
     const rest = spaceIdx >= 0 ? raw.slice(spaceIdx + 1) : '';
     const cmd = this.registry.findCommand(name);
-    if (!cmd) {
+    if (!cmd || !this.registry.isCommandEnabled(name)) {
       log.debug('未知命令', { chatId, name });
-      return; // 未知命令静默忽略
+      return; // 未知命令/已禁用命令静默忽略
     }
+    // 从消息事件提取发送者与群号，供命令做权限/群级操作
+    const ev = ctx.event as OneBotMessageEvent;
+    const groupId = 'group_id' in ev && typeof ev.group_id === 'number' ? ev.group_id : undefined;
+    const senderId = ev.user_id;
+    const senderName = ev.sender?.nickname || `用户${ev.user_id}`;
     log.info('命令', { chatId, name });
     await cmd.handler({
       chatId,
+      groupId,
+      senderId,
+      senderName,
       rest,
       reply: async (t: string) => {
-        await ctx.reply(text(t));
+        // 开启全局 Markdown 清理时，命令文本回复也过一遍 cleanText
+        const out =
+          this.formatter?.enabled && this.formatter.globalMarkdownKiller ? this.formatter.cleanText(t) : t;
+        await ctx.reply(text(out));
       },
+      send: (m) => ctx.reply(m),
+      api: ctx.client,
       sessions: this.sessions,
       config: this.config,
     });
@@ -220,9 +245,10 @@ export class Pipeline {
   ): Promise<void> {
     const s = this.sessions.get(chatId);
     const persona = s.personaOverride ?? this.config.persona;
+    const tools = this.registry.getEnabledSkills();
     const system: LLMMessage = {
       role: 'system',
-      content: `${persona}\n可用工具：${this.registry.getSkills().map((x) => x.name).join('、')}`,
+      content: `${persona}\n可用工具：${tools.map((x) => x.name).join('、')}`,
     };
     const messages: LLMMessage[] = [system, ...s.buildContext()];
     log.info('开始生成', { chatId, atBot });
@@ -230,7 +256,7 @@ export class Pipeline {
 
     const res = await runAgentLoop({
       provider: this.provider,
-      skills: this.registry.getSkills(),
+      skills: tools,
       messages,
       maxIterations: this.config.maxToolIterations,
       temperature: this.config.llm.temperature,
@@ -240,25 +266,45 @@ export class Pipeline {
       senderName,
     });
     log.info('回复完成', { chatId, ms: Date.now() - startedAt, toolCalls: res.toolCallsUsed, chars: res.text.length });
+    metrics.toolCalls += res.toolCallsUsed;
+
+    // 实际发送的文本：格式化层开启时先做 Markdown 清理
+    const formatted = this.formatter?.enabled ? this.formatter.cleanText(res.text) : res.text;
 
     if (res.error) {
+      metrics.errors++;
       await ctx.reply(text(`（出错了：${res.error}）`));
+      metrics.messagesSent++;
+    } else if (this.formatter?.enabled && this.formatter.lineSplit) {
+      // 格式化分段发送：按结构切段、逐段延时（对应 AstrBot on_decorating_result）
+      const segs = this.formatter.buildSegments(formatted);
+      for (let i = 0; i < segs.length; i++) {
+        const seg = segs[i]!;
+        const rendered = this.formatter.renderSegment(seg);
+        // 群聊且 @ 了机器人时，第一条前加 @ 发送者
+        const chain = atBot && i === 0 ? at(senderId).text(rendered) : text(rendered);
+        await ctx.reply(chain);
+        metrics.messagesSent++;
+        const delay = this.formatter.segmentDelay(seg);
+        if (delay > 0) await sleep(delay * 1000);
+      }
     } else {
-      const chunks = splitText(res.text, MAX_CHUNK);
+      const chunks = splitText(formatted, MAX_CHUNK);
       for (let i = 0; i < chunks.length; i++) {
         const chunk = chunks[i]!;
         // 群聊且 @ 了机器人时，第一条前加 @ 发送者
         const chain = atBot && i === 0 ? at(senderId).text(chunk) : text(chunk);
         await ctx.reply(chain);
+        metrics.messagesSent++;
       }
     }
 
-    // 记 bot 回复日志（供上下文连贯）
+    // 记 bot 回复日志（记录实际发送文本，供上下文连贯）
     s.append({
       role: 'assistant',
       senderId: undefined,
       senderName: this._botNickname,
-      text: res.text,
+      text: formatted,
       atBot: false,
       time: Date.now(),
     });
@@ -267,6 +313,7 @@ export class Pipeline {
   /** 非命令路径兜底：异常回复「内部出错了」，绝不冒泡 */
   private async safeErrorReply(ctx: SnowLumaEventContext, err: unknown): Promise<void> {
     const msg = err instanceof Error ? err.message : String(err);
+    metrics.errors++;
     log.error('内部出错了', { err: msg });
     try {
       await ctx.reply(text(`内部出错了：${msg}`));

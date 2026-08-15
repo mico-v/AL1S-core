@@ -9,6 +9,7 @@
  */
 import { appendFileSync, mkdirSync, renameSync, rmSync, statSync } from 'node:fs';
 import { dirname } from 'node:path';
+import { logBuffer } from './buffer';
 
 export type LogLevel = 'debug' | 'info' | 'warn' | 'error';
 
@@ -186,6 +187,18 @@ export class Logger {
       const plain = renderLine(level, this.tag, msg, f, false);
       const colored = this.useColor() ? renderLine(level, this.tag, msg, f, true) : plain;
       const block = level === 'error' && stack ? `\n${stack}` : '';
+
+      // 结构化记录 → 环形缓冲（供管理后台回溯/SSE）
+      try {
+        const fieldsStr: Record<string, string> = {};
+        for (const [k, v] of Object.entries(f)) {
+          if (v === undefined) continue;
+          fieldsStr[k] = typeof v === 'string' ? v : JSON.stringify(v);
+        }
+        logBuffer.push({ time: formatTime(new Date()), level, tag: this.tag, msg, fields: fieldsStr });
+      } catch {
+        // 缓冲失败不影响日志主流程
+      }
 
       // warn/error 走 stderr，debug/info 走 stdout
       const stream = level === 'warn' || level === 'error' ? process.stderr : process.stdout;
