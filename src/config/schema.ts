@@ -83,26 +83,8 @@ export const CONFIG_GROUPS: ConfigGroupMeta[] = [
       { key: 'al1sFormat.maxDelay', label: '单段最大延时(秒)', type: 'number', group: 'al1sFormat', min: 0 },
     ],
   },
-  {
-    key: 'course',
-    label: '课程表插件',
-    description: '数据文件、群文件目录与字体',
-    fields: [
-      { key: 'env.COURSE_DATA_FILE', label: '数据文件路径', type: 'string', group: 'course', requiresRestart: true },
-      { key: 'env.COURSE_ICS_FOLDER', label: '群文件课表目录', type: 'string', group: 'course', requiresRestart: true },
-      { key: 'env.COURSE_FONT_PATH', label: '中文字体路径', type: 'string', group: 'course', hint: '留空则自动查找' },
-    ],
-  },
-  {
-    key: 'xxt',
-    label: 'XXT 课堂提醒',
-    description: '上课时段与提醒参数',
-    fields: [
-      { key: 'env.XXT_CLASS_PERIODS', label: '上课时段', type: 'string', group: 'xxt', hint: '逗号分隔："08:30-10:00:课程名"' },
-      { key: 'env.XXT_CLASS_WARNING_COOLDOWN_SECONDS', label: '发言提醒冷却(秒)', type: 'number', group: 'xxt', min: 0 },
-      { key: 'env.XXT_CLASS_REPLY_TIMEOUT_SECONDS', label: '@ 未回复超时(秒)', type: 'number', group: 'xxt', min: 0 },
-    ],
-  },
+  // 注意：课程表 / XXT 的设置项由各插件模块自己声明（skills/xxt、skills/courseSchedule），
+  // 经下方 registerConfigFields 并入 CONFIG_FIELD_MAP，不进 CONFIG_GROUPS（全局"设置"页不显示插件分组）。
 ];
 
 /** 字段索引：key → 元数据 */
@@ -114,6 +96,23 @@ for (const group of CONFIG_GROUPS) {
 /** 分组索引 */
 export const CONFIG_GROUP_MAP: Record<string, ConfigGroupMeta> = {};
 for (const group of CONFIG_GROUPS) CONFIG_GROUP_MAP[group.key] = group;
+
+/**
+ * 插件声明设置：把插件配置项注册进全局字段索引。
+ * - 只并入 CONFIG_FIELD_MAP / CONFIG_GROUP_MAP，不进 CONFIG_GROUPS——全局"设置"页
+ *   （渲染 CONFIG_GROUPS）不显示插件分组，插件设置由各自详情页展示。
+ * - 必须在 ConfigStore 构造前调用：插件模块在模块顶层调用，bot.ts 的静态 import 链
+ *   （bot → plugins.ts → 各插件模块）保证求值顺序先于 new ConfigStore()。
+ * - 幂等：同一 group key 重复注册时仅补缺，不覆盖已有字段。
+ */
+export function registerConfigFields(group: ConfigGroupMeta): void {
+  if (CONFIG_GROUP_MAP[group.key]) {
+    for (const field of group.fields) CONFIG_FIELD_MAP[field.key] ??= field;
+    return;
+  }
+  CONFIG_GROUP_MAP[group.key] = group;
+  for (const field of group.fields) CONFIG_FIELD_MAP[field.key] = field;
+}
 
 /** 判断字段是否访问环境变量 */
 export function isEnvField(key: string): boolean {

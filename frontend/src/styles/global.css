@@ -1,3 +1,45 @@
+/* 全局样式：中文字体栈 + 主题感知的滚动条与背景（色值来自 Vuetify 主题的 --v-theme-*） */
+:root {
+  font-family:
+    ui-sans-serif,
+    system-ui,
+    -apple-system,
+    'PingFang SC',
+    'Hiragino Sans GB',
+    'Noto Sans CJK SC',
+    'Microsoft YaHei',
+    'Noto Sans SC',
+    sans-serif;
+}
+
+body {
+  background-color: rgb(var(--v-theme-containerBg));
+}
+
+/* 主题色滚动条（AstrBot 风格：主色调 thumb + hover 高亮/投影） */
+::-webkit-scrollbar {
+  width: 10px;
+  height: 10px;
+}
+::-webkit-scrollbar-track {
+  background: rgba(var(--v-theme-primary), 0.06);
+}
+::-webkit-scrollbar-thumb {
+  background: rgba(var(--v-theme-primary), 0.72);
+  border-radius: 5px;
+  border: 1px solid rgba(var(--v-theme-surface), 0.5);
+}
+::-webkit-scrollbar-thumb:hover {
+  background: rgba(var(--v-theme-primary), 0.84);
+  box-shadow: 0 2px 8px rgba(var(--v-theme-primary), 0.32);
+}
+
+/* Firefox */
+* {
+  scrollbar-width: thin;
+  scrollbar-color: rgba(var(--v-theme-primary), 0.72) rgba(var(--v-theme-primary), 0.06);
+}
+
 /* 全局少量工具样式 */
 .font-mono {
   font-family: 'SFMono-Regular', Consolas, 'Liberation Mono', Menlo, monospace;

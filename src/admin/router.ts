@@ -143,6 +143,34 @@ export async function handleApiRequest(ctx: AdminContext, req: IncomingMessage, 
       return true;
     }
 
+    // --- 插件设置（每插件一组）--- 固定在 /api/plugins 与 /api/plugins/enabled 之后匹配
+    const pluginConfigMatch = path.match(/^\/api\/plugins\/([^/]+)\/config$/);
+    if (pluginConfigMatch) {
+      const pluginName = decodeURIComponent(pluginConfigMatch[1]!);
+      const meta = ctx.registry.getPluginMeta(pluginName);
+      if (!meta) {
+        fail(res, 404, `插件不存在：${pluginName}`);
+        return true;
+      }
+      if (method === 'GET') {
+        const group = meta.settings ?? null;
+        const values: Record<string, unknown> = {};
+        if (group) for (const f of group.fields) values[f.key] = ctx.configStore.getField(f.key);
+        ok(res, { group, values });
+        return true;
+      }
+      if (method === 'PUT') {
+        if (!meta.settings) {
+          fail(res, 400, `插件 ${pluginName} 无设置项`);
+          return true;
+        }
+        const body = (await readJsonBody(req)) as { values?: Record<string, unknown> };
+        const { applied, pendingRestart } = ctx.configStore.updateValues(body?.values ?? {});
+        ok(res, { applied, pendingRestart });
+        return true;
+      }
+    }
+
     // --- 会话 ---
     if (path === '/api/sessions') {
       if (method === 'GET') {

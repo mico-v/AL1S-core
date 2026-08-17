@@ -5,6 +5,7 @@ import type { Plugin, SkillRegistry } from '../registry';
 
 export const helpPlugin: Plugin = {
   name: 'help',
+  displayName: '帮助',
   description: '帮助',
   register(registry: SkillRegistry): void {
     registry.registerCommand({

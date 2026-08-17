@@ -14,12 +14,20 @@ import { SessionPersistence } from './session/persistence';
 import { SkillRegistry } from './skills/registry';
 import { PluginControl } from './plugins/control';
 import { registerPlugins } from './skills/plugins';
+import { normalizeMessage } from './pipeline/normalize';
 import { Al1sFormatter } from './format/formatter';
 import { Pipeline } from './pipeline/pipeline';
 import { AdminServer } from './admin/server';
 import type { AdminContext } from './admin/router';
 
 const log = logger.child('bot');
+const receiveLog = logger.child('receive');
+
+/** 是否记录「收到消息」日志：LOG_RECEIVE='0'|'false'|'off' 时关闭，缺省开启 */
+function logReceiveEnabled(): boolean {
+  const raw = process.env.LOG_RECEIVE;
+  return raw === undefined || !['0', 'false', 'off'].includes(raw.trim().toLowerCase());
+}
 
 function readVersion(): string {
   try {
@@ -110,12 +118,33 @@ export class Bot {
 
     this.adminServer ? void this.adminServer.start() : undefined;
 
-    // 绑定消息事件：先跑插件后台钩子（防撤回缓存/课堂提醒等），再走主 pipeline
+    // 绑定消息事件：先记「收到消息」日志 + 跑插件后台钩子（防撤回缓存/课堂提醒等），再走主 pipeline
     this.client.onGroupMessage(async (event, ctx) => {
+      if (logReceiveEnabled()) {
+        const norm = normalizeMessage(event);
+        receiveLog.info('收到群消息', {
+          chatId: `g:${event.group_id}`,
+          group: event.group_id,
+          senderId: event.user_id,
+          senderName: event.sender.nickname || `用户${event.user_id}`,
+          atBot: norm.atBot,
+          text: norm.text,
+        });
+      }
       await this.registry.runMessageHooks(event, ctx);
       await this.pipeline.handleGroupMessage(event, ctx);
     });
     this.client.onPrivateMessage(async (event, ctx) => {
+      if (logReceiveEnabled()) {
+        const norm = normalizeMessage(event);
+        receiveLog.info('收到私聊消息', {
+          chatId: `p:${event.user_id}`,
+          senderId: event.user_id,
+          senderName: event.sender.nickname || `用户${event.user_id}`,
+          atBot: norm.atBot,
+          text: norm.text,
+        });
+      }
       await this.registry.runMessageHooks(event, ctx);
       await this.pipeline.handlePrivateMessage(event, ctx);
     });

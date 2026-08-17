@@ -18,6 +18,7 @@ const routes: RouteRecordRaw[] = [
       { path: '', name: 'dashboard', component: () => import('@/pages/Dashboard.vue') },
       { path: 'settings', name: 'settings', component: () => import('@/pages/Settings.vue') },
       { path: 'plugins', name: 'plugins', component: () => import('@/pages/Plugins.vue') },
+      { path: 'plugins/:name', name: 'plugin-detail', component: () => import('@/pages/PluginDetail.vue') },
       { path: 'sessions', name: 'sessions', component: () => import('@/pages/Sessions.vue') },
       { path: 'logs', name: 'logs', component: () => import('@/pages/Logs.vue') },
     ],

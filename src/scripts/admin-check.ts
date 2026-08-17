@@ -69,7 +69,9 @@ assert('metrics 含计数', typeof status.data.metrics?.messagesReceived === 'nu
 
 console.log('== config ==');
 const schema = (await (await fetch(`${base}/api/config/schema`, { headers: auth })).json()) as any;
-assert('schema 分组 >= 5', schema.ok && Array.isArray(schema.data.groups) && schema.data.groups.length >= 5);
+assert('schema 分组 >= 3', schema.ok && Array.isArray(schema.data.groups) && schema.data.groups.length >= 3);
+assert('全局 schema 不含插件分组(course)', !schema.data.groups.some((g: any) => g.key === 'course'));
+assert('全局 schema 不含插件分组(xxt)', !schema.data.groups.some((g: any) => g.key === 'xxt'));
 
 const cfg0 = (await (await fetch(`${base}/api/config`, { headers: auth })).json()) as any;
 assert('persona 可读取', typeof cfg0.data.values['persona'] === 'string');
@@ -101,7 +103,9 @@ assert('restartRequired 标志置位', configStore.restartRequired === true);
 
 console.log('== plugins ==');
 const plugins = (await (await fetch(`${base}/api/plugins`, { headers: auth })).json()) as any;
-assert('插件列表含「选人」', plugins.ok && plugins.data.commands.some((c: any) => c.name === '选人'));
+assert('插件列表含「xxt」', plugins.ok && plugins.data.plugins.some((p: any) => p.name === 'xxt'));
+assert('xxt 声明了设置(hasSettings)', plugins.data.plugins.find((p: any) => p.name === 'xxt').hasSettings === true);
+assert('xxt 含命令「选人」', plugins.data.plugins.find((p: any) => p.name === 'xxt').commands.some((c: any) => c.name === '选人'));
 const toggle = (await (
   await fetch(`${base}/api/plugins/enabled`, {
     method: 'PUT',
@@ -112,13 +116,31 @@ const toggle = (await (
 assert('命令启停 ok', toggle.ok === true);
 assert('registry 中「选人」已禁用', registry.isCommandEnabled('选人') === false);
 const plugins2 = (await (await fetch(`${base}/api/plugins`, { headers: auth })).json()) as any;
-assert('列表反映禁用', plugins2.data.commands.find((c: any) => c.name === '选人').enabled === false);
+assert('列表反映禁用', plugins2.data.plugins.find((p: any) => p.name === 'xxt').commands.find((c: any) => c.name === '选人').enabled === false);
 // 恢复
 await fetch(`${base}/api/plugins/enabled`, {
   method: 'PUT',
   headers: jsonHeaders,
   body: JSON.stringify({ kind: 'command', name: '选人', enabled: true }),
 });
+
+console.log('== 插件设置 ==');
+const pc = (await (await fetch(`${base}/api/plugins/xxt/config`, { headers: auth })).json()) as any;
+assert('插件配置 GET 带 group', pc.ok && pc.data.group?.key === 'xxt');
+assert('插件配置 GET 带值', pc.ok && 'env.XXT_CLASS_WARNING_COOLDOWN_SECONDS' in (pc.data.values ?? {}));
+const pcPut = (await (
+  await fetch(`${base}/api/plugins/xxt/config`, {
+    method: 'PUT',
+    headers: jsonHeaders,
+    body: JSON.stringify({ values: { 'env.XXT_CLASS_WARNING_COOLDOWN_SECONDS': 90 } }),
+  })
+).json()) as any;
+assert('插件配置 PUT applied', pcPut.ok && pcPut.data.applied.includes('env.XXT_CLASS_WARNING_COOLDOWN_SECONDS'));
+assert('插件配置写回 process.env', process.env['XXT_CLASS_WARNING_COOLDOWN_SECONDS'] === '90');
+const pcGet2 = (await (await fetch(`${base}/api/plugins/xxt/config`, { headers: auth })).json()) as any;
+assert('插件配置 GET 反映热更新', pcGet2.data.values['env.XXT_CLASS_WARNING_COOLDOWN_SECONDS'] === '90');
+const pcMissing = (await (await fetch(`${base}/api/plugins/not-exist/config`, { headers: auth })).json()) as any;
+assert('未知插件配置 404', pcMissing.ok === false);
 
 console.log('== sessions ==');
 const sessionsResp = (await (await fetch(`${base}/api/sessions`, { headers: auth })).json()) as any;

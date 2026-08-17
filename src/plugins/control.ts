@@ -11,6 +11,16 @@ export interface EnabledSnapshot {
   skills: Record<string, boolean>;
 }
 
+/** 单个插件在管理后台的展示项：含其命令/工具与其启停状态 */
+export interface PluginItem {
+  name: string;
+  displayName: string;
+  description: string;
+  hasSettings: boolean; // 该插件是否声明了设置项（前端据此显示"设置"徽标/表单）
+  commands: Array<{ name: string; description: string; enabled: boolean }>;
+  skills: Array<{ name: string; description: string; enabled: boolean }>;
+}
+
 export class PluginControl {
   private readonly file: string;
   private readonly registry: SkillRegistry;
@@ -40,12 +50,25 @@ export class PluginControl {
     return ok;
   }
 
-  /** 当前命令/skill 列表（含 enabled 状态），供管理后台展示 */
-  list(): { commands: Array<{ name: string; description: string; enabled: boolean }>; skills: Array<{ name: string; description: string; enabled: boolean }> } {
-    return {
-      commands: this.registry.getCommands().map((c) => ({ name: c.name, description: c.description, enabled: this.registry.isCommandEnabled(c.name) })),
-      skills: this.registry.getSkills().map((s) => ({ name: s.name, description: s.description, enabled: this.registry.isSkillEnabled(s.name) })),
-    };
+  /** 插件列表（含各插件命令/工具的启停状态），供管理后台展示 */
+  list(): { plugins: PluginItem[] } {
+    const plugins = this.registry.getPluginMetas().map((m) => ({
+      name: m.name,
+      displayName: m.displayName,
+      description: m.description,
+      hasSettings: Boolean(m.settings && m.settings.fields.length > 0),
+      commands: this.registry.getCommandsByPlugin(m.name).map((c) => ({
+        name: c.name,
+        description: c.description,
+        enabled: this.registry.isCommandEnabled(c.name),
+      })),
+      skills: this.registry.getSkillsByPlugin(m.name).map((s) => ({
+        name: s.name,
+        description: s.description,
+        enabled: this.registry.isSkillEnabled(s.name),
+      })),
+    }));
+    return { plugins };
   }
 
   private persist(): void {

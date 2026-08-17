@@ -6,47 +6,52 @@
       <v-btn variant="text" icon="mdi-refresh" :loading="loading" @click="load" />
     </div>
 
-    <v-card class="mb-4">
-      <v-card-title class="text-subtitle-2">{{ t('plugins.commands') }}</v-card-title>
-      <v-data-table
-        :headers="headers"
-        :items="commands"
-        :loading="loading"
-        items-per-page="-1"
-        density="compact"
-      >
-        <template #item.enabled="{ item }">
-          <v-switch
-            :model-value="item.enabled"
-            color="primary"
-            density="compact"
-            hide-details
-            @update:model-value="(v: unknown) => toggle('command', item, !!v)"
-          />
-        </template>
-      </v-data-table>
-    </v-card>
+    <v-alert v-if="loadError" type="error" class="mb-4">{{ loadError }}</v-alert>
 
-    <v-card>
-      <v-card-title class="text-subtitle-2">{{ t('plugins.skills') }}</v-card-title>
-      <v-data-table
-        :headers="headers"
-        :items="skills"
-        :loading="loading"
-        items-per-page="-1"
-        density="compact"
-      >
-        <template #item.enabled="{ item }">
-          <v-switch
-            :model-value="item.enabled"
-            color="primary"
-            density="compact"
-            hide-details
-            @update:model-value="(v: unknown) => toggle('skill', item, !!v)"
-          />
-        </template>
-      </v-data-table>
-    </v-card>
+    <v-row v-if="plugins.length">
+      <v-col v-for="p in plugins" :key="p.name" cols="12" sm="6" lg="4" class="plugin-col">
+        <v-card :to="{ name: 'plugin-detail', params: { name: p.name } }" hover class="plugin-card">
+          <v-card-item>
+            <template #prepend>
+              <v-avatar color="primary" variant="tonal" size="44">
+                <v-icon>mdi-puzzle-outline</v-icon>
+              </v-avatar>
+            </template>
+            <template #title>
+              <div class="d-flex align-center flex-wrap">
+                <span>{{ p.displayName }}</span>
+                <v-chip v-if="p.hasSettings" size="x-small" color="primary" variant="tonal" class="ml-2">
+                  {{ t('plugins.hasSettings') }}
+                </v-chip>
+              </div>
+            </template>
+            <template #subtitle>
+              <span class="font-mono">{{ p.name }}</span>
+            </template>
+          </v-card-item>
+
+          <v-card-text class="text-medium-emphasis">
+            {{ p.description }}
+          </v-card-text>
+
+          <v-card-actions class="d-flex align-center px-4 pb-3">
+            <v-chip size="small" variant="text" class="text-caption">
+              {{ t('plugins.commandCount', { n: p.commands.length }) }}
+            </v-chip>
+            <v-chip size="small" variant="text" class="text-caption ml-1">
+              {{ t('plugins.skillCount', { n: p.skills.length }) }}
+            </v-chip>
+            <v-spacer />
+            <v-btn :to="{ name: 'plugin-detail', params: { name: p.name } }" variant="text" color="primary" size="small">
+              {{ t('plugins.open') }}
+              <v-icon end size="small">mdi-chevron-right</v-icon>
+            </v-btn>
+          </v-card-actions>
+        </v-card>
+      </v-col>
+    </v-row>
+
+    <v-alert v-else-if="!loading && !loadError" type="info">{{ t('plugins.empty') }}</v-alert>
   </div>
 </template>
 
@@ -54,51 +59,23 @@
 import { onMounted, ref } from 'vue'
 import { useI18n } from 'vue-i18n'
 import { api } from '@/api/client'
-import type { CommandItem, SkillItem } from '@/api/types'
-import { useSnackbarStore } from '@/stores/snackbar'
+import type { PluginItem } from '@/api/types'
 
 const { t } = useI18n()
-const snackbar = useSnackbarStore()
 
-const commands = ref<CommandItem[]>([])
-const skills = ref<SkillItem[]>([])
+const plugins = ref<PluginItem[]>([])
 const loading = ref(false)
-
-interface Header {
-  title: string
-  key: string
-  sortable?: boolean
-}
-
-const headers: Header[] = [
-  { title: t('plugins.name'), key: 'name' },
-  { title: t('plugins.description'), key: 'description' },
-  { title: t('plugins.enabled'), key: 'enabled', sortable: false },
-]
-
-type ToggleItem = CommandItem | SkillItem
-
-/** 切换启用状态：乐观更新，失败回滚 */
-async function toggle(kind: 'command' | 'skill', item: ToggleItem, enabled: boolean): Promise<void> {
-  const prev = item.enabled
-  if (prev === enabled) return
-  item.enabled = enabled // 乐观更新
-  const res = await api.setPluginEnabled({ kind, name: item.name, enabled })
-  if (!res.ok) {
-    item.enabled = prev // 失败回滚
-    snackbar.show(res.error ?? t('plugins.toggleFailed'), 'error')
-  }
-}
+const loadError = ref('')
 
 async function load(): Promise<void> {
   loading.value = true
+  loadError.value = ''
   const res = await api.getPlugins()
   loading.value = false
   if (res.ok && res.data) {
-    commands.value = res.data.commands
-    skills.value = res.data.skills
+    plugins.value = res.data.plugins
   } else {
-    snackbar.show(res.error ?? '加载插件列表失败', 'error')
+    loadError.value = res.error ?? '加载插件列表失败'
   }
 }
 
@@ -106,3 +83,15 @@ onMounted(() => {
   void load()
 })
 </script>
+
+<style scoped>
+.plugin-card {
+  height: 100%;
+  transition:
+    transform 0.15s ease,
+    box-shadow 0.15s ease;
+}
+.plugin-col {
+  display: flex;
+}
+</style>

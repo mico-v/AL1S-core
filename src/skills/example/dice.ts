@@ -28,6 +28,7 @@ export const diceSkill: Skill = {
 
 export const dicePlugin: Plugin = {
   name: 'dice',
+  displayName: '骰子',
   description: '示例工具：掷骰子',
   register(registry: SkillRegistry): void {
     registry.registerSkill(diceSkill);

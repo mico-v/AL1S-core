@@ -36,6 +36,14 @@ type ConfigField = {
 
 type CommandItem = { name: string; description: string; enabled: boolean };
 type SkillItem = { name: string; description: string; enabled: boolean };
+type PluginItem = {
+  name: string;              // 插件标识（如 xxt / course-schedule）
+  displayName: string;       // 中文显示名（侧栏/卡片/页头）
+  description: string;
+  hasSettings: boolean;      // 是否声明了设置项
+  commands: CommandItem[];   // 该插件注册的命令（含启停）
+  skills: SkillItem[];       // 该插件注册的工具（含启停）
+};
 
 type SessionSummary = {
   chatId: string;          // "g:123" / "p:456"
@@ -81,7 +89,16 @@ Body：`{ values: Record<string, unknown> }`（部分提交即可）。后端热
 返回 `{ groups: ConfigGroup[] }`。
 
 ### `GET /api/plugins`
-返回 `{ commands: CommandItem[], skills: SkillItem[] }`。
+返回 `{ plugins: PluginItem[] }` —— 每个插件含其命令/工具列表与启停状态、`hasSettings`。前端据此渲染侧栏「插件」目录 + 插件总览卡片。
+
+### `GET /api/plugins/:name/config`（URL 编码）
+返回 `{ group: ConfigGroup | null, values: Record<string, unknown> }`。
+- `group`：该插件声明的设置 schema（无设置项的插件为 `null`）；
+- `values`：fieldKey（`env.*`）→ 当前生效值（`env.*` 读回为字符串）。
+
+### `PUT /api/plugins/:name/config`
+Body：`{ values: Record<string, unknown> }`（部分提交）。热应用 + 持久化（复用全局 settings.json 覆盖层）。
+返回 `{ applied: string[], pendingRestart: string[] }`。无设置项的插件返回 400；未知插件返回 404。
 
 ### `PUT /api/plugins/enabled`
 Body：`{ kind: 'command' | 'skill', name: string, enabled: boolean }`。热生效（/命令 与工具调用按此过滤）。
@@ -107,13 +124,14 @@ Body：`{ kind: 'command' | 'skill', name: string, enabled: boolean }`。热生�
 ### `POST /api/system/restart`
 干净退出进程（由外部 supervisor 拉起）。返回 `{ ok: true, message }` 后进程退出。
 
-## 前端要求（5 页面，Vuetify 3）
+## 前端要求（Vuetify 3）
 1. **登录**：token 输入 + 保存；验证后进入。
 2. **仪表盘 / Dashboard**：状态卡（连接/登录名/在线时长/会话数）、指标卡（收/发/工具/错误）、最近日志流小窗（只读，级别色标）。
-3. **设置 / Settings**：schema 驱动表单 —— 按 `groups` 渲染折叠分区卡片；每字段按 `type` 选控件（string→文本、password→密码、textarea→多行、number→数字、boolean→开关、string-list/number-list→多选 chips 输入）；**改动防抖 500ms 自动保存**（调 `PUT /api/config`），保存后提示 `applied`/`pendingRestart`；`requiresRestart` 字段加"重启后生效"徽标并禁用即时保存提示。配置变化即时反映（后端已热应用，保存后可重新 `GET /api/config` 对账）。
-4. **插件 / Plugins**：命令 + 工具两个表格（名称/描述/启用开关），开关调 `PUT /api/plugins/enabled`，乐观更新 + 失败回滚。
-5. **会话 / Sessions**：表格（chatId/消息数/最近活跃/生成中），点行打开日志抽屉（`GET /api/sessions/:id`），抽屉内"清空"按钮（`DELETE`）。
-6. **日志 / Logs**：SSE 实时流（`EventSource`），级别过滤 chips、tag 过滤、暂停/继续、自动滚动开关、清空视图；断线自动重连（Last-Event-ID 续传）。
+3. **设置 / Settings**：schema 驱动表单 —— 按 `groups` 渲染折叠分区卡片；每字段按 `type` 选控件（string→文本、password→密码、textarea→多行、number→数字、boolean→开关、string-list/number-list→多选 chips 输入）；**改动防抖 500ms 自动保存**（调 `PUT /api/config`），保存后提示 `applied`/`pendingRestart`；`requiresRestart` 字段加"重启后生效"徽标并禁用即时保存提示。配置变化即时反映（后端已热应用，保存后可重新 `GET /api/config` 对账）。插件分组（课程表/XXT）已不在全局 schema 里，各自进插件详情页。
+4. **插件 / Plugins**：AstrBot 式**卡片网格**（图标/displayName/描述/hasSettings 徽标/命令与工具数），点击卡片进入 `#/plugins/:name` 详情页。
+5. **插件详情 / PluginDetail**：返回箭头 + 插件名；有设置项则渲染设置表单（同 Settings 的 schema 驱动控件，调 `GET/PUT /api/plugins/:name/config`）；下方为该插件命令/工具开关表（乐观更新 + 失败回滚，调 `PUT /api/plugins/enabled`）。
+6. **会话 / Sessions**：表格（chatId/消息数/最近活跃/生成中），点行打开日志抽屉（`GET /api/sessions/:id`），抽屉内"清空"按钮（`DELETE`）。
+7. **日志 / Logs**：SSE 实时流（`EventSource`），级别过滤 chips、tag 过滤、暂停/继续、自动滚动开关、清空视图；断线自动重连（Last-Event-ID 续传）。后端会为**每条 WS 收到的聊天消息**记 `tag='receive'` 的 info 日志（`收到群消息`/`收到私聊消息`），可借此按 tag 过滤聊天记录。
 
 ## 工程约定
 - 技术栈：Vue 3（`<script setup>`）+ Vite + TypeScript + Vuetify 3 + Pinia + vue-router（hash）+ vue-i18n。

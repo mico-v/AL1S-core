@@ -11,10 +11,10 @@ import { xxtPlugin } from './xxt/plugin';
 import { courseSchedulePlugin } from './courseSchedule/plugin';
 
 export function registerPlugins(registry: SkillRegistry): void {
-  helpPlugin.register(registry);
-  resetPlugin.register(registry);
-  personaPlugin.register(registry);
-  dicePlugin.register(registry);
-  xxtPlugin.register(registry);
-  courseSchedulePlugin.register(registry);
+  registry.registerPlugin(helpPlugin);
+  registry.registerPlugin(resetPlugin);
+  registry.registerPlugin(personaPlugin);
+  registry.registerPlugin(dicePlugin);
+  registry.registerPlugin(xxtPlugin);
+  registry.registerPlugin(courseSchedulePlugin);
 }

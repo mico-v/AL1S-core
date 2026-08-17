@@ -1,6 +1,7 @@
 // 中文文案
 export default {
   nav: {
+    main: '主菜单',
     dashboard: '仪表盘',
     settings: '设置',
     plugins: '插件',
@@ -14,6 +15,8 @@ export default {
     failed: '加载失败',
     retry: '重试',
     close: '关闭',
+    back: '返回',
+    theme: '切换主题',
   },
   login: {
     title: 'AL1S 管理后台',
@@ -55,12 +58,20 @@ export default {
   },
   plugins: {
     title: '插件',
+    all: '全部插件',
+    settings: '设置',
+    noSettings: '该插件没有可配置的设置项',
+    hasSettings: '有设置',
+    open: '打开',
     commands: '命令',
     skills: '工具',
     name: '名称',
     description: '描述',
     enabled: '启用',
     toggleFailed: '切换失败',
+    commandCount: '命令 {n}',
+    skillCount: '工具 {n}',
+    empty: '暂无插件',
   },
   sessions: {
     title: '会话',

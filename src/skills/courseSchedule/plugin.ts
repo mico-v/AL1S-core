@@ -2,12 +2,30 @@
  * 课程表插件：注册 /今日课表、/同步课表 命令 + 两个 SQL 工具。
  */
 import type { Plugin, SkillRegistry } from '../registry';
+import type { ConfigGroupMeta } from '../../config/schema';
+import { registerConfigFields } from '../../config/schema';
 import { CourseSchedulePlugin } from './main';
 import { ScheduleStore } from './store';
 
+/** 插件声明设置：COURSE_* 环境变量配置项。模块顶层注册进字段索引（见 registerConfigFields 注释的时序不变量）。 */
+const courseSettings: ConfigGroupMeta = {
+  key: 'course',
+  label: '课程表插件',
+  description: '数据文件、群文件目录与字体',
+  fields: [
+    { key: 'env.COURSE_DATA_FILE', label: '数据文件路径', type: 'string', group: 'course', requiresRestart: true },
+    { key: 'env.COURSE_ICS_FOLDER', label: '群文件课表目录', type: 'string', group: 'course', requiresRestart: true },
+    { key: 'env.COURSE_FONT_PATH', label: '中文字体路径', type: 'string', group: 'course', hint: '留空则自动查找' },
+  ],
+};
+// 必须在 ConfigStore 构造前调用（bot.ts 静态 import 链保证）；幂等
+registerConfigFields(courseSettings);
+
 export const courseSchedulePlugin: Plugin = {
   name: 'course-schedule',
+  displayName: '课程表',
   description: '课程表插件（今日课表/同步课表 + SQL 查询与修改）',
+  settings: courseSettings,
   register(registry: SkillRegistry): void {
     const plugin = new CourseSchedulePlugin(new ScheduleStore(process.env.COURSE_DATA_FILE || './data/course-schedule.json'));
     plugin.setApi(registry.getApi());

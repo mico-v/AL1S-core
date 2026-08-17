@@ -7,6 +7,7 @@ import type { Plugin, SkillRegistry } from '../registry';
 
 export const personaPlugin: Plugin = {
   name: 'persona',
+  displayName: '人设',
   description: '人设',
   register(registry: SkillRegistry): void {
     registry.registerCommand({

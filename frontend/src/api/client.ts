@@ -5,6 +5,7 @@ import type {
   ConfigSchema,
   ConfigValues,
   LogsData,
+  PluginConfig,
   PluginsData,
   SessionDetail,
   SessionsData,
@@ -118,6 +119,10 @@ export const api = {
   getPlugins: (): Promise<ApiResponse<PluginsData>> => get('/plugins'),
   setPluginEnabled: (payload: PluginTogglePayload): Promise<ApiResponse<{ ok: boolean }>> =>
     put('/plugins/enabled', payload),
+  getPluginConfig: (name: string): Promise<ApiResponse<PluginConfig>> =>
+    get(`/plugins/${encodeURIComponent(name)}/config`),
+  updatePluginConfig: (name: string, values: Record<string, unknown>): Promise<ApiResponse<ConfigSaveResult>> =>
+    put(`/plugins/${encodeURIComponent(name)}/config`, { values }),
   getSessions: (): Promise<ApiResponse<SessionsData>> => get('/sessions'),
   getSessionMessages: (chatId: string): Promise<ApiResponse<SessionDetail>> =>
     get(`/sessions/${encodeURIComponent(chatId)}`),

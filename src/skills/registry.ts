@@ -14,6 +14,7 @@ import type {
 } from '@snowluma/sdk';
 import type { SessionManager } from '../session/manager';
 import type { BotConfig } from '../config';
+import type { ConfigGroupMeta } from '../config/schema';
 import { logger } from '../logging/logger';
 
 const log = logger.child('registry');
@@ -63,10 +64,20 @@ export interface Command {
   handler(ctx: CommandContext): Promise<void>;
 }
 
+/** 插件元数据（管理后台据此渲染插件卡片与详情页） */
+export interface PluginMeta {
+  name: string;
+  displayName: string;
+  description: string;
+  settings?: ConfigGroupMeta; // 插件设置 schema；无设置项则省略
+}
+
 /** 插件：一组 skill 与命令的打包单元，注册入口 */
 export interface Plugin {
   name: string;
+  displayName?: string; // 侧栏/页头显示名；缺省用 name
   description: string;
+  settings?: ConfigGroupMeta; // 插件声明设置（模块顶层需先 registerConfigFields 并入字段索引）
   register(registry: SkillRegistry): void;
 }
 
@@ -79,16 +90,60 @@ export class SkillRegistry {
   private api?: SnowLumaApiClient;
   private messageHooks: MessageHook[] = [];
   private noticeHooks: NoticeHook[] = [];
+  // 插件元数据 + 命令/skill 归属（管理后台按插件分组展示用）
+  private pluginMetas: PluginMeta[] = [];
+  private currentPluginName: string | undefined;
+  private commandPlugins = new Map<string, string>();
+  private skillPlugins = new Map<string, string>();
+
+  /** 注册插件元数据并执行插件注册；期间 registerCommand/registerSkill 自动归属该插件 */
+  registerPlugin(plugin: Plugin): void {
+    this.pluginMetas.push({
+      name: plugin.name,
+      displayName: plugin.displayName ?? plugin.name,
+      description: plugin.description,
+      settings: plugin.settings,
+    });
+    const prev = this.currentPluginName;
+    this.currentPluginName = plugin.name;
+    try {
+      plugin.register(this);
+    } finally {
+      this.currentPluginName = prev;
+    }
+  }
+
+  /** 全部插件元数据（注册顺序） */
+  getPluginMetas(): PluginMeta[] {
+    return [...this.pluginMetas];
+  }
+
+  /** 按名称查插件元数据 */
+  getPluginMeta(name: string): PluginMeta | undefined {
+    return this.pluginMetas.find((p) => p.name === name);
+  }
+
+  /** 某插件注册的全部命令 */
+  getCommandsByPlugin(name: string): Command[] {
+    return this.commands.filter((c) => this.commandPlugins.get(c.name) === name);
+  }
+
+  /** 某插件注册的全部工具 skill */
+  getSkillsByPlugin(name: string): Skill[] {
+    return this.skills.filter((s) => this.skillPlugins.get(s.name) === name);
+  }
 
   /** 注册一个工具 skill（默认启用；保留已持久化的禁用状态） */
   registerSkill(skill: Skill): void {
     this.skills.push(skill);
+    if (this.currentPluginName !== undefined) this.skillPlugins.set(skill.name, this.currentPluginName);
     if (!this.skillEnabled.has(skill.name)) this.skillEnabled.set(skill.name, true);
   }
 
   /** 注册一个斜杠命令（默认启用；保留已持久化的禁用状态） */
   registerCommand(command: Command): void {
     this.commands.push(command);
+    if (this.currentPluginName !== undefined) this.commandPlugins.set(command.name, this.currentPluginName);
     if (!this.commandEnabled.has(command.name)) this.commandEnabled.set(command.name, true);
   }
 

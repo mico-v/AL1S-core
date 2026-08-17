@@ -5,6 +5,7 @@ import type { Plugin, SkillRegistry } from '../registry';
 
 export const resetPlugin: Plugin = {
   name: 'reset',
+  displayName: '重置上下文',
   description: '清空上下文',
   register(registry: SkillRegistry): void {
     registry.registerCommand({

@@ -75,6 +75,15 @@ export interface SkillItem {
   enabled: boolean
 }
 
+export interface PluginItem {
+  name: string // 插件标识（如 xxt / course-schedule）
+  displayName: string // 中文显示名（侧栏/卡片/页头）
+  description: string
+  hasSettings: boolean // 是否声明了设置项
+  commands: CommandItem[] // 该插件注册的命令（含启停）
+  skills: SkillItem[] // 该插件注册的工具（含启停）
+}
+
 export interface SessionSummary {
   chatId: string // "g:123" / "p:456"
   messageCount: number
@@ -100,8 +109,12 @@ export interface ConfigSchema {
 }
 
 export interface PluginsData {
-  commands: CommandItem[]
-  skills: SkillItem[]
+  plugins: PluginItem[]
+}
+
+export interface PluginConfig {
+  group: ConfigGroup | null // 无设置项的插件为 null
+  values: Record<string, unknown> // fieldKey（env.*）→ 当前生效值
 }
 
 export interface ConfigSaveResult {
