@@ -4,7 +4,7 @@
  */
 import type { IncomingMessage, ServerResponse } from 'node:http';
 import type { ConfigStore } from '../config/store';
-import { CONFIG_GROUPS } from '../config/schema';
+import { CONFIG_FIELD_MAP, CONFIG_GROUPS } from '../config/schema';
 import type { SkillRegistry } from '../skills/registry';
 import type { PluginControl } from '../plugins/control';
 import type { SessionManager } from '../session/manager';
@@ -49,6 +49,15 @@ function fail(res: ServerResponse, status: number, error: string): void {
   sendJson(res, status, { ok: false, error });
 }
 
+function redactConfigValues(values: Record<string, unknown>): Record<string, unknown> {
+  const out = { ...values };
+  for (const key of Object.keys(out)) {
+    if (/key|token|secret|password/i.test(key)) {
+      out[key] = out[key] ? '••••••••' : '';
+    }
+  }
+  return out;
+}
 /** 读取并解析 JSON body */
 function readJsonBody(req: IncomingMessage): Promise<unknown> {
   return new Promise((resolve, reject) => {
@@ -105,16 +114,30 @@ export async function handleApiRequest(ctx: AdminContext, req: IncomingMessage, 
     // --- 配置 ---
     if (path === '/api/config') {
       if (method === 'GET') {
-        ok(res, { values: ctx.configStore.getValues() });
+        ok(res, { values: redactConfigValues(ctx.configStore.getValues()) });
         return true;
       }
       if (method === 'PUT') {
         const body = (await readJsonBody(req)) as { values?: Record<string, unknown> };
         const values = body?.values ?? {};
+        for (const [key, value] of Object.entries(values)) {
+          if (/key|token|secret|password/i.test(key) && value === '••••••••') delete values[key];
+        }
         const { applied, pendingRestart } = ctx.configStore.updateValues(values);
         ok(res, { applied, pendingRestart });
         return true;
       }
+    }
+    if (method === 'GET' && path === '/api/config/secret') {
+      const key = url.searchParams.get('key') ?? '';
+      const meta = CONFIG_FIELD_MAP[key];
+      if (!meta || meta.type !== 'password') {
+        fail(res, 404, '密钥字段不存在');
+        return true;
+      }
+      const value = ctx.configStore.getField(key);
+      ok(res, { key, value: typeof value === 'string' ? value : '' });
+      return true;
     }
     if (method === 'GET' && path === '/api/config/schema') {
       ok(res, { groups: CONFIG_GROUPS });
@@ -165,7 +188,9 @@ export async function handleApiRequest(ctx: AdminContext, req: IncomingMessage, 
           return true;
         }
         const body = (await readJsonBody(req)) as { values?: Record<string, unknown> };
-        const { applied, pendingRestart } = ctx.configStore.updateValues(body?.values ?? {});
+        const allowed = new Set(meta.settings.fields.map((f) => f.key));
+        const patch = Object.fromEntries(Object.entries(body?.values ?? {}).filter(([key]) => allowed.has(key)));
+        const { applied, pendingRestart } = ctx.configStore.updateValues(patch);
         ok(res, { applied, pendingRestart });
         return true;
       }
@@ -174,16 +199,18 @@ export async function handleApiRequest(ctx: AdminContext, req: IncomingMessage, 
     // --- 会话 ---
     if (path === '/api/sessions') {
       if (method === 'GET') {
-        const sessions = ctx.sessions
-          .list()
-          .map((s) => ({
-            chatId: s.chatId,
-            messageCount: s.size,
-            lastActivity: Math.floor(s.lastActivity / 1000), // 统一 epoch 秒
-            isGenerating: s.isGenerating,
-            personaOverride: s.personaOverride,
-          }))
-          .sort((a, b) => b.lastActivity - a.lastActivity);
+        const disk = ctx.persistence?.listDiskSummaries() ?? [];
+        const byId = new Map(disk.map((s) => [s.chatId, s]));
+        for (const s of ctx.sessions.list()) byId.set(s.chatId, {
+          chatId: s.chatId, messageCount: s.size, lastActivity: s.lastActivity, isGenerating: s.isGenerating, personaOverride: s.personaOverride,
+        });
+        const sessions = [...byId.values()].map((s) => ({
+          chatId: s.chatId,
+          messageCount: s.messageCount,
+          lastActivity: Math.floor(s.lastActivity / 1000),
+          isGenerating: 'isGenerating' in s ? Boolean(s.isGenerating) : false,
+          personaOverride: s.personaOverride,
+        })).sort((a, b) => b.lastActivity - a.lastActivity);
         ok(res, { sessions });
         return true;
       }
@@ -192,11 +219,7 @@ export async function handleApiRequest(ctx: AdminContext, req: IncomingMessage, 
     if (sessionMatch) {
       const chatId = decodeURIComponent(sessionMatch[1]!);
       if (method === 'GET') {
-        const session = ctx.sessions.list().find((s) => s.chatId === chatId);
-        if (!session) {
-          fail(res, 404, `会话不存在：${chatId}`);
-          return true;
-        }
+        const session = ctx.sessions.getOrLoad(chatId);
         const messages = session.getSnapshot().map((m) => ({ ...m, time: Math.floor(m.time / 1000) })); // 统一 epoch 秒
         ok(res, { chatId, messages });
         return true;
@@ -229,7 +252,7 @@ export async function handleApiRequest(ctx: AdminContext, req: IncomingMessage, 
       });
       res.write('retry: 3000\n\n');
 
-      // 每条 log 事件带 id（日志 time，可字典序比较），浏览器重连自动带 Last-Event-ID 续传
+      // 每条 log 事件带 id（基于记录时间的兼容格式）
       const sendLog = (record: LogRecord): void => {
         res.write(`id: ${record.time}\n`);
         res.write(`event: log\ndata: ${JSON.stringify(record)}\n\n`);

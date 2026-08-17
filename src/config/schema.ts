@@ -25,6 +25,7 @@ export interface ConfigFieldMeta {
   hint?: string;
   placeholder?: string;
   requiresRestart?: boolean; // true → 前端显示"重启后生效"徽标
+  applyMode?: 'live' | 'rebuild' | 'restart';
   min?: number;
   max?: number;
   step?: number;
@@ -51,11 +52,12 @@ export const CONFIG_GROUPS: ConfigGroupMeta[] = [
       { key: 'enabledGroups', label: '群白名单', type: 'number-list', group: 'general', hint: '逗号分隔群号；留空 = 全部群' },
       { key: 'maxSessions', label: '会话数上限（LRU）', type: 'number', group: 'general', min: 1 },
       { key: 'adminIds', label: '管理员 QQ', type: 'number-list', group: 'general', hint: '逗号分隔；留空 = 不限制' },
-      { key: 'wsUrl', label: 'SnowLuma WS 地址', type: 'string', group: 'general', requiresRestart: true },
-      { key: 'accessToken', label: 'OneBot accessToken', type: 'password', group: 'general', requiresRestart: true },
-      { key: 'env.LOG_LEVEL', label: '日志级别', type: 'string', group: 'general', hint: 'debug|info|warn|error' },
-      { key: 'env.LOG_FILE', label: '日志文件路径', type: 'string', group: 'general', hint: '留空=仅终端', requiresRestart: true },
-      { key: 'env.LOG_MAX_SIZE_MB', label: '日志轮转阈值(MB)', type: 'number', group: 'general', min: 1, requiresRestart: true },
+      { key: 'wsUrl', label: 'SnowLuma WS 地址', type: 'string', group: 'general', applyMode: 'rebuild' },
+      { key: 'httpUrl', label: 'SnowLuma HTTP 地址', type: 'string', group: 'general', applyMode: 'rebuild' },
+      { key: 'accessToken', label: 'OneBot accessToken', type: 'password', group: 'general', applyMode: 'rebuild' },
+      { key: 'env.LOG_LEVEL', label: '日志级别', type: 'string', group: 'general', applyMode: 'live', hint: 'debug|info|warn|error' },
+      { key: 'env.LOG_FILE', label: '日志文件路径', type: 'string', group: 'general', applyMode: 'rebuild', hint: '留空=仅终端' },
+      { key: 'env.LOG_MAX_SIZE_MB', label: '日志轮转阈值(MB)', type: 'number', group: 'general', applyMode: 'live', min: 1 },
     ],
   },
   {
@@ -63,28 +65,14 @@ export const CONFIG_GROUPS: ConfigGroupMeta[] = [
     label: 'LLM',
     description: 'OpenAI 兼容接口',
     fields: [
-      { key: 'llm.baseUrl', label: 'Base URL', type: 'string', group: 'llm', requiresRestart: true },
-      { key: 'llm.apiKey', label: 'API Key', type: 'password', group: 'llm', requiresRestart: true },
-      { key: 'llm.model', label: '模型', type: 'string', group: 'llm' },
-      { key: 'llm.temperature', label: '温度', type: 'number', group: 'llm', min: 0, max: 2, step: 0.1 },
-      { key: 'llm.maxTokens', label: '最大 tokens', type: 'number', group: 'llm', min: 1 },
+      { key: 'llm.baseUrl', label: 'Base URL', type: 'string', group: 'llm', applyMode: 'live' },
+      { key: 'llm.apiKey', label: 'API Key', type: 'password', group: 'llm', applyMode: 'live' },
+      { key: 'llm.model', label: '模型', type: 'string', group: 'llm', applyMode: 'live' },
+      // OpenAI 兼容接口通常由 provider/model 决定采样策略，不再展示温度设置。
+      { key: 'llm.maxTokens', label: '最大输出 tokens', type: 'number', group: 'llm', min: 1 },
     ],
   },
-  {
-    key: 'al1sFormat',
-    label: 'AL1S 格式化',
-    description: 'LLM 回复的 Markdown 清理与分段发送（可开关）',
-    fields: [
-      { key: 'al1sFormat.enabled', label: '启用格式化', type: 'boolean', group: 'al1sFormat', hint: '开启后 LLM 输出先清理 Markdown' },
-      { key: 'al1sFormat.globalMarkdownKiller', label: '全局 Markdown 清理', type: 'boolean', group: 'al1sFormat', hint: '含命令文本回复' },
-      { key: 'al1sFormat.lineSplit', label: '按结构分段发送', type: 'boolean', group: 'al1sFormat' },
-      { key: 'al1sFormat.charsPerSecond', label: '分段字数/秒', type: 'number', group: 'al1sFormat', hint: '越小间隔越长', min: 1 },
-      { key: 'al1sFormat.minDelay', label: '单段最小延时(秒)', type: 'number', group: 'al1sFormat', min: 0 },
-      { key: 'al1sFormat.maxDelay', label: '单段最大延时(秒)', type: 'number', group: 'al1sFormat', min: 0 },
-    ],
-  },
-  // 注意：课程表 / XXT 的设置项由各插件模块自己声明（skills/xxt、skills/courseSchedule），
-  // 经下方 registerConfigFields 并入 CONFIG_FIELD_MAP，不进 CONFIG_GROUPS（全局"设置"页不显示插件分组）。
+  // 课程表 / XXT / Shell 的设置由各自插件声明并显示在插件详情页。
 ];
 
 /** 字段索引：key → 元数据 */

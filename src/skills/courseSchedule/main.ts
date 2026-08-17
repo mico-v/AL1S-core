@@ -27,7 +27,9 @@ import { applySqlEditToMember, executeCourseScheduleSql } from './sql';
 import { drawRowsImage, type RenderRow } from './render';
 import type { CommandContext } from '../registry';
 
-const SCHEDULE_FOLDER_NAME = (process.env.COURSE_ICS_FOLDER || 'schedule').toLowerCase();
+function scheduleFolderName(): string {
+  return (process.env.COURSE_ICS_FOLDER || 'schedule').toLowerCase();
+}
 const MAX_ICS_BYTES = 2 * 1024 * 1024;
 const ROOT_SCHEDULE_FILE_RE = /^schedule(\d+)\.ics$/i;
 const FOLDER_SCHEDULE_FILE_RE = /^(\d+)\.ics$/i;
@@ -68,16 +70,16 @@ function normalizedScheduleFilename(userId: string): string {
   return `${userId}.ics`;
 }
 function normalizedSchedulePath(userId: string): string {
-  return `${SCHEDULE_FOLDER_NAME}/${normalizedScheduleFilename(userId)}`;
+  return `${scheduleFolderName()}/${normalizedScheduleFilename(userId)}`;
 }
 function isNormalizedScheduleFile(fileInfo: FileInfo, userId: string): boolean {
   const folderPath = String(fileInfo['_folder_path'] ?? '').replace(/^\/+|\/+$/g, '').toLowerCase();
-  return folderPath === SCHEDULE_FOLDER_NAME && fileName(fileInfo).toLowerCase() === normalizedScheduleFilename(userId).toLowerCase();
+  return folderPath === scheduleFolderName() && fileName(fileInfo).toLowerCase() === normalizedScheduleFilename(userId).toLowerCase();
 }
 function extractScheduleUserId(filename: string, folderPath: string): string | null {
   const name = filename.trim();
   const normalized = folderPath.trim().replace(/^\/+|\/+$/g, '').toLowerCase();
-  if (normalized.split('/').at(-1) === SCHEDULE_FOLDER_NAME) {
+  if (normalized.split('/').at(-1) === scheduleFolderName()) {
     const m = name.match(FOLDER_SCHEDULE_FILE_RE);
     if (m) return m[1]!;
   }
@@ -129,9 +131,15 @@ function isOwnQuery(query: string): boolean {
 export class CourseSchedulePlugin {
   private api?: SnowLumaApiClient;
   private readonly store: ScheduleStore;
+  private icsFolderName: string;
 
   constructor(store: ScheduleStore) {
     this.store = store;
+    this.icsFolderName = (process.env.COURSE_ICS_FOLDER || 'schedule').toLowerCase();
+  }
+
+  reloadFromConfig(): void {
+    this.icsFolderName = (process.env.COURSE_ICS_FOLDER || 'schedule').toLowerCase();
   }
 
   setApi(api: SnowLumaApiClient | undefined): void {
@@ -408,7 +416,7 @@ export class CourseSchedulePlugin {
     }
     for (const folder of folders) {
       const path = String(folder['_folder_path'] ?? '').replace(/^\/+|\/+$/g, '').toLowerCase();
-      if (path === SCHEDULE_FOLDER_NAME) {
+      if (path === scheduleFolderName()) {
         const fid = extractFolderId(folder);
         if (fid) return fid;
       }
@@ -416,7 +424,7 @@ export class CourseSchedulePlugin {
     try {
       const resp = (await api.call('create_group_file_folder', {
         group_id: Number(groupId),
-        name: SCHEDULE_FOLDER_NAME,
+        name: scheduleFolderName(),
         parent_id: '/',
       })) as Record<string, unknown> | null;
       if (resp) {
@@ -424,17 +432,17 @@ export class CourseSchedulePlugin {
         if (fid) return fid;
       }
     } catch (e) {
-      throw new Error(`创建群文件 ${SCHEDULE_FOLDER_NAME} 文件夹失败：${errMsg(e)}`);
+      throw new Error(`创建群文件 ${scheduleFolderName()} 文件夹失败：${errMsg(e)}`);
     }
     const relisted = await this.listGroupFilesAndFolders(api, groupId);
     for (const folder of relisted.folders) {
       const path = String(folder['_folder_path'] ?? '').replace(/^\/+|\/+$/g, '').toLowerCase();
-      if (path === SCHEDULE_FOLDER_NAME) {
+      if (path === scheduleFolderName()) {
         const fid = extractFolderId(folder);
         if (fid) return fid;
       }
     }
-    throw new Error(`创建群文件 ${SCHEDULE_FOLDER_NAME} 文件夹后未找到 folder_id`);
+    throw new Error(`创建群文件 ${scheduleFolderName()} 文件夹后未找到 folder_id`);
   }
 
   private async getGroupFileUrl(api: SnowLumaApiClient, groupId: string, fileInfo: FileInfo): Promise<string> {

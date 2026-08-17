@@ -52,6 +52,17 @@ export class ChatSession {
     this._onChange?.();
   }
 
+  /** 从持久化快照恢复，不触发 onChange */
+  restore(messages: LoggedMessage[], personaOverride?: string): void {
+    this._messages.length = 0;
+    this._lastBotReplyTime = undefined;
+    for (const msg of messages.slice(-this._maxMessages)) {
+      if (msg.role === 'assistant') this._lastBotReplyTime = msg.time;
+      this._messages.push({ ...msg });
+    }
+    this._personaOverride = personaOverride || undefined;
+  }
+
   clear(): void {
     this._messages.length = 0;
     this._lastBotReplyTime = undefined;

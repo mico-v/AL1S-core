@@ -51,6 +51,7 @@ export interface ConfigField {
   hint?: string
   placeholder?: string
   requiresRestart?: boolean
+  applyMode?: 'live' | 'rebuild' | 'restart'
   min?: number
   max?: number
   step?: number

@@ -50,7 +50,16 @@ export class PluginControl {
     return ok;
   }
 
-  /** 插件列表（含各插件命令/工具的启停状态），供管理后台展示 */
+  /** 设置插件整体启停；禁用时后台钩子也会停止执行 */
+  setPluginEnabled(name: string, enabled: boolean): boolean {
+    const ok = this.registry.setPluginEnabled(name, enabled);
+    if (ok) this.persist();
+    return ok;
+  }
+  reloadPlugin(name: string): void {
+    this.registry.reloadPlugin(name);
+  }
+
   list(): { plugins: PluginItem[] } {
     const plugins = this.registry.getPluginMetas().map((m) => ({
       name: m.name,

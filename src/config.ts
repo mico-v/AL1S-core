@@ -12,14 +12,30 @@ export interface Al1sFormatConfig {
   maxDelay: number; // 单段最大延时（秒）
 }
 
+/** 受控 shell 工具配置；默认完全关闭。 */
+export interface ShellConfig {
+  enabled: boolean;
+  runtime: 'local';
+  cwd: string;
+  triggerPrefix: string;
+  allowlist: string[];
+  denylist: string[];
+  timeoutMs: number;
+  maxOutputBytes: number;
+  adminIds: number[];
+  scrubEnv: boolean;
+  selfModifyMode: 'disabled' | 'reserved';
+}
+
 export interface BotConfig {
   wsUrl: string;
+  httpUrl?: string;
   accessToken?: string;
   llm: {
     baseUrl: string;
     apiKey?: string;
     model: string;
-    temperature: number;
+    temperature?: number;
     maxTokens: number;
   };
   persona: string;
@@ -31,6 +47,7 @@ export interface BotConfig {
   maxSessions: number;
   adminIds: number[]; // 管理员 QQ 号（BOT_ADMINS），空数组 = 不限制
   al1sFormat: Al1sFormatConfig;
+  shell: ShellConfig;
 }
 
 /** 默认人设 */
@@ -74,13 +91,14 @@ function bool(env: NodeJS.ProcessEnv, key: string, fallback: boolean): boolean {
 export function loadConfig(env: NodeJS.ProcessEnv = process.env): BotConfig {
   return {
     wsUrl: env.SNOWLUMA_WS_URL ?? 'ws://127.0.0.1:3001/',
+    httpUrl: env.SNOWLUMA_HTTP_URL || undefined,
     accessToken: env.SNOWLUMA_TOKEN || undefined,
     llm: {
       baseUrl: env.LLM_BASE_URL ?? 'https://api.deepseek.com/v1',
       apiKey: env.LLM_API_KEY || undefined,
       model: env.LLM_MODEL ?? 'deepseek-chat',
-      temperature: num(env, 'LLM_TEMPERATURE', 0.7),
-      maxTokens: num(env, 'LLM_MAX_TOKENS', 1024),
+      temperature: undefined,
+      maxTokens: num(env, 'LLM_MAX_TOKENS', 4096),
     },
     persona: env.BOT_PERSONA || DEFAULT_PERSONA,
     triggerKeywords: strList(env, 'TRIGGER_KEYWORDS'),
@@ -97,6 +115,22 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): BotConfig {
       charsPerSecond: num(env, 'AL1S_SPLIT_CHARS_PER_SECOND', 80),
       minDelay: num(env, 'AL1S_SPLIT_MIN_SECONDS', 0.5),
       maxDelay: num(env, 'AL1S_SPLIT_MAX_SECONDS', 3.0),
+    },
+    shell: {
+      enabled: bool(env, 'SHELL_ENABLED', true),
+      runtime: 'local',
+      cwd: env.SHELL_CWD || process.cwd(),
+      triggerPrefix: env.SHELL_TRIGGER_PREFIX || '$',
+      allowlist: strList(env, 'SHELL_ALLOWLIST'),
+      denylist: strList(env, 'SHELL_DENYLIST'),
+      timeoutMs: Math.max(1, num(env, 'SHELL_TIMEOUT_MS', 10000)),
+      maxOutputBytes: Math.max(1, num(env, 'SHELL_MAX_OUTPUT_BYTES', 32000)),
+      adminIds: (() => {
+        const shellAdmins = numList(env, 'SHELL_ADMIN_IDS');
+        return shellAdmins.length > 0 ? shellAdmins : numList(env, 'BOT_ADMINS');
+      })(),
+      scrubEnv: bool(env, 'SHELL_SCRUB_ENV', true),
+      selfModifyMode: 'disabled',
     },
   };
 }

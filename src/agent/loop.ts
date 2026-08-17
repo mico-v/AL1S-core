@@ -4,6 +4,7 @@
  * 把结果回填为 tool 消息后进入下一轮，直到无工具调用或达到轮数上限。
  */
 import type { LLMProvider, LLMMessage, LLMToolCall } from '../llm/types';
+import type { BotConfig } from '../config';
 import { validateArgs, type Skill, type SkillRunContext } from '../skills/registry';
 import { logger } from '../logging/logger';
 
@@ -23,6 +24,7 @@ export interface AgentLoopParams {
   chatId?: string;
   senderId?: number;
   senderName?: string;
+  config?: BotConfig;
 }
 
 /** agent loop 结果 */
@@ -73,6 +75,8 @@ export async function runAgentLoop(params: AgentLoopParams): Promise<AgentLoopRe
     chatId: params.chatId ?? '',
     senderId: params.senderId,
     senderName: params.senderName ?? '',
+    signal: params.signal,
+    config: params.config,
   };
   let toolCallsUsed = 0;
   const startedAt = Date.now();

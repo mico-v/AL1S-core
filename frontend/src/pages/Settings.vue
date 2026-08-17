@@ -1,21 +1,23 @@
 <template>
-  <div>
-    <div class="d-flex align-center mb-4">
-      <h1 class="text-h5">{{ t('settings.title') }}</h1>
-      <v-spacer />
-      <v-btn variant="text" icon="mdi-refresh" :loading="loading" @click="load" />
+  <div class="dashboard-page">
+    <div class="dashboard-shell">
+      <header class="dashboard-header">
+        <div><h1 class="dashboard-title">{{ t('settings.title') }}</h1><p class="dashboard-subtitle">调整机器人运行参数，修改会自动保存。</p></div>
+        <v-btn variant="tonal" color="primary" prepend-icon="mdi-refresh" :loading="loading" @click="load">刷新</v-btn>
+      </header>
+
+      <v-alert v-if="loadError" type="error" variant="tonal" class="mb-5">{{ loadError }}</v-alert>
+
+      <!-- schema 驱动表单：字段渲染 + 防抖自动保存统一由 ConfigForm 提供 -->
+      <ConfigForm
+        :groups="groups"
+        :values="values"
+        :loading="loading"
+        :save-values="saveValues"
+        :refresh-values="refreshValues"
+        :reveal-value="revealValue"
+      />
     </div>
-
-    <v-alert v-if="loadError" type="error" class="mb-4">{{ loadError }}</v-alert>
-
-    <!-- schema 驱动表单：字段渲染 + 防抖自动保存统一由 ConfigForm 提供 -->
-    <ConfigForm
-      :groups="groups"
-      :values="values"
-      :loading="loading"
-      :save-values="saveValues"
-      :refresh-values="refreshValues"
-    />
   </div>
 </template>
 
@@ -47,12 +49,16 @@ async function refreshValues(): Promise<Record<string, unknown>> {
   return res.data.values
 }
 
+async function revealValue(key: string): Promise<string> {
+  const res = await api.getConfigSecret(key)
+  if (!res.ok || !res.data) throw new Error(res.error ?? '读取密钥失败')
+  return res.data.value
+}
 async function load(): Promise<void> {
   loading.value = true
   loadError.value = ''
   const [schemaRes, configRes] = await Promise.all([api.getConfigSchema(), api.getConfig()])
   loading.value = false
-
   if (!schemaRes.ok || !schemaRes.data) {
     loadError.value = schemaRes.error ?? '加载配置结构失败'
     return
@@ -61,7 +67,6 @@ async function load(): Promise<void> {
     loadError.value = configRes.error ?? '加载配置值失败'
     return
   }
-
   groups.value = schemaRes.data.groups
   values.value = configRes.data.values
 }

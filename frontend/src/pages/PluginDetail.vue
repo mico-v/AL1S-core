@@ -1,26 +1,25 @@
 <template>
-  <div>
+  <div class="dashboard-page">
+    <div class="dashboard-shell">
     <!-- 页头：返回 + 插件名 -->
-    <div class="d-flex align-center mb-4">
-      <v-btn
-        variant="text"
-        icon="mdi-arrow-left"
-        :to="{ name: 'plugins' }"
-        :aria-label="t('common.back')"
-      />
-      <div class="ml-1">
-        <h1 class="text-h5">{{ plugin?.displayName ?? name }}</h1>
-        <div v-if="name" class="text-caption text-medium-emphasis font-mono">{{ name }}</div>
+    <header class="dashboard-header">
+      <div class="d-flex align-center min-width-0">
+        <v-btn variant="text" icon="mdi-arrow-left" :to="{ name: 'plugins' }" :aria-label="t('common.back')" class="mr-2" />
+        <div class="min-width-0">
+          <h1 class="dashboard-title text-truncate">{{ plugin?.displayName ?? name }}</h1>
+          <div v-if="name" class="dashboard-subtitle font-mono text-truncate">{{ name }}</div>
+        </div>
       </div>
-      <v-spacer />
-      <v-progress-circular v-if="loading" size="20" indeterminate class="mr-2" />
-      <v-btn variant="text" icon="mdi-refresh" :loading="loading" @click="load" />
-    </div>
+      <div class="dashboard-header-actions">
+        <v-progress-circular v-if="loading" size="20" indeterminate />
+        <v-btn variant="tonal" color="primary" prepend-icon="mdi-refresh" :loading="loading" @click="load">刷新</v-btn>
+      </div>
+    </header>
 
-    <v-alert v-if="loadError" type="error" class="mb-4">{{ loadError }}</v-alert>
+    <v-alert v-if="loadError" type="error" variant="tonal" class="mb-5">{{ loadError }}</v-alert>
 
     <!-- 插件描述 -->
-    <v-card v-if="plugin" class="mb-4">
+    <v-card v-if="plugin" class="dashboard-card mb-5 plugin-summary">
       <v-card-text>
         <v-row align="center">
           <v-avatar color="primary" variant="tonal" size="40" class="mr-3">
@@ -37,8 +36,8 @@
     </v-card>
 
     <!-- 设置：插件自己声明的 schema 表单（模块化渲染，与全局设置共用 ConfigForm） -->
-    <v-card v-if="settings" class="mb-4">
-      <v-card-title class="text-subtitle-2">
+    <v-card v-if="settings" class="dashboard-card mb-5">
+      <v-card-title class="d-flex align-center dashboard-section-title">
         {{ t('plugins.settings') }}
         <v-chip v-if="settings.label" size="small" variant="tonal" color="primary" class="ml-2">
           {{ settings.label }}
@@ -50,16 +49,15 @@
           :values="values"
           :save-values="saveValues"
           :refresh-values="refreshValues"
+          :reveal-value="revealValue"
         />
       </v-card-text>
     </v-card>
-    <v-card v-else-if="!loading && plugin" class="mb-4">
-      <v-card-text class="text-medium-emphasis">{{ t('plugins.noSettings') }}</v-card-text>
-    </v-card>
+    <v-card v-else-if="!loading && plugin" class="dashboard-card mb-5"><v-card-text class="text-medium-emphasis">{{ t('plugins.noSettings') }}</v-card-text></v-card>
 
     <!-- 命令开关 -->
-    <v-card v-if="commands.length" class="mb-4">
-      <v-card-title class="text-subtitle-2">{{ t('plugins.commands') }}</v-card-title>
+    <v-card v-if="commands.length" class="dashboard-card mb-5">
+      <v-card-title class="dashboard-section-title">{{ t('plugins.commands') }}</v-card-title>
       <v-data-table
         :headers="headers"
         :items="commands"
@@ -80,8 +78,8 @@
     </v-card>
 
     <!-- 工具开关 -->
-    <v-card v-if="skills.length">
-      <v-card-title class="text-subtitle-2">{{ t('plugins.skills') }}</v-card-title>
+    <v-card v-if="skills.length" class="dashboard-card">
+      <v-card-title class="dashboard-section-title">{{ t('plugins.skills') }}</v-card-title>
       <v-data-table
         :headers="headers"
         :items="skills"
@@ -100,6 +98,7 @@
         </template>
       </v-data-table>
     </v-card>
+  </div>
   </div>
 </template>
 
@@ -166,12 +165,16 @@ async function refreshValues(): Promise<Record<string, unknown>> {
   return res.data?.values ?? {}
 }
 
+async function revealValue(key: string): Promise<string> {
+  const res = await api.getConfigSecret(key)
+  if (!res.ok || !res.data) throw new Error(res.error ?? '读取密钥失败')
+  return res.data.value
+}
 async function load(): Promise<void> {
   loading.value = true
   loadError.value = ''
   const [listRes, cfgRes] = await Promise.all([api.getPlugins(), api.getPluginConfig(name.value)])
   loading.value = false
-
   if (listRes.ok && listRes.data) {
     plugin.value = listRes.data.plugins.find((p) => p.name === name.value) ?? null
     if (plugin.value) {
@@ -179,7 +182,6 @@ async function load(): Promise<void> {
       skills.value = plugin.value.skills
     }
   }
-
   if (!cfgRes.ok || !cfgRes.data) {
     loadError.value = cfgRes.error ?? '加载插件配置失败'
     return

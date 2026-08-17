@@ -1,4 +1,4 @@
-/* 全局样式：中文字体栈 + 主题感知的滚动条与背景（色值来自 Vuetify 主题的 --v-theme-*） */
+/* 全局样式：中文字体、主题 token 与 AstrBot 风格的后台基础组件 */
 :root {
   font-family:
     ui-sans-serif,
@@ -10,34 +10,340 @@
     'Microsoft YaHei',
     'Noto Sans SC',
     sans-serif;
+  color-scheme: light;
+  font-synthesis: none;
+  text-rendering: optimizeLegibility;
 }
 
 body {
+  min-width: 320px;
   background-color: rgb(var(--v-theme-containerBg));
+  color: rgb(var(--v-theme-primaryText));
 }
 
-/* 主题色滚动条（AstrBot 风格：主色调 thumb + hover 高亮/投影） */
+/* 主题色滚动条 */
 ::-webkit-scrollbar {
   width: 10px;
   height: 10px;
 }
+
 ::-webkit-scrollbar-track {
   background: rgba(var(--v-theme-primary), 0.06);
 }
+
 ::-webkit-scrollbar-thumb {
   background: rgba(var(--v-theme-primary), 0.72);
-  border-radius: 5px;
   border: 1px solid rgba(var(--v-theme-surface), 0.5);
+  border-radius: 5px;
 }
+
 ::-webkit-scrollbar-thumb:hover {
   background: rgba(var(--v-theme-primary), 0.84);
   box-shadow: 0 2px 8px rgba(var(--v-theme-primary), 0.32);
 }
 
-/* Firefox */
 * {
   scrollbar-width: thin;
   scrollbar-color: rgba(var(--v-theme-primary), 0.72) rgba(var(--v-theme-primary), 0.06);
+}
+
+.thin-scrollbar {
+  scrollbar-width: thin;
+}
+
+/* 页面通用 token，使用 Vuetify 主题变量以同时适配浅色/深色 */
+.dashboard-page {
+  --dashboard-bg: rgb(var(--v-theme-background));
+  --dashboard-surface: rgb(var(--v-theme-surface));
+  --dashboard-text: rgb(var(--v-theme-primaryText));
+  --dashboard-muted: rgba(var(--v-theme-primaryText), 0.68);
+  --dashboard-subtle: rgba(var(--v-theme-primaryText), 0.52);
+  --dashboard-border: rgba(var(--v-theme-on-surface), 0.11);
+  --dashboard-border-strong: rgba(var(--v-theme-on-surface), 0.18);
+  --dashboard-soft: rgba(var(--v-theme-primary), 0.08);
+  --dashboard-soft-strong: rgba(var(--v-theme-primary), 0.14);
+  min-height: 100%;
+  background: var(--dashboard-bg);
+  color: var(--dashboard-text);
+}
+
+.dashboard-page.is-dark {
+  --dashboard-border: rgba(var(--v-theme-on-surface), 0.16);
+  --dashboard-border-strong: rgba(var(--v-theme-on-surface), 0.24);
+  --dashboard-soft: rgba(var(--v-theme-primary), 0.13);
+  --dashboard-soft-strong: rgba(var(--v-theme-primary), 0.2);
+}
+
+.dashboard-shell {
+  width: min(100%, 1560px);
+  margin: 0 auto;
+}
+
+.dashboard-header,
+.dashboard-section-head {
+  display: flex;
+  align-items: flex-end;
+  justify-content: space-between;
+  gap: 18px;
+  margin-bottom: 22px;
+}
+
+.dashboard-header-main {
+  min-width: 0;
+}
+
+.dashboard-title {
+  margin: 0;
+  font-size: clamp(1.35rem, 2vw, 1.65rem);
+  line-height: 1.25;
+  font-weight: 700;
+  letter-spacing: -0.02em;
+}
+
+.dashboard-subtitle,
+.dashboard-section-subtitle {
+  margin: 5px 0 0;
+  color: var(--dashboard-muted);
+  font-size: 0.875rem;
+  line-height: 1.6;
+}
+
+.dashboard-header-actions,
+.dashboard-section-actions {
+  display: flex;
+  align-items: center;
+  justify-content: flex-end;
+  gap: 10px;
+  flex-wrap: wrap;
+}
+
+.dashboard-pill {
+  display: inline-flex;
+  align-items: center;
+  gap: 7px;
+  min-height: 34px;
+  padding: 7px 12px;
+  border: 1px solid var(--dashboard-border);
+  border-radius: 999px;
+  background: var(--dashboard-surface);
+  color: var(--dashboard-muted);
+  font-size: 0.8rem;
+}
+
+.dashboard-overview-grid {
+  display: grid;
+  grid-template-columns: repeat(4, minmax(0, 1fr));
+  gap: 16px;
+  margin-bottom: 20px;
+}
+
+.dashboard-card {
+  border: 1px solid var(--dashboard-border);
+  border-radius: 16px;
+  background: var(--dashboard-surface);
+  box-shadow: 0 1px 2px rgba(20, 40, 60, 0.02);
+}
+
+.dashboard-card--padded,
+.dashboard-overview-card {
+  padding: 20px;
+}
+
+.dashboard-overview-card {
+  transition: transform 160ms ease, box-shadow 160ms ease, border-color 160ms ease;
+}
+
+.dashboard-overview-card:hover {
+  border-color: var(--dashboard-border-strong);
+  box-shadow: 0 10px 28px rgba(40, 70, 100, 0.08);
+  transform: translateY(-2px);
+}
+
+.dashboard-card-icon {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 36px;
+  height: 36px;
+  border-radius: 12px;
+  background: var(--dashboard-soft);
+  color: rgb(var(--v-theme-primary));
+}
+
+.dashboard-card-label {
+  margin-top: 12px;
+  color: var(--dashboard-muted);
+  font-size: 0.8rem;
+  font-weight: 500;
+}
+
+.dashboard-card-value {
+  margin-top: 7px;
+  font-size: clamp(1.65rem, 2.7vw, 2.15rem);
+  line-height: 1.1;
+  font-weight: 700;
+  letter-spacing: -0.04em;
+  overflow-wrap: anywhere;
+}
+
+.dashboard-card-note {
+  margin-top: 7px;
+  color: var(--dashboard-subtle);
+  font-size: 0.75rem;
+  line-height: 1.5;
+}
+
+.dashboard-section-title {
+  font-size: 1.15rem;
+  font-weight: 650;
+  line-height: 1.3;
+}
+
+.dashboard-split-grid {
+  display: grid;
+  grid-template-columns: minmax(0, 1.6fr) minmax(280px, 0.9fr);
+  gap: 20px;
+  align-items: stretch;
+}
+
+.dashboard-split-grid > *,
+.dashboard-side-column > * {
+  min-width: 0;
+}
+
+.dashboard-side-column {
+  display: grid;
+  align-content: start;
+  gap: 20px;
+}
+
+.dashboard-meta-list {
+  display: grid;
+  gap: 10px;
+  margin-top: 16px;
+  padding-top: 14px;
+  border-top: 1px solid var(--dashboard-border);
+}
+
+.dashboard-meta-row,
+.dashboard-list-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  min-width: 0;
+}
+
+.dashboard-meta-row {
+  color: var(--dashboard-muted);
+  font-size: 0.85rem;
+}
+
+.dashboard-list {
+  display: grid;
+  gap: 0;
+}
+
+.dashboard-list-row {
+  padding: 12px 0;
+  border-bottom: 1px solid var(--dashboard-border);
+  font-size: 0.875rem;
+}
+
+.dashboard-list-row:last-child {
+  border-bottom: 0;
+}
+
+.dashboard-list-label {
+  overflow: hidden;
+  color: var(--dashboard-text);
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.dashboard-empty {
+  padding: 28px 16px;
+  color: var(--dashboard-muted);
+  font-size: 0.875rem;
+  text-align: center;
+}
+
+.dashboard-scrollable {
+  max-height: 360px;
+  overflow-y: auto;
+  padding-right: 5px;
+}
+
+.dashboard-form-grid {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 16px;
+}
+
+.dashboard-form-grid--single {
+  grid-template-columns: 1fr;
+}
+
+/* Vuetify 组件的统一细节覆盖 */
+.v-card {
+  border-radius: 16px;
+  border-color: rgba(var(--v-theme-on-surface), 0.11);
+}
+
+.v-card--variant-outlined {
+  border-color: rgba(var(--v-theme-on-surface), 0.16);
+}
+
+.v-card-item,
+.v-card-text {
+  padding-inline: 20px;
+}
+
+.v-btn {
+  text-transform: none;
+  letter-spacing: 0;
+  font-weight: 600;
+}
+
+.v-btn:focus-visible,
+.v-list-item:focus-visible,
+.v-field:focus-within {
+  outline: 2px solid rgba(var(--v-theme-primary), 0.5);
+  outline-offset: 2px;
+}
+
+.v-field {
+  border-radius: 10px;
+}
+
+.v-field--variant-outlined .v-field__outline {
+  color: rgba(var(--v-theme-inputBorder), 0.64);
+}
+
+.v-list-item {
+  border-radius: 9px;
+  margin: 2px 6px;
+  transition: background-color 140ms ease, color 140ms ease;
+}
+
+.v-navigation-drawer .v-list-item:hover,
+.v-navigation-drawer .v-list-item--active {
+  background: rgba(var(--v-theme-primary), 0.1);
+  color: rgb(var(--v-theme-primary));
+}
+
+.v-data-table tbody tr {
+  transition: background-color 140ms ease;
+}
+
+.v-data-table tbody tr:hover {
+  background: rgba(var(--v-theme-primary), 0.045);
+}
+
+.v-snackbar__wrapper {
+  min-height: 48px;
+  border-radius: 10px;
+  box-shadow: 0 10px 28px rgba(20, 30, 40, 0.18);
 }
 
 /* 全局少量工具样式 */
@@ -48,4 +354,59 @@ body {
 .text-pre-wrap {
   white-space: pre-wrap;
   word-break: break-word;
+}
+
+@media (max-width: 1280px) {
+  .dashboard-overview-grid {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+}
+
+@media (max-width: 960px) {
+  .dashboard-split-grid,
+  .dashboard-form-grid {
+    grid-template-columns: 1fr;
+  }
+
+  .dashboard-header,
+  .dashboard-section-head {
+    align-items: flex-start;
+    flex-direction: column;
+  }
+
+  .dashboard-header-actions,
+  .dashboard-section-actions {
+    justify-content: flex-start;
+  }
+}
+
+@media (max-width: 640px) {
+  .dashboard-overview-grid {
+    grid-template-columns: 1fr;
+  }
+
+  .dashboard-card--padded,
+  .dashboard-overview-card {
+    padding: 17px;
+  }
+
+  .v-card-item,
+  .v-card-text {
+    padding-inline: 16px;
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  *,
+  *::before,
+  *::after {
+    scroll-behavior: auto !important;
+    transition-duration: 0.01ms !important;
+    animation-duration: 0.01ms !important;
+    animation-iteration-count: 1 !important;
+  }
+}
+
+.v-theme--dark {
+  color-scheme: dark;
 }

@@ -9,7 +9,7 @@
  * 依赖 OneBot：get_group_member_list（选人）、send_group_msg / send_group_forward_msg / get_forward_msg（重放）、
  * group_recall 通知（撤回监听）。后台通过 registry 的消息/通知钩子驱动。
  */
-import { at, text } from '@snowluma/sdk';
+import { at, chain, text } from '@snowluma/sdk';
 import type { JsonValue, OneBotMessageEvent, OutgoingMessage, SnowLumaApiClient } from '@snowluma/sdk';
 import type { CommandContext } from '../registry';
 
@@ -239,6 +239,7 @@ export class XxtPlugin {
 
   private classReminderEnabled: boolean;
   private classPeriods: ClassPeriod[];
+  private disposed = false;
   /** 运行时读 env（管理后台改 env.XXT_CLASS_* 即时生效） */
   private get classWarningCooldown(): number {
     return intEnv('XXT_CLASS_WARNING_COOLDOWN_SECONDS', 60);
@@ -266,6 +267,22 @@ export class XxtPlugin {
     this.classPeriods = parseClassPeriods(process.env.XXT_CLASS_PERIODS);
   }
 
+  reloadFromConfig(): void {
+    this.adminIds.splice(0, this.adminIds.length, ...norm(process.env.BOT_ADMINS).split(',').map((s) => s.trim()).filter(Boolean).map(Number).filter((n) => !Number.isNaN(n)));
+    this.classPeriods = parseClassPeriods(process.env.XXT_CLASS_PERIODS);
+    this.classReminderEnabled = boolEnv('XXT_CLASS_REMINDER_ENABLED', this.classReminderEnabled);
+  }
+
+  dispose(): void {
+    if (this.disposed) return;
+    this.disposed = true;
+    for (const rec of this.classMentionPending.values()) clearTimeout(rec.timer);
+    this.classMentionPending.clear();
+    this.recentMessages.clear();
+    this.recalledMessages = [];
+    this.classWarningLastAt.clear();
+  }
+
   setApi(api: SnowLumaApiClient | undefined): void {
     this.api = api;
   }
@@ -274,6 +291,7 @@ export class XxtPlugin {
 
   /** 消息钩子：清缓存 + 缓存消息 + 课堂提醒判定 */
   async messageHook(event: OneBotMessageEvent): Promise<void> {
+    if (this.disposed) return;
     this.purgeExpiredCache();
     if (this.isCacheableMessage(event)) {
       await this.cacheMessage(event);
@@ -283,6 +301,7 @@ export class XxtPlugin {
 
   /** 通知钩子：撤回通知 → 记录 */
   noticeHook(event: unknown): void {
+    if (this.disposed) return;
     if (isRecallEvent(event)) this.handleRecallEvent(event);
   }
 
@@ -329,12 +348,12 @@ export class XxtPlugin {
       return;
     }
     const selected = sample(candidates, pickCount);
-    const chain: OutgoingMessage[] = [text('随机选中：')];
+    let output = chain().text('随机选中：');
     selected.forEach((mem, idx) => {
-      chain.push(at(Number((mem as Record<string, unknown>)['user_id'])));
-      if (idx < selected.length - 1) chain.push(text(' '));
+      output = output.at(Number((mem as Record<string, unknown>)['user_id']));
+      if (idx < selected.length - 1) output = output.text(' ');
     });
-    await ctx.send(chain as OutgoingMessage);
+    await ctx.send(output);
   }
 
   /** /查撤回 [N]：列出最近撤回记录（管理员） */
@@ -400,11 +419,7 @@ export class XxtPlugin {
       return;
     }
     const components = this.replayComponents(record);
-    if (components.length === 0) {
-      await ctx.reply('该撤回消息没有可重放的内容。');
-      return;
-    }
-    await ctx.send(components as unknown as OutgoingMessage);
+    await ctx.send(components);
   }
 
   /** /清空撤回：清空当前群撤回记录（管理员） */
@@ -560,10 +575,10 @@ export class XxtPlugin {
     return ordered.find((r) => norm(r.recordId) === String(recordId));
   }
 
-  private replayComponents(record: RecalledRecord): OutgoingMessage[] {
-    if (Array.isArray(record.message) && record.message.length > 0) return record.message as OutgoingMessage[];
-    if (record.messageStr) return [text(record.messageStr)];
-    return [];
+  private replayComponents(record: RecalledRecord): OutgoingMessage {
+    if (record.messageStr) return text(record.messageStr);
+    if (Array.isArray(record.message) && record.message.length > 0) return text('[消息内容]');
+    return text('');
   }
 
   // --- 重放（OneBot） ---
@@ -740,10 +755,7 @@ export class XxtPlugin {
     const cooldown = Math.max(1, this.classWarningCooldown);
     if (now - lastAt < cooldown) return;
     this.classWarningLastAt.set(key, now);
-    void this.safeSend(groupId, [
-      at(Number(senderId)),
-      text(`现在是 ${className} 上课时间，请先上课好好听讲。`),
-    ]);
+    void this.safeSend(groupId, chain().at(Number(senderId)).text(`现在是 ${className} 上课时间，请先上课好好听讲。`));
   }
 
   private scheduleOrRefreshMentionReminder(groupId: string, mentionerId: string, targetId: string, className: string): void {
@@ -771,18 +783,16 @@ export class XxtPlugin {
     this.classMentionPending.delete(key);
     if (!record) return;
     if (!this.classReminderEnabled) return;
-    await this.safeSend(groupId, [
-      at(Number(mentionerId)),
-      text('对方 '),
-      at(Number(targetId)),
-      text(` 当前未回复，正在上课：${className}，先好好听讲。`),
-    ]);
+    await this.safeSend(groupId, chain().at(Number(mentionerId)).text('对方 ').at(Number(targetId)).text(` 当前未回复，正在上课：${className}，先好好听讲。`));
   }
 
-  private async safeSend(groupId: string, message: OutgoingMessage[]): Promise<void> {
+  private async safeSend(groupId: string, message: OutgoingMessage): Promise<void> {
     try {
       if (!this.api) return;
-      await this.api.call('send_group_msg', { group_id: Number(groupId), message: message as unknown as JsonValue, auto_escape: false });
+      const segments = message instanceof Object && 'build' in message && typeof (message as { build?: unknown }).build === 'function'
+        ? (message as { build: () => JsonValue }).build()
+        : message;
+      await this.api.call('send_group_msg', { group_id: Number(groupId), message: segments as JsonValue, auto_escape: false });
     } catch {
       // 主动推送失败静默，不打扰群
     }

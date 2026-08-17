@@ -3,17 +3,15 @@
  * tsx 友好（不用 import.meta.glob），新增插件只需在此加一行。
  */
 import type { SkillRegistry } from './registry';
-import { helpPlugin } from './builtin/help';
-import { resetPlugin } from './builtin/reset';
-import { personaPlugin } from './builtin/persona';
+import { shellPlugin } from './builtin/shell';
+import { builtinPlugin } from './builtin/builtin';
 import { dicePlugin } from './example/dice';
 import { xxtPlugin } from './xxt/plugin';
 import { courseSchedulePlugin } from './courseSchedule/plugin';
 
 export function registerPlugins(registry: SkillRegistry): void {
-  registry.registerPlugin(helpPlugin);
-  registry.registerPlugin(resetPlugin);
-  registry.registerPlugin(personaPlugin);
+  registry.registerPlugin(shellPlugin);
+  registry.registerPlugin(builtinPlugin);
   registry.registerPlugin(dicePlugin);
   registry.registerPlugin(xxtPlugin);
   registry.registerPlugin(courseSchedulePlugin);

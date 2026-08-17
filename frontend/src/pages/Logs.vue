@@ -1,91 +1,40 @@
 <template>
-  <div>
-    <div class="d-flex align-center mb-4">
-      <h1 class="text-h5">{{ t('logs.title') }}</h1>
-      <v-spacer />
-      <v-chip :color="connColor" size="small" class="mr-2">
-        {{ connText }}
-      </v-chip>
-      <v-btn variant="text" icon="mdi-close-box-outline" :title="t('logs.clear')" @click="clearView" />
+  <div class="dashboard-page">
+    <div class="dashboard-shell">
+      <header class="dashboard-header">
+        <div><h1 class="dashboard-title">{{ t('logs.title') }}</h1><p class="dashboard-subtitle">实时查看系统运行日志，支持级别和标签过滤。</p></div>
+        <div class="dashboard-header-actions">
+          <span class="dashboard-pill" :class="`connection-${connState}`"><span class="status-dot" />{{ connText }}</span>
+          <v-btn variant="tonal" icon="mdi-close-box-outline" :aria-label="t('logs.clear')" :title="t('logs.clear')" @click="clearView" />
+        </div>
+      </header>
+
+      <section class="dashboard-card log-toolbar mb-4">
+        <div class="log-toolbar-inner">
+          <div class="log-filters">
+            <v-chip size="small" :variant="activeLevels.size === levels.length ? 'flat' : 'tonal'" @click="setAllLevels">{{ t('logs.all') }}</v-chip>
+            <v-chip v-for="lv in levels" :key="lv.value" size="small" :color="activeLevels.has(lv.value) ? lv.color : undefined" :variant="activeLevels.has(lv.value) ? 'flat' : 'outlined'" @click="toggleLevel(lv.value)">{{ lv.label }}</v-chip>
+          </div>
+          <div class="log-actions">
+            <v-text-field v-model="tagFilter" :label="t('logs.tagFilter')" density="compact" hide-details clearable prepend-inner-icon="mdi-magnify" class="log-search" />
+            <v-btn variant="tonal" :color="paused ? 'success' : 'warning'" size="small" @click="paused = !paused">{{ paused ? t('logs.resume') : t('logs.pause') }}</v-btn>
+            <v-switch v-model="autoScroll" :label="t('logs.autoScroll')" density="compact" hide-details />
+          </div>
+        </div>
+      </section>
+
+      <section class="dashboard-card log-card">
+        <div ref="listEl" class="dashboard-scrollable log-list">
+          <div v-for="(log, i) in filteredLogs" :key="i" class="log-row font-mono">
+            <span class="text-medium-emphasis">{{ log.time }}</span>
+            <span class="log-level" :class="`log-level--${log.level}`">{{ log.level }}</span>
+            <span class="log-tag">[{{ log.tag }}]</span>
+            <span class="log-message">{{ log.msg }}<template v-if="log.fields"><span v-for="(fv, fk) in log.fields" :key="fk" class="text-medium-emphasis">&nbsp;{{ fk }}={{ fv }}</span></template></span>
+          </div>
+          <div v-if="!filteredLogs.length" class="dashboard-empty">{{ t('logs.empty') }}</div>
+        </div>
+      </section>
     </div>
-
-    <!-- 工具栏：级别 chips / tag 过滤 / 暂停 / 自动滚动 -->
-    <v-card class="mb-3">
-      <v-card-text class="d-flex flex-wrap align-center py-2">
-        <v-chip size="small" class="mr-1" variant="flat" @click="setAllLevels">
-          {{ t('logs.all') }}
-        </v-chip>
-        <v-chip
-          v-for="lv in levels"
-          :key="lv.value"
-          size="small"
-          class="mr-1"
-          :color="activeLevels.has(lv.value) ? lv.color : undefined"
-          variant="flat"
-          @click="toggleLevel(lv.value)"
-        >
-          {{ lv.label }}
-        </v-chip>
-
-        <v-spacer />
-
-        <v-text-field
-          v-model="tagFilter"
-          label="Tag 过滤"
-          density="compact"
-          hide-details
-          clearable
-          prepend-inner-icon="mdi-magnify"
-          class="mr-2"
-          style="max-width: 220px"
-        />
-
-        <v-btn
-          variant="tonal"
-          :color="paused ? 'success' : 'warning'"
-          size="small"
-          class="mr-2"
-          @click="paused = !paused"
-        >
-          {{ paused ? t('logs.resume') : t('logs.pause') }}
-        </v-btn>
-
-        <v-switch
-          v-model="autoScroll"
-          :label="t('logs.autoScroll')"
-          density="compact"
-          hide-details
-        />
-      </v-card-text>
-    </v-card>
-
-    <!-- 日志列表（SSE 实时流） -->
-    <v-card>
-      <div
-        ref="listEl"
-        class="overflow-y-auto"
-        :style="{ maxHeight: 'calc(100vh - 300px)' }"
-      >
-        <v-list density="compact" class="font-mono">
-          <v-list-item v-for="(log, i) in filteredLogs" :key="i" class="px-3">
-            <v-list-item-title class="text-body-2">
-              <span class="text-medium-emphasis">{{ log.time }}</span>
-              <span class="mx-1" :style="{ color: levelColor(log.level) }">{{ log.level }}</span>
-              <span class="mx-1 text-info">[{{ log.tag }}]</span>
-              {{ log.msg }}
-              <template v-if="log.fields">
-                <span v-for="(fv, fk) in log.fields" :key="fk" class="text-medium-emphasis">
-                  &nbsp;{{ fk }}={{ fv }}
-                </span>
-              </template>
-            </v-list-item-title>
-          </v-list-item>
-          <v-list-item v-if="!filteredLogs.length" class="text-center text-medium-emphasis">
-            {{ t('logs.empty') }}
-          </v-list-item>
-        </v-list>
-      </div>
-    </v-card>
   </div>
 </template>
 
@@ -115,17 +64,6 @@ const levels: { value: LogLevel; label: string; color: string }[] = [
   { value: 'error', label: 'error', color: 'error' },
 ]
 
-const levelColorMap: Record<LogLevel, string> = {
-  debug: '#78909C',
-  info: '#42A5F5',
-  warn: '#FFA726',
-  error: '#EF5350',
-}
-
-function levelColor(level: LogLevel): string {
-  return levelColorMap[level]
-}
-
 const connText = computed(() => {
   switch (connState.value) {
     case 'open':
@@ -134,17 +72,6 @@ const connText = computed(() => {
       return t('logs.connecting')
     default:
       return t('logs.disconnected')
-  }
-})
-
-const connColor = computed(() => {
-  switch (connState.value) {
-    case 'open':
-      return 'success'
-    case 'connecting':
-      return 'warning'
-    default:
-      return 'error'
   }
 })
 
@@ -228,3 +155,31 @@ onBeforeUnmount(() => {
   stream = null
 })
 </script>
+
+<style scoped>
+.log-toolbar { padding: 14px 18px; }
+.log-toolbar-inner, .log-filters, .log-actions { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
+.log-toolbar-inner { justify-content: space-between; }
+.log-search { width: 220px; }
+.log-card { overflow: hidden; }
+.log-list { max-height: calc(100vh - 300px); padding: 8px 18px; }
+.log-row { display: grid; grid-template-columns: 155px 52px 120px minmax(0, 1fr); gap: 8px; padding: 9px 0; border-bottom: 1px solid var(--dashboard-border); font-size: 0.78rem; line-height: 1.5; }
+.log-row:last-child { border-bottom: 0; }
+.log-level { font-weight: 700; text-transform: uppercase; }
+.log-level--debug { color: rgb(var(--v-theme-secondary)); }
+.log-level--info { color: rgb(var(--v-theme-info)); }
+.log-level--warn { color: rgb(var(--v-theme-warning)); }
+.log-level--error { color: rgb(var(--v-theme-error)); }
+.log-tag { color: rgb(var(--v-theme-primary)); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.log-message { min-width: 0; overflow-wrap: anywhere; }
+.status-dot { width: 8px; height: 8px; border-radius: 50%; background: currentColor; }
+.connection-open { color: rgb(var(--v-theme-success)); }
+.connection-connecting { color: rgb(var(--v-theme-warning)); }
+.connection-closed { color: rgb(var(--v-theme-error)); }
+@media (max-width: 760px) {
+  .log-search { width: 100%; }
+  .log-actions { width: 100%; }
+  .log-row { grid-template-columns: auto 52px minmax(0, 1fr); }
+  .log-tag { display: none; }
+}
+</style>

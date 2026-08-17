@@ -3,6 +3,8 @@
  * logger 写入时同步 push 一份到这里（push 内部 try/catch，绝不抛错）。
  */
 import type { LogLevel } from './logger';
+import { appendFileSync, mkdirSync, readFileSync, renameSync, statSync, writeFileSync } from 'node:fs';
+import { dirname } from 'node:path';
 
 /** 一条结构化日志记录（管理后台 /api/logs 与 SSE 使用的形态） */
 export interface LogRecord {
@@ -17,9 +19,48 @@ export class LogBuffer {
   private records: LogRecord[] = [];
   private readonly listeners = new Set<(record: LogRecord) => void>();
   private readonly limit: number;
+  private historyFile?: string;
 
-  constructor(limit = 1000) {
-    this.limit = limit;
+  constructor(limit = 1000, historyFile = process.env.LOG_HISTORY_FILE || './data/logs/history.jsonl') {
+    this.limit = Math.max(1, limit);
+    this.historyFile = historyFile.trim() || undefined;
+    this.loadHistory();
+  }
+
+  private loadHistory(): void {
+    if (!this.historyFile) return;
+    try {
+      if (statSync(this.historyFile).size > 20 * 1024 * 1024) return;
+      const lines = readFileSync(this.historyFile, 'utf-8').split(/\r?\n/);
+      for (const line of lines.slice(-this.limit * 2)) {
+        if (!line.trim()) continue;
+        try {
+          const record = JSON.parse(line) as LogRecord;
+          if (record && typeof record.time === 'string' && typeof record.msg === 'string') this.records.push(record);
+        } catch { /* 忽略截断或损坏行 */ }
+      }
+      this.records = this.records.slice(-this.limit);
+    } catch { /* 历史文件不存在时正常启动 */ }
+  }
+
+  configureHistory(file?: string): void {
+    this.historyFile = file?.trim() || undefined;
+    this.records = [];
+    this.loadHistory();
+  }
+
+  private persist(record: LogRecord): void {
+    if (!this.historyFile) return;
+    try {
+      mkdirSync(dirname(this.historyFile), { recursive: true });
+      appendFileSync(this.historyFile, `${JSON.stringify(record)}\n`, 'utf-8');
+      const size = statSync(this.historyFile).size;
+      if (size > 20 * 1024 * 1024) {
+        const tmp = `${this.historyFile}.tmp`;
+        writeFileSync(tmp, `${this.records.map((r) => JSON.stringify(r)).join('\n')}\n`, 'utf-8');
+        renameSync(tmp, this.historyFile);
+      }
+    } catch { /* 历史落盘失败不影响日志 */ }
   }
 
   push(record: LogRecord): void {
@@ -27,6 +68,7 @@ export class LogBuffer {
     if (this.records.length > this.limit) {
       this.records = this.records.slice(-this.limit);
     }
+    this.persist(record);
     for (const listener of [...this.listeners]) {
       try {
         listener(record);

@@ -5,7 +5,7 @@
  * - chatId（g:<gid> / p:<uid>）本就是确定性 key → 启动后首次访问某会话时从磁盘恢复。
  * - 每次追加/清空/改人设触发 2s 防抖落盘；退出时 flushAll 全量落盘。
  */
-import { existsSync, mkdirSync, readFileSync, renameSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdirSync, readdirSync, readFileSync, renameSync, rmSync, statSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { ChatSession, type LoggedMessage } from './session';
 import type { SessionManager } from './manager';
@@ -44,9 +44,23 @@ export class SessionPersistence {
     const file = this.fileOf(session.chatId);
     if (!existsSync(file)) return;
     try {
-      const data = JSON.parse(readFileSync(file, 'utf-8')) as SessionFile;
-      for (const msg of data.messages ?? []) session.append({ ...msg });
-      if (data.personaOverride) session.setPersonaOverride(data.personaOverride);
+      const size = statSync(file).size;
+      if (size > 5 * 1024 * 1024) return;
+      const data = JSON.parse(readFileSync(file, 'utf-8')) as Partial<SessionFile>;
+      if (data.version !== 1 || !Array.isArray(data.messages)) return;
+      const restored: LoggedMessage[] = [];
+      for (const msg of data.messages.slice(-500)) {
+        if (!msg || (msg.role !== 'user' && msg.role !== 'assistant') || typeof msg.text !== 'string') continue;
+        restored.push({
+          role: msg.role,
+          senderId: typeof msg.senderId === 'number' ? msg.senderId : undefined,
+          senderName: typeof msg.senderName === 'string' ? msg.senderName : '',
+          text: msg.text,
+          atBot: Boolean(msg.atBot),
+          time: typeof msg.time === 'number' && Number.isFinite(msg.time) ? msg.time : Date.now(),
+        });
+      }
+      session.restore(restored, typeof data.personaOverride === 'string' ? data.personaOverride : undefined);
     } catch {
       // 损坏文件视为空会话
     }
@@ -64,7 +78,29 @@ export class SessionPersistence {
     );
   }
 
-  /** 立即写盘某会话 */
+  /** 扫描磁盘会话，供管理端展示尚未惰性恢复的会话 */
+  listDiskSummaries(): Array<{ chatId: string; messageCount: number; lastActivity: number; isGenerating: boolean; personaOverride?: string }> {
+    try {
+      if (!existsSync(this.dir)) return [];
+      const out: Array<{ chatId: string; messageCount: number; lastActivity: number; isGenerating: boolean; personaOverride?: string }> = [];
+      for (const name of readdirSync(this.dir)) {
+        if (!name.endsWith('.json')) continue;
+        try {
+          const data = JSON.parse(readFileSync(join(this.dir, name), 'utf-8')) as Partial<SessionFile>;
+          const encoded = name.slice(0, -5);
+          const chatId = decodeURIComponent(encoded);
+          const messages = Array.isArray(data.messages) ? data.messages : [];
+          const last = messages.at(-1) as LoggedMessage | undefined;
+          out.push({ chatId, messageCount: messages.length, lastActivity: typeof last?.time === 'number' ? last.time : 0, isGenerating: false, personaOverride: data.personaOverride });
+        } catch { /* 忽略损坏文件 */ }
+      }
+      return out;
+    } catch {
+      return [];
+    }
+  }
+
+
   flush(chatId: string): void {
     const session = this.manager.list().find((s) => s.chatId === chatId);
     if (!session) return;
@@ -90,10 +126,12 @@ export class SessionPersistence {
     if (timer) clearTimeout(timer);
     this.timers.delete(chatId);
     const file = this.fileOf(chatId);
-    try {
-      if (existsSync(file)) renameSync(file, `${file}.del`);
-    } catch {
-      // 忽略
+    for (const candidate of [file, `${file}.tmp`, `${file}.del`]) {
+      try {
+        rmSync(candidate, { force: true });
+      } catch {
+        // 忽略
+      }
     }
   }
 

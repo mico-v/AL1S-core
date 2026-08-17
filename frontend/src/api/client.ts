@@ -115,6 +115,7 @@ export const api = {
   getConfig: (): Promise<ApiResponse<ConfigValues>> => get('/config'),
   updateConfig: (values: Record<string, unknown>): Promise<ApiResponse<ConfigSaveResult>> =>
     put('/config', { values }),
+  getConfigSecret: (key: string): Promise<ApiResponse<{ key: string; value: string }>> => get(`/config/secret?key=${encodeURIComponent(key)}`),
   getConfigSchema: (): Promise<ApiResponse<ConfigSchema>> => get('/config/schema'),
   getPlugins: (): Promise<ApiResponse<PluginsData>> => get('/plugins'),
   setPluginEnabled: (payload: PluginTogglePayload): Promise<ApiResponse<{ ok: boolean }>> =>

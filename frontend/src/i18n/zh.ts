@@ -93,6 +93,7 @@ export default {
     disconnected: '已断开，正在重连…',
     connecting: '连接中…',
     connected: '实时',
+    tagFilter: 'Tag 过滤',
     empty: '暂无日志',
   },
 }

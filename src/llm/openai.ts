@@ -55,8 +55,8 @@ function toOpenAITool(tool: LLMToolSchema): Record<string, unknown> {
 }
 
 export class OpenAIProvider implements LLMProvider {
-  private readonly baseUrl: string;
-  private readonly apiKey?: string;
+  private baseUrl: string;
+  private apiKey?: string;
   private model: string;
 
   constructor(options: OpenAIProviderOptions) {
@@ -65,7 +65,15 @@ export class OpenAIProvider implements LLMProvider {
     this.model = options.model;
   }
 
-  /** 运行时切换模型（管理后台热更新；apiKey/baseUrl 需重启后由 ConfigStore 重新构造生效） */
+  /** 运行时更新连接参数；正在进行的请求继续使用当前请求快照 */
+  updateConfig(options: Partial<OpenAIProviderOptions>): void {
+    if (typeof options.baseUrl === 'string' && options.baseUrl.trim()) this.baseUrl = options.baseUrl.replace(/\/+$/, '');
+    if (options.apiKey !== undefined) this.apiKey = options.apiKey || undefined;
+    if (typeof options.model === 'string' && options.model.trim()) this.model = options.model;
+    log.info('更新 LLM 配置', { baseUrl: this.baseUrl, model: this.model, hasApiKey: Boolean(this.apiKey) });
+  }
+
+  /** 运行时切换模型（管理后台热更新） */
   setModel(model: string): void {
     if (model && model !== this.model) {
       this.model = model;
@@ -121,10 +129,11 @@ export class OpenAIProvider implements LLMProvider {
     const body: Record<string, unknown> = {
       model: this.model,
       messages: messages.map(toOpenAIMessage),
-      temperature: temperature ?? 0.7,
-      max_tokens: maxTokens ?? 1024,
+      max_tokens: maxTokens ?? 4096,
       stream: true,
     };
+    // 仅在显式配置时发送 temperature；推理模型和新兼容接口通常拒绝该参数。
+    if (temperature !== undefined) body.temperature = temperature;
     if (tools && tools.length > 0) {
       body.tools = tools.map(toOpenAITool);
       body.tool_choice = 'auto';

@@ -10,7 +10,7 @@
 import { mkdirSync, readFileSync, renameSync, writeFileSync } from 'node:fs';
 import { dirname } from 'node:path';
 import { loadConfig, type BotConfig } from '../config';
-import { CONFIG_FIELD_MAP, fieldRequiresRestart, isEnvField, type ConfigFieldMeta } from './schema';
+import { CONFIG_FIELD_MAP, isEnvField, type ConfigFieldMeta } from './schema';
 
 /** 覆盖层文件结构 */
 interface SettingsFile {
@@ -142,7 +142,8 @@ export class ConfigStore {
       const coerced = coerceFieldValue(meta, value);
       if (coerced === undefined) continue; // 非法值忽略
       this.applyField(key, coerced);
-      if (fieldRequiresRestart(key)) {
+      const mode = this.getApplyMode(key);
+      if (mode === 'restart') {
         this.restartKeys.add(key);
         pendingRestart.push(key);
       } else {
@@ -161,6 +162,13 @@ export class ConfigStore {
       this.emit();
     }
     return { applied, pendingRestart };
+  }
+
+  /** 字段的应用模式：兼容旧的 requiresRestart 元数据 */
+  getApplyMode(key: string): 'live' | 'rebuild' | 'restart' {
+    const meta = CONFIG_FIELD_MAP[key];
+    if (meta?.applyMode) return meta.applyMode;
+    return meta?.requiresRestart ? 'restart' : 'live';
   }
 
   /** 是否存在本运行内未生效的「需重启」改动 */

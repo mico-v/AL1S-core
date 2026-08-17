@@ -29,6 +29,7 @@ export const xxtPlugin: Plugin = {
   register(registry: SkillRegistry): void {
     const plugin = new XxtPlugin();
     plugin.setApi(registry.getApi());
+    registry.registerPluginInstance('xxt', { dispose: () => plugin.dispose(), reloadFromConfig: () => plugin.reloadFromConfig() });
 
     // 后台：每条消息缓存 + 课堂提醒判定
     registry.addMessageHook((event) => plugin.messageHook(event));

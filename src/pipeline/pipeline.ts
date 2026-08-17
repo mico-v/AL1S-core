@@ -259,11 +259,13 @@ export class Pipeline {
       skills: tools,
       messages,
       maxIterations: this.config.maxToolIterations,
-      temperature: this.config.llm.temperature,
+      temperature: undefined,
       maxTokens: this.config.llm.maxTokens,
       chatId,
       senderId,
       senderName,
+      signal: undefined,
+      config: this.config,
     });
     log.info('回复完成', { chatId, ms: Date.now() - startedAt, toolCalls: res.toolCallsUsed, chars: res.text.length });
     metrics.toolCalls += res.toolCallsUsed;

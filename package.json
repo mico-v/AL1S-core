@@ -15,6 +15,7 @@
     "format:check": "tsx --env-file=.env src/scripts/format-check.ts",
     "plugins:check": "tsx --env-file=.env src/scripts/plugins-check.ts",
     "admin:check": "tsx --env-file=.env src/scripts/admin-check.ts",
+    "shell:check": "tsx src/scripts/shell-check.ts",
     "build:frontend": "npm --prefix frontend run build",
     "typecheck": "tsc --noEmit"
   },

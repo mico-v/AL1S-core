@@ -11,6 +11,8 @@ export interface SessionManagerOptions {
   maxSessions: number; // LRU 上限
   getTokenBudget?: () => number; // 运行时现读（管理后台热更新用）
   getMaxSessions?: () => number; // 运行时现读
+  onEvict?: (session: ChatSession) => void;
+  onClear?: (chatId: string) => void;
 }
 
 export class SessionManager {
@@ -18,6 +20,8 @@ export class SessionManager {
   private readonly _maxSessions: number;
   private readonly _getTokenBudget?: () => number;
   private readonly _getMaxSessions?: () => number;
+  private _onEvict?: (session: ChatSession) => void;
+  private _onClear?: (chatId: string) => void;
   private readonly _sessions = new Map<string, ChatSession>(); // 迭代序 = 最近使用序
   /** 会话创建工厂（持久化模块可替换为「磁盘恢复 + 变更落盘」） */
   createSession: (chatId: string, tokenBudget: number) => ChatSession;
@@ -27,7 +31,14 @@ export class SessionManager {
     this._maxSessions = Math.max(1, options.maxSessions);
     this._getTokenBudget = options.getTokenBudget;
     this._getMaxSessions = options.getMaxSessions;
+    this._onEvict = options.onEvict;
+    this._onClear = options.onClear;
     this.createSession = (chatId, tokenBudget) => new ChatSession({ chatId, tokenBudget });
+  }
+
+  setPersistenceHooks(hooks: { onEvict?: (session: ChatSession) => void; onClear?: (chatId: string) => void }): void {
+    this._onEvict = hooks.onEvict;
+    this._onClear = hooks.onClear;
   }
 
   /** 获取会话；不存在则创建；每次访问刷新为最近使用 */
@@ -47,15 +58,23 @@ export class SessionManager {
       const oldest = this._sessions.keys().next().value; // 迭代器第一个 = 最久未用
       if (oldest === undefined) break;
       log.debug('淘汰会话', { chatId: oldest });
+      const evicted = this._sessions.get(oldest);
+      if (evicted) this._onEvict?.(evicted);
       this._sessions.delete(oldest);
     }
     log.debug('新建会话', { chatId });
     return created;
   }
 
-  /** 删除指定会话 */
+  /** 获取或恢复会话；管理后台使用此方法确保每次访问都查盘 */
+  getOrLoad(chatId: string): ChatSession {
+    return this.get(chatId);
+  }
+
+
   clear(chatId: string): void {
     this._sessions.delete(chatId);
+    this._onClear?.(chatId);
   }
 
   /** 全部会话（LRU 序，不保证顺序稳定） */

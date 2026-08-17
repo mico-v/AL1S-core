@@ -29,6 +29,7 @@ export const courseSchedulePlugin: Plugin = {
   register(registry: SkillRegistry): void {
     const plugin = new CourseSchedulePlugin(new ScheduleStore(process.env.COURSE_DATA_FILE || './data/course-schedule.json'));
     plugin.setApi(registry.getApi());
+    registry.registerPluginInstance('course-schedule', { reloadFromConfig: () => plugin.reloadFromConfig() });
 
     registry.registerCommand({
       name: '今日课表',

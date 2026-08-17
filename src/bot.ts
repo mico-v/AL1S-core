@@ -3,7 +3,7 @@
  * 负责注册插件、绑定消息事件、获取登录昵称（写入 pipeline）、优雅关闭。
  * 同时装配管理后台：运行时 ConfigStore、会话持久化、插件启停控制、AdminServer。
  */
-import { SnowLumaWebSocketClient } from '@snowluma/sdk';
+import { SnowLumaWebSocketClient, SnowLumaHttpClient } from '@snowluma/sdk';
 import { readFileSync } from 'node:fs';
 import type { BotConfig } from './config';
 import { ConfigStore } from './config/store';
@@ -40,6 +40,7 @@ function readVersion(): string {
 
 export class Bot {
   private readonly client: SnowLumaWebSocketClient;
+  private readonly httpClient?: SnowLumaHttpClient;
   private readonly configStore: ConfigStore;
   private readonly registry: SkillRegistry;
   private readonly pluginControl: PluginControl;
@@ -59,7 +60,9 @@ export class Bot {
       accessToken: cfg.accessToken,
       reconnect: true,
     });
+    this.httpClient = cfg.httpUrl ? new SnowLumaHttpClient({ baseUrl: cfg.httpUrl, accessToken: cfg.accessToken }) : undefined;
     this.registry = new SkillRegistry();
+    this.registry.setConfig(cfg);
     this.pluginControl = new PluginControl(this.registry);
 
     const sessions = new SessionManager({
@@ -70,6 +73,10 @@ export class Bot {
     });
     this.persistence = new SessionPersistence(sessions);
     this.persistence.attach(); // 会话磁盘恢复 + 防抖落盘
+    sessions.setPersistenceHooks({
+      onEvict: (session) => this.persistence.flush(session.chatId),
+      onClear: (chatId) => this.persistence.remove(chatId),
+    });
 
     // apiKey 缺失时也构造 provider：运行时请求会以 done.error 返回（llm-check 已提示）
     const provider = new OpenAIProvider({
@@ -77,8 +84,16 @@ export class Bot {
       apiKey: cfg.llm.apiKey,
       model: cfg.llm.model,
     });
-    // 模型切换热更新（apiKey/baseUrl 需重启后由 ConfigStore 重新应用）
-    this.configStore.registerApplier((store) => provider.setModel(store.config.llm.model));
+    // LLM 连接参数与模型全部支持运行时更新（请求内部读取当前 provider 状态）
+    this.configStore.registerApplier((store) => {
+      this.pluginControl.reloadPlugin('xxt');
+      this.pluginControl.reloadPlugin('course-schedule');
+      provider.updateConfig({
+        baseUrl: store.config.llm.baseUrl,
+        apiKey: store.config.llm.apiKey,
+        model: store.config.llm.model,
+      });
+    });
 
     const formatter = new Al1sFormatter(cfg.al1sFormat);
     this.pipeline = new Pipeline({ config: cfg, provider, sessions, registry: this.registry, formatter });
@@ -156,17 +171,9 @@ export class Bot {
     this.client.on('close', (info) => log.warn('连接关闭', { code: info?.code ?? '', reason: info?.reason ?? '' }));
     this.client.on('error', (err) => log.error('连接错误', { err }));
 
-    // 取登录昵称写入 pipeline（request 内部会自动发起连接，与下方 connect 幂等）
-    try {
-      const login = await this.client.getLoginInfo();
-      this.botNickname = login.nickname;
-      this.pipeline.setBotNickname(login.nickname);
-      log.info('登录账号', { userId: login.user_id, nickname: login.nickname });
-    } catch (err) {
-      log.error('获取登录信息失败', { err });
-    }
-
+    // 先建立事件连接；身份 API 失败不阻塞消息处理，优先 HTTP，回退 WS
     await this.client.connect();
+    await this.refreshBotIdentity();
     log.info('就绪，等待事件……（Ctrl+C 退出）');
 
     // 优雅关闭
@@ -174,13 +181,36 @@ export class Bot {
     process.on('SIGTERM', () => this.stop());
   }
 
+  private async refreshBotIdentity(): Promise<void> {
+    const getIdentity = async (): Promise<{ user_id: number; nickname: string }> => {
+      if (this.httpClient) return await this.httpClient.getLoginInfo();
+      return await Promise.race([
+        this.client.getLoginInfo(),
+        new Promise<never>((_, reject) => setTimeout(() => reject(new Error('WS get_login_info 超时')), 5000)),
+      ]);
+    };
+    try {
+      const login = await getIdentity();
+      this.botNickname = login.nickname;
+      this.pipeline.setBotNickname(login.nickname);
+      log.info('登录账号', { userId: login.user_id, nickname: login.nickname, transport: this.httpClient ? 'http' : 'ws' });
+    } catch (err) {
+      const detail = err instanceof Error ? { name: err.name, message: err.message, stack: err.stack } : { error: String(err) };
+      log.warn('获取登录信息失败，继续运行', { ...detail, wsConnected: this.client.isConnected, hasHttpFallback: Boolean(this.httpClient) });
+    }
+  }
   /** 优雅关闭：落盘会话、关闭 WebSocket 并退出 */
   stop(): void {
     log.info('正在关闭……');
     try {
+      void this.registry.disposePlugins();
+    } catch (err) {
+      log.warn('插件清理失败', { err: err instanceof Error ? err.message : String(err) });
+    }
+    try {
       this.persistence.flushAll();
     } catch (err) {
-      log.error('会话落盘失败', { err });
+      log.error('会话落盘失败', { err: err instanceof Error ? err.message : String(err) });
     }
     this.client.close(1000, 'bye');
     process.exit(0);
