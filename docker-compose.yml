@@ -1,0 +1,33 @@
+# AL1S-core docker-compose
+#
+# 设计要点：
+#  - network_mode: host：bot 要连宿主机上的 SnowLuma（ws://127.0.0.1:3001），
+#    且管理后台本就设计为只监听 127.0.0.1（更安全）——host 网络两者都天然满足。
+#    注意：用 host 网络时不要再写 ports:（会被忽略/报错）。
+#  - env_file: .env：密钥不进镜像，从服务器上的 .env 注入（.env 已被 .dockerignore 排除）。
+#  - volumes: ./data 挂到 /app/data：会话历史、settings.json、课程表、插件开关持久化。
+#  - 服务器部署前务必确认 .env 里 SHELL_ENABLED=false。
+#
+# 构建并启动：    docker compose up -d --build
+# 查看日志：      docker compose logs -f
+# 重启/停止/删除：docker compose restart | stop | down
+
+services:
+  al1s:
+    build: .
+    image: al1s-bot:latest   # 推送到服务器时改成 <registry>/al1s-bot:latest 再 push
+    container_name: al1s-bot
+    restart: unless-stopped
+    network_mode: host
+    env_file: .env
+    environment:
+      - TZ=Asia/Shanghai      # 课表/课堂提醒依赖本地时区
+    volumes:
+      - ./data:/app/data
+    healthcheck:
+      test: ["CMD", "node", "deploy/healthcheck.mjs"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 20s
+    stop_grace_period: 15s    # 给 SIGTERM 优雅落盘（会话持久化 flush）留时间

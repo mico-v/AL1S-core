@@ -1,0 +1,23 @@
+# --- 密钥/环境：永不进入镜像 ---
+.env
+.env.*
+!.env.example
+data/
+
+# --- 依赖（镜像内由 npm ci 安装） ---
+node_modules
+frontend/node_modules
+
+# --- 构建产物（镜像内重建） ---
+frontend/dist
+
+# --- 参考实现（体积大且无运行时作用） ---
+ref/
+
+# --- 版本控制 / 日志 / 配置 ---
+.git
+.gitignore
+.claude/
+*.log
+.DS_Store
+Thumbs.db
