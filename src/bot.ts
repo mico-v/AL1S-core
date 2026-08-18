@@ -146,8 +146,8 @@ export class Bot {
           text: norm.text,
         });
       }
-      await this.registry.runMessageHooks(event, ctx);
-      await this.pipeline.handleGroupMessage(event, ctx);
+      const handled = await this.registry.runMessageHooks(event, ctx);
+      if (!handled) await this.pipeline.handleGroupMessage(event, ctx);
     });
     this.client.onPrivateMessage(async (event, ctx) => {
       if (logReceiveEnabled()) {
@@ -160,8 +160,8 @@ export class Bot {
           text: norm.text,
         });
       }
-      await this.registry.runMessageHooks(event, ctx);
-      await this.pipeline.handlePrivateMessage(event, ctx);
+      const handled = await this.registry.runMessageHooks(event, ctx);
+      if (!handled) await this.pipeline.handlePrivateMessage(event, ctx);
     });
     // 通知事件（撤回、入群等）→ 插件通知钩子
     this.client.onNotice((event, ctx) => this.registry.runNoticeHooks(event, ctx));

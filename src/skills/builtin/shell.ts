@@ -79,15 +79,15 @@ export const shellPlugin: Plugin = {
         const stopped = shellTasks.stopMatching(chatId, target === '' || target === 'all' ? undefined : target, senderId, shellConfig.adminIds);
         audit({ event: 'stopped', requestId: randomUUID(), actorId: senderId, chatId, groupId, command: body, runtime: shellConfig.runtime, cwd: shellConfig.cwd, reason: stopped.length > 0 ? `停止 ${stopped.length} 个任务` : '没有可停止任务' });
         await ctx.reply(stopped.length > 0 ? `已停止：${stopped.map((task) => task.taskId).join(', ')}` : '没有找到可停止的 shell 任务');
-        return;
+        return { handled: true };
       }
-      if (!body) { await ctx.reply(`用法：${triggerPrefix}<命令>，${triggerPrefix}stop [all|taskId]`); return; }
+      if (!body) { await ctx.reply(`用法：${triggerPrefix}<命令>，${triggerPrefix}stop [all|taskId]`); return { handled: true }; }
       const request: ShellRequest = { command: body, runtime: 'local' };
       const decision = evaluateShellRequest(request, shellConfig, senderId);
       if (!decision.allowed) {
         audit({ event: 'rejected', requestId: randomUUID(), actorId: senderId, chatId, groupId, command: body, runtime: shellConfig.runtime, cwd: shellConfig.cwd, reason: decision.reason });
         await ctx.reply(`shell 执行失败：${decision.reason ?? '策略拒绝'}`);
-        return;
+        return { handled: true };
       }
       const task = shellTasks.start(request, { senderId, chatId, groupId }, shellConfig, async (finished) => {
         const result = finished.result;
@@ -99,6 +99,7 @@ export const shellPlugin: Plugin = {
       });
       audit({ event: 'started', requestId: task.taskId, taskId: task.taskId, actorId: senderId, chatId, groupId, command: body, runtime: shellConfig.runtime, cwd: shellConfig.cwd });
       await ctx.reply(`已启动 shell 任务 ${task.taskId}`);
+      return { handled: true };
     });
 
     registry.registerSkill({

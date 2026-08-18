@@ -19,6 +19,10 @@ import { logger } from '../logging/logger';
 
 const log = logger.child('registry');
 
+export interface MessageHookResult {
+  handled?: boolean;
+}
+
 /** 后台消息/通知钩子的返回类型（同步或异步均可） */
 export type MaybePromise<T = void> = T | Promise<T>;
 
@@ -54,7 +58,7 @@ export interface CommandContext {
 }
 
 /** 后台消息钩子：每条群/私聊消息都触发（含命令与未触发消息） */
-export type MessageHook = (event: OneBotMessageEvent, ctx: SnowLumaEventContext) => MaybePromise<void>;
+export type MessageHook = (event: OneBotMessageEvent, ctx: SnowLumaEventContext) => MaybePromise<MessageHookResult | void>;
 
 /** 后台通知钩子：每条 OneBot notice（如 group_recall 撤回）都触发 */
 export type NoticeHook = (event: OneBotNoticeEvent, ctx: SnowLumaEventContext) => MaybePromise<void>;
@@ -262,16 +266,19 @@ export class SkillRegistry {
   }
 
   /** 顺序执行全部消息钩子；单个钩子抛错只记日志，不中断后续 */
-  async runMessageHooks(event: OneBotMessageEvent, ctx: SnowLumaEventContext): Promise<void> {
+  async runMessageHooks(event: OneBotMessageEvent, ctx: SnowLumaEventContext): Promise<boolean> {
+    let handled = false;
     for (const hook of [...this.messageHooks]) {
       const owner = this.hookPlugins.get(hook);
       if (owner && this.pluginEnabled.get(owner) === false) continue;
       try {
-        await hook(event, ctx);
+        const result = await hook(event, ctx);
+        if (result?.handled) handled = true;
       } catch (err) {
         log.error('消息钩子出错', { err: err instanceof Error ? err.message : String(err) });
       }
     }
+    return handled;
   }
 
   /** 顺序执行全部通知钩子；单个钩子抛错只记日志，不中断后续 */
