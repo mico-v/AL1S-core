@@ -3,13 +3,15 @@ import type { OneBotMessageEvent } from '@snowluma/sdk';
 import type { ConfigGroupMeta } from '../../config/schema';
 import { registerConfigFields } from '../../config/schema';
 import { logger } from '../../logging/logger';
+import { logReject, sendLogged } from '../../logging/send-log';
 import { normalizeMessage } from '../../pipeline/normalize';
 import { auditShell, redactShellCommand } from '../../tools/audit';
 import { evaluateShellRequest } from '../../tools/policy';
 import { shellTasks, type ShellTaskFinished } from '../../tools/tasks';
 import type { ShellRequest } from '../../tools/types';
 import type { Plugin, SkillRegistry } from '../registry';
-
+import type { MspRuntime } from '../../msp/protocol/types';
+import { commandInput } from './shell-command-input';
 const log = logger.child('shell');
 
 const shellSettings: ConfigGroupMeta = {
@@ -41,14 +43,13 @@ function messageText(event: OneBotMessageEvent): string {
 }
 
 function formatResult(finished: ShellTaskFinished): string {
-  const taskId = finished.task.taskId;
-  if (finished.error) return `[shell ${taskId}] 执行失败：${finished.error instanceof Error ? finished.error.message : String(finished.error)}`;
-  if (!finished.decision.allowed) return `[shell ${taskId}] 执行失败：${finished.decision.reason ?? '策略拒绝'}`;
+  if (finished.error) return `执行失败：${finished.error instanceof Error ? finished.error.message : String(finished.error)}`;
+  if (!finished.decision.allowed) return `执行失败：${finished.decision.reason ?? '策略拒绝'}`;
   const result = finished.result;
-  if (!result) return `[shell ${taskId}] 执行失败：执行器未返回结果`;
-  const output = [result.stdout, result.stderr ? `stderr:\n${result.stderr}` : ''].filter(Boolean).join('\n');
+  if (!result) return '执行失败：执行器未返回结果';
+  const output = result.displayText ?? [result.stdout, result.stderr ? `stderr:\n${result.stderr}` : ''].filter(Boolean).join('\n');
   const status = result.ok ? '完成' : result.error ?? `退出码 ${result.exitCode ?? '未知'}`;
-  return `[shell ${taskId}] ${status}${output ? `\n${output}` : ''}`;
+  return `${status}${output ? `\n${output}` : ''}`;
 }
 
 export const shellPlugin: Plugin = {
@@ -62,43 +63,37 @@ export const shellPlugin: Plugin = {
       if (!shellConfig) return;
       const text = messageText(event);
       const triggerPrefix = shellConfig.triggerPrefix.trim();
-      if (!shellConfig.enabled || triggerPrefix.length === 0 || !text.startsWith(triggerPrefix)) return;
+      if (!shellConfig || triggerPrefix.length === 0 || !text.startsWith(triggerPrefix)) return;
+      if (!shellConfig.enabled) return;
       const rawSenderId = typeof event.user_id === 'number' ? event.user_id : Number(event.user_id);
       const normalizedSenderId = Number.isFinite(rawSenderId) ? rawSenderId : undefined;
       const groupValue = typeof event.group_id === 'number' ? event.group_id : Number(event.group_id);
       const groupId = Number.isFinite(groupValue) ? groupValue : undefined;
       const chatId = groupId !== undefined ? `g:${groupId}` : `p:${normalizedSenderId ?? ''}`;
       const body = text.slice(triggerPrefix.length).trim();
-      if (normalizedSenderId === undefined || !shellConfig.adminIds.includes(normalizedSenderId)) {
-        log.warn('shell 非管理员触发已拒绝', { chatId, senderId: normalizedSenderId, command: redactShellCommand(body) });
-        return;
-      }
-      const senderId = normalizedSenderId;
-      if (body === 'stop' || body.startsWith('stop ')) {
-        const target = body.slice(4).trim();
-        const stopped = shellTasks.stopMatching(chatId, target === '' || target === 'all' ? undefined : target, senderId, shellConfig.adminIds);
-        audit({ event: 'stopped', requestId: randomUUID(), actorId: senderId, chatId, groupId, command: body, runtime: shellConfig.runtime, cwd: shellConfig.cwd, reason: stopped.length > 0 ? `停止 ${stopped.length} 个任务` : '没有可停止任务' });
-        await ctx.reply(stopped.length > 0 ? `已停止：${stopped.map((task) => task.taskId).join(', ')}` : '没有找到可停止的 shell 任务');
+      const context = {
+        chatId,
+        groupId,
+        senderId: normalizedSenderId,
+        senderName: event.sender?.nickname,
+        source: 'chat' as const,
+      };
+      const sessionRunner = registry.getSessionCommandRunner();
+      if (sessionRunner) {
+        if (normalizedSenderId === undefined || !shellConfig.adminIds.includes(normalizedSenderId)) {
+          logReject({ module: 'src/skills/builtin/shell.ts', command: body, chatId, groupId, senderId: normalizedSenderId, reason: 'Shell 管理员列表拒绝' });
+          return { handled: true };
+        }
+        const result = await sessionRunner.run(body, context);
+        if (result.stdout || result.stderr) {
+          const output = result.stderr ? `${result.stdout}${result.stdout ? '\n' : ''}stderr:\n${result.stderr}` : result.stdout;
+          await sendLogged((out) => ctx.reply(out as never), { module: 'src/skills/builtin/shell.ts', command: body, chatId, groupId, senderId: normalizedSenderId, messageType: 'text' }, output);
+        }
         return { handled: true };
       }
-      if (!body) { await ctx.reply(`用法：${triggerPrefix}<命令>，${triggerPrefix}stop [all|taskId]`); return { handled: true }; }
-      const request: ShellRequest = { command: body, runtime: 'local' };
-      const decision = evaluateShellRequest(request, shellConfig, senderId);
-      if (!decision.allowed) {
-        audit({ event: 'rejected', requestId: randomUUID(), actorId: senderId, chatId, groupId, command: body, runtime: shellConfig.runtime, cwd: shellConfig.cwd, reason: decision.reason });
-        await ctx.reply(`shell 执行失败：${decision.reason ?? '策略拒绝'}`);
-        return { handled: true };
-      }
-      const task = shellTasks.start(request, { senderId, chatId, groupId }, shellConfig, async (finished) => {
-        const result = finished.result;
-        const eventName = result?.error === '命令执行已取消'
-          ? 'stopped'
-          : finished.error || !finished.decision.allowed || (result && !result.ok) ? 'failed' : 'completed';
-        audit({ event: eventName, requestId: finished.requestId, taskId: task.taskId, actorId: senderId, chatId, groupId, command: body, runtime: shellConfig.runtime, cwd: shellConfig.cwd, durationMs: result?.durationMs, exitCode: result?.exitCode, signal: result?.signal, ok: result?.ok, stdoutBytes: result ? Buffer.byteLength(result.stdout) : undefined, stderrBytes: result ? Buffer.byteLength(result.stderr) : undefined, reason: result?.error ?? (finished.error instanceof Error ? finished.error.message : finished.error ? String(finished.error) : undefined) });
-        await ctx.reply(formatResult(finished));
-      });
-      audit({ event: 'started', requestId: task.taskId, taskId: task.taskId, actorId: senderId, chatId, groupId, command: body, runtime: shellConfig.runtime, cwd: shellConfig.cwd });
-      await ctx.reply(`已启动 shell 任务 ${task.taskId}`);
+      log.warn('shell 执行器未配置，拒绝执行', { module: 'src/skills/builtin/shell.ts', command: body, chatId, groupId, senderId: normalizedSenderId, reason: 'SessionCommandRunner 未配置' });
+      const message = '工具执行失败：SessionCommandRunner 未配置，已停止后续处理';
+      await sendLogged((out) => ctx.reply(out as never), { module: 'src/skills/builtin/shell.ts', command: body, chatId, groupId, senderId: normalizedSenderId, messageType: 'text' }, message);
       return { handled: true };
     });
 
@@ -115,17 +110,11 @@ export const shellPlugin: Plugin = {
         const base = { requestId, actorId: context.senderId, chatId: context.chatId, command, runtime: request.runtime ?? shellConfig.runtime, cwd: shellConfig.cwd } as const;
         audit({ event: 'started', ...base });
         try {
-          const execution = await import('../../tools/executor').then(({ executeShell }) => executeShell({ ...request, command }, shellConfig, context.senderId, context.signal));
-          if (!execution.decision.allowed) {
-            audit({ event: 'rejected', ...base, requestId: execution.requestId, reason: execution.decision.reason });
-            return `工具执行失败：${execution.decision.reason ?? '策略拒绝'}`;
-          }
-          if (!execution.result) {
-            audit({ event: 'failed', ...base, requestId: execution.requestId, reason: '执行器未返回结果' });
-            return '工具执行失败：执行器未返回结果';
-          }
-          audit({ event: execution.result.ok ? 'completed' : execution.result.error === '命令执行已取消' ? 'stopped' : 'failed', ...base, requestId: execution.requestId, durationMs: execution.result.durationMs, exitCode: execution.result.exitCode, signal: execution.result.signal, ok: execution.result.ok, stdoutBytes: Buffer.byteLength(execution.result.stdout), stderrBytes: Buffer.byteLength(execution.result.stderr), reason: execution.result.error });
-          return JSON.stringify(execution.result);
+        const runner = registry.getSessionCommandRunner();
+        if (!runner) return '工具执行失败：SessionCommandRunner 未配置';
+        const result = await runner.run(command, { chatId: context.chatId, senderId: context.senderId, senderName: context.senderName, source: 'agent' });
+        audit({ event: result.exitCode === 0 ? 'completed' : 'failed', ...base, durationMs: result.internal.durationMs, exitCode: result.exitCode ?? undefined, ok: result.exitCode === 0, stdoutBytes: Buffer.byteLength(result.stdout), stderrBytes: Buffer.byteLength(result.stderr), reason: result.exitCode === 0 ? undefined : result.stderr });
+        return [result.stdout, result.stderr ? `stderr:\n${result.stderr}` : ''].filter(Boolean).join('\n') || `退出码 ${result.exitCode ?? '未知'}`;
         } catch (error) {
           audit({ event: 'failed', ...base, reason: error instanceof Error ? error.message : String(error) });
           return `工具执行失败：${error instanceof Error ? error.message : String(error)}`;

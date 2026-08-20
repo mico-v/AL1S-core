@@ -4,11 +4,12 @@
  */
 import { existsSync, mkdirSync, readFileSync, renameSync, writeFileSync } from 'node:fs';
 import { dirname } from 'node:path';
-import type { SkillRegistry } from '../skills/registry';
+import type { SkillRegistry, PluginCommandInfo } from '../skills/registry';
 
 export interface EnabledSnapshot {
+  plugins?: Record<string, boolean>;
   commands: Record<string, boolean>;
-  skills: Record<string, boolean>;
+  skills?: Record<string, boolean>;
 }
 
 /** 单个插件在管理后台的展示项：含其命令/工具与其启停状态 */
@@ -16,9 +17,9 @@ export interface PluginItem {
   name: string;
   displayName: string;
   description: string;
-  hasSettings: boolean; // 该插件是否声明了设置项（前端据此显示"设置"徽标/表单）
-  commands: Array<{ name: string; description: string; enabled: boolean }>;
-  skills: Array<{ name: string; description: string; enabled: boolean }>;
+  enabled: boolean;
+  hasSettings: boolean;
+  commands: PluginCommandInfo[];
 }
 
 export class PluginControl {
@@ -65,17 +66,9 @@ export class PluginControl {
       name: m.name,
       displayName: m.displayName,
       description: m.description,
+      enabled: this.registry.isPluginEnabled(m.name),
       hasSettings: Boolean(m.settings && m.settings.fields.length > 0),
-      commands: this.registry.getCommandsByPlugin(m.name).map((c) => ({
-        name: c.name,
-        description: c.description,
-        enabled: this.registry.isCommandEnabled(c.name),
-      })),
-      skills: this.registry.getSkillsByPlugin(m.name).map((s) => ({
-        name: s.name,
-        description: s.description,
-        enabled: this.registry.isSkillEnabled(s.name),
-      })),
+      commands: this.registry.getPluginCommands(m.name),
     }));
     return { plugins };
   }

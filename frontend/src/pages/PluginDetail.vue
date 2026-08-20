@@ -28,7 +28,7 @@
           <div>
             <div class="text-subtitle-1">{{ plugin.description }}</div>
             <div class="text-caption text-medium-emphasis">
-              {{ commandCount }} {{ t('plugins.commands') }} · {{ skillCount }} {{ t('plugins.skills') }}
+              {{ commandCount }} 个命令
             </div>
           </div>
         </v-row>
@@ -55,46 +55,23 @@
     </v-card>
     <v-card v-else-if="!loading && plugin" class="dashboard-card mb-5"><v-card-text class="text-medium-emphasis">{{ t('plugins.noSettings') }}</v-card-text></v-card>
 
-    <!-- 命令开关 -->
-    <v-card v-if="commands.length" class="dashboard-card mb-5">
-      <v-card-title class="dashboard-section-title">{{ t('plugins.commands') }}</v-card-title>
-      <v-data-table
-        :headers="headers"
-        :items="commands"
-        :loading="loading"
-        items-per-page="-1"
-        density="compact"
-      >
-        <template #item.enabled="{ item }">
-          <v-switch
-            :model-value="item.enabled"
-            color="primary"
-            density="compact"
-            hide-details
-            @update:model-value="(v: unknown) => toggle('command', item, !!v)"
-          />
+    <!-- 统一命令列表：工具与显式命令均按 CLI command 展示 -->
+    <v-card v-if="commands.length" class="dashboard-card">
+      <v-card-title class="dashboard-section-title">插件命令</v-card-title>
+      <v-data-table :headers="headers" :items="commands" :loading="loading" items-per-page="-1" density="compact">
+        <template #item.name="{ item }">
+          <div class="font-mono">${{ item.name }}</div>
+          <div v-if="item.aliases.length" class="text-caption text-medium-emphasis">别名：{{ item.aliases.join('、') }}</div>
         </template>
-      </v-data-table>
-    </v-card>
-
-    <!-- 工具开关 -->
-    <v-card v-if="skills.length" class="dashboard-card">
-      <v-card-title class="dashboard-section-title">{{ t('plugins.skills') }}</v-card-title>
-      <v-data-table
-        :headers="headers"
-        :items="skills"
-        :loading="loading"
-        items-per-page="-1"
-        density="compact"
-      >
+        <template #item.kind="{ item }">
+          <v-chip size="small" variant="tonal" :color="item.kind === 'skill' ? 'secondary' : 'primary'">{{ item.kind === 'skill' ? 'Agent 工具' : '插件命令' }}</v-chip>
+        </template>
+        <template #item.description="{ item }">
+          <div>{{ item.description }}</div>
+          <div class="text-caption text-medium-emphasis">{{ item.execution }} · {{ item.supportsChat ? '聊天' : '' }} {{ item.supportsAgent ? 'Agent' : '' }}</div>
+        </template>
         <template #item.enabled="{ item }">
-          <v-switch
-            :model-value="item.enabled"
-            color="primary"
-            density="compact"
-            hide-details
-            @update:model-value="(v: unknown) => toggle('skill', item, !!v)"
-          />
+          <v-switch :model-value="item.enabled" color="primary" density="compact" hide-details @update:model-value="(v: unknown) => toggle(item, !!v)" />
         </template>
       </v-data-table>
     </v-card>
@@ -107,7 +84,7 @@ import { computed, onMounted, ref, watch } from 'vue'
 import { useRoute } from 'vue-router'
 import { useI18n } from 'vue-i18n'
 import { api } from '@/api/client'
-import type { CommandItem, ConfigGroup, PluginItem, SkillItem } from '@/api/types'
+import type { ConfigGroup, PluginCommandItem, PluginItem } from '@/api/types'
 import ConfigForm from '@/components/ConfigForm.vue'
 import { useSnackbarStore } from '@/stores/snackbar'
 
@@ -119,8 +96,7 @@ const name = computed(() => String(route.params.name ?? ''))
 const plugin = ref<PluginItem | null>(null)
 const settings = ref<ConfigGroup | null>(null)
 const values = ref<Record<string, unknown>>({})
-const commands = ref<CommandItem[]>([])
-const skills = ref<SkillItem[]>([])
+const commands = ref<PluginCommandItem[]>([])
 const loading = ref(false)
 const loadError = ref('')
 
@@ -131,24 +107,24 @@ interface Header {
 }
 
 const headers: Header[] = [
-  { title: t('plugins.name'), key: 'name' },
-  { title: t('plugins.description'), key: 'description' },
-  { title: t('plugins.enabled'), key: 'enabled', sortable: false },
+  { title: '命令', key: 'name' },
+  { title: '类型', key: 'kind', sortable: false },
+  { title: '说明', key: 'description' },
+  { title: '启用', key: 'enabled', sortable: false },
 ]
 
 const commandCount = computed(() => commands.value.length)
-const skillCount = computed(() => skills.value.length)
 
-type ToggleItem = CommandItem | SkillItem
+type ToggleItem = PluginCommandItem
 
-/** 切换启用状态：乐观更新，失败回滚 */
-async function toggle(kind: 'command' | 'skill', item: ToggleItem, enabled: boolean): Promise<void> {
+/** 切换统一 command 启用状态：乐观更新，失败回滚 */
+async function toggle(item: ToggleItem, enabled: boolean): Promise<void> {
   const prev = item.enabled
   if (prev === enabled) return
-  item.enabled = enabled // 乐观更新
-  const res = await api.setPluginEnabled({ kind, name: item.name, enabled })
+  item.enabled = enabled
+  const res = await api.setPluginEnabled({ kind: item.kind, name: item.name, enabled })
   if (!res.ok) {
-    item.enabled = prev // 失败回滚
+    item.enabled = prev
     snackbar.show(res.error ?? t('plugins.toggleFailed'), 'error')
   }
 }
@@ -179,7 +155,6 @@ async function load(): Promise<void> {
     plugin.value = listRes.data.plugins.find((p) => p.name === name.value) ?? null
     if (plugin.value) {
       commands.value = plugin.value.commands
-      skills.value = plugin.value.skills
     }
   }
   if (!cfgRes.ok || !cfgRes.data) {

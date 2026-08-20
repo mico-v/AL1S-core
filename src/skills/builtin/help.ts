@@ -6,24 +6,8 @@ import type { Plugin, SkillRegistry } from '../registry';
 export const helpPlugin: Plugin = {
   name: 'help',
   displayName: '帮助',
-  description: '帮助',
-  register(registry: SkillRegistry): void {
-    registry.registerCommand({
-      name: 'help',
-      description: '显示帮助',
-      async handler(ctx) {
-        const lines: string[] = [];
-        lines.push('—— 可用命令 ——');
-        for (const c of registry.getEnabledCommands()) {
-          lines.push(`/${c.name}：${c.description}`);
-        }
-        lines.push('');
-        lines.push('—— 可用工具 ——');
-        for (const s of registry.getEnabledSkills()) {
-          lines.push(`${s.name}：${s.description}`);
-        }
-        await ctx.reply(lines.join('\n'));
-      },
-    });
+  description: '帮助（已由宿主管理命令处理）',
+  register(_registry: SkillRegistry): void {
+    // 兼容保留模块；正式注册由 builtinPlugin 元数据完成。
   },
 };

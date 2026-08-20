@@ -14,8 +14,15 @@ import type { BotConfig } from '../config';
 import type { SessionManager } from '../session/manager';
 import type { SkillRegistry } from '../skills/registry';
 import type { OutputFormatter } from '../format/formatter';
+import type { MspAgentBridge } from '../msp/agent-bridge';
+import type { ExecCommandInput, WriteStdinInput } from '../msp/protocol/types';
+import type { AdminCommandDispatcher } from '../admin/commands';
+import type { PluginCliRegistry } from '../msp/plugin-cli-registry';
+import type { SessionCommandRunner } from '../msp/session-command-runner';
 import { normalizeMessage } from './normalize';
 import { evaluateTrigger } from './trigger';
+import { getToolName } from '../agent/tool-names';
+import { sendLogged } from '../logging/send-log';
 
 const log = logger.child('pipeline');
 
@@ -27,6 +34,10 @@ export interface PipelineDeps {
   registry: SkillRegistry;
   botNickname?: string;
   formatter?: OutputFormatter; // 可开关的 LLM 输出格式化层
+  mspBridge?: MspAgentBridge;
+  adminCommands?: AdminCommandDispatcher;
+  cliRegistry?: PluginCliRegistry;
+  sessionCommandRunner?: SessionCommandRunner;
 }
 
 /** 单条回复的最大字数，超长分条发送 */
@@ -73,6 +84,10 @@ export class Pipeline {
   private readonly sessions: SessionManager;
   private readonly registry: SkillRegistry;
   private readonly formatter?: OutputFormatter;
+  private readonly mspBridge?: MspAgentBridge;
+  private readonly adminCommands?: AdminCommandDispatcher;
+  private readonly cliRegistry?: PluginCliRegistry;
+  private readonly sessionCommandRunner?: SessionCommandRunner;
   private _botNickname: string;
 
   constructor(deps: PipelineDeps) {
@@ -81,6 +96,10 @@ export class Pipeline {
     this.sessions = deps.sessions;
     this.registry = deps.registry;
     this.formatter = deps.formatter;
+    this.mspBridge = deps.mspBridge;
+    this.adminCommands = deps.adminCommands;
+    this.cliRegistry = deps.cliRegistry;
+    this.sessionCommandRunner = deps.sessionCommandRunner;
     this._botNickname = deps.botNickname ?? '';
   }
 
@@ -108,7 +127,16 @@ export class Pipeline {
     // c) 命令分发：命令不记日志、不触发（同样兜底，异常回复「内部出错了」）
     if (norm.text.startsWith('/')) {
       try {
-        await this.dispatchCommand(norm.text, chatId, ctx);
+        const adminHandled = this.adminCommands ? await this.adminCommands.dispatch(norm.text, {
+          chatId,
+          senderId: event.user_id,
+          senderName: event.sender.nickname || `用户${event.user_id}`,
+          reply: async (message) => {
+            await sendLogged((out) => ctx.reply(text(String(out))), { module: 'src/pipeline/pipeline.ts', command: 'builtin', chatId, senderId: event.user_id, messageType: 'text' }, message);
+          },
+        }) : false;
+        // 普通插件只走 $/Agent；/ 保留给 builtin 管理命令。
+        if (!adminHandled) log.debug('未知管理命令', { chatId, text: norm.text });
       } catch (err) {
         await this.safeErrorReply(ctx, err);
       }
@@ -168,7 +196,16 @@ export class Pipeline {
 
     if (norm.text.startsWith('/')) {
       try {
-        await this.dispatchCommand(norm.text, chatId, ctx);
+        const adminHandled = this.adminCommands ? await this.adminCommands.dispatch(norm.text, {
+          chatId,
+          senderId: event.user_id,
+          senderName: event.sender.nickname || `用户${event.user_id}`,
+          reply: async (message) => {
+            await sendLogged((out) => ctx.reply(text(String(out))), { module: 'src/pipeline/pipeline.ts', command: 'builtin', chatId, senderId: event.user_id, messageType: 'text' }, message);
+          },
+        }) : false;
+        // 普通插件只走 $/Agent；/ 保留给 builtin 管理命令。
+        if (!adminHandled) log.debug('未知管理命令', { chatId, text: norm.text });
       } catch (err) {
         await this.safeErrorReply(ctx, err);
       }
@@ -199,40 +236,55 @@ export class Pipeline {
     }
   }
 
-  /** 命令分发：取第一个空白前 token 去掉 '/' 作为命令名，构造 CommandContext 执行 */
+  /** 普通插件命令：命令描述来自统一 CLI registry，执行通过 MSP runtime。 */
   private async dispatchCommand(raw: string, chatId: string, ctx: SnowLumaEventContext): Promise<void> {
     const spaceIdx = raw.indexOf(' ');
     const head = spaceIdx >= 0 ? raw.slice(0, spaceIdx) : raw;
-    const name = head.slice(1); // 去掉开头的 '/'
+    const name = head.slice(1);
     const rest = spaceIdx >= 0 ? raw.slice(spaceIdx + 1) : '';
-    const cmd = this.registry.findCommand(name);
-    if (!cmd || !this.registry.isCommandEnabled(name)) {
+    const pluginCommand = this.registry.findPluginCommand(name);
+    if (!pluginCommand || !pluginCommand.enabled) {
       log.debug('未知命令', { chatId, name });
-      return; // 未知命令/已禁用命令静默忽略
+      return;
     }
-    // 从消息事件提取发送者与群号，供命令做权限/群级操作
+
     const ev = ctx.event as OneBotMessageEvent;
     const groupId = 'group_id' in ev && typeof ev.group_id === 'number' ? ev.group_id : undefined;
     const senderId = ev.user_id;
     const senderName = ev.sender?.nickname || `用户${ev.user_id}`;
     log.info('命令', { chatId, name });
-    await cmd.handler({
-      chatId,
-      groupId,
-      senderId,
-      senderName,
-      rest,
-      reply: async (t: string) => {
-        // 开启全局 Markdown 清理时，命令文本回复也过一遍 cleanText
-        const out =
-          this.formatter?.enabled && this.formatter.globalMarkdownKiller ? this.formatter.cleanText(t) : t;
-        await ctx.reply(text(out));
-      },
-      send: (m) => ctx.reply(m),
-      api: ctx.client,
-      sessions: this.sessions,
-      config: this.config,
-    });
+
+    if (this.cliRegistry?.find(name)) {
+      const result = await this.cliRegistry.invoke(name, { name, arguments: rest ? rest.split(/\s+/) : [], rawInput: raw }, {
+        chatId,
+        senderId,
+        senderName,
+        workspace: '/',
+        commandContext: {
+          chatId,
+          groupId,
+          senderId,
+          senderName,
+          rest,
+          reply: async (message) => {
+            const out = this.formatter?.enabled && this.formatter.globalMarkdownKiller ? this.formatter.cleanText(message) : message;
+            await sendLogged((out) => ctx.reply(out as never), { module: 'src/pipeline/pipeline.ts', command: name, chatId, groupId, senderId, messageType: 'text' }, out);
+          },
+          send: (message) => sendLogged((out) => ctx.reply(out as never), { module: 'src/pipeline/pipeline.ts', command: name, chatId, groupId, senderId, messageType: 'segments' }, message),
+          api: ctx.client,
+          sessions: this.sessions,
+          config: this.config,
+        },
+      });
+      const output = [result.stdout, result.stderr ? `stderr:\n${result.stderr}` : ''].filter(Boolean).join('\n');
+      if (output) {
+        const clean = this.formatter?.enabled && this.formatter.globalMarkdownKiller ? this.formatter.cleanText(output) : output;
+        await sendLogged((out) => ctx.reply(text(String(out))), { module: 'src/pipeline/pipeline.ts', command: name, chatId, groupId, senderId, messageType: 'text' }, clean);
+      }
+      return;
+    }
+
+    return;
   }
 
   /** 生成并回复：组装 system + 上下文 → agent loop → 分条回复 → 记 bot 回复日志 */
@@ -244,11 +296,60 @@ export class Pipeline {
     ctx: SnowLumaEventContext,
   ): Promise<void> {
     const s = this.sessions.get(chatId);
+    const event = ctx.event as OneBotMessageEvent;
+    const groupId = 'group_id' in event && typeof event.group_id === 'number' ? event.group_id : undefined;
+    if (this.config.msp.enabled) {
+      const availability = this.sessionCommandRunner
+        ? await this.sessionCommandRunner.inspectAvailability()
+        : { available: false, isolated: false, reason: 'SessionCommandRunner 未配置' };
+      if (!availability.available || !this.mspBridge) {
+        const reason = !availability.available ? (availability.reason ?? 'Session sandbox 不可用') : 'MspAgentBridge 未配置';
+        log.warn('拒绝进入 Agent', { module: 'src/pipeline/pipeline.ts', sourceModule: 'src/msp/session-command-runner.ts', chatId, groupId, senderId, reason });
+        const message = '工具执行失败（模块：src/msp/session-command-runner.ts）：Session sandbox 不可用，已停止处理。';
+        await sendLogged((out) => ctx.reply(out as never), { module: 'src/pipeline/pipeline.ts', command: 'msp-sandbox', chatId, groupId, senderId, messageType: 'text' }, message);
+        metrics.errors++;
+        return;
+      }
+    }
     const persona = s.personaOverride ?? this.config.persona;
     const tools = this.registry.getEnabledSkills();
+    const commandSkills = this.registry.getAllPluginCommands()
+      .filter((command) => command.enabled && command.supportsAgent && command.kind === 'command');
+    const mspTools = this.config.msp.enabled ? this.mspBridge!.getModelTools() : [];
+    const agentSkills = [
+      ...tools,
+      ...commandSkills
+        .filter((command) => !tools.some((skill) => skill.name === command.name))
+        .map((command) => ({
+          name: command.name,
+          toolName: getToolName(command.name, command.plugin),
+          description: command.description,
+          inputSchema: command.inputSchema,
+          run: async (args: Record<string, unknown>, context: { chatId: string; senderId?: number; senderName: string; signal?: AbortSignal }) => {
+            const cliArgs = Object.entries(args).flatMap(([key, value]) => value === undefined ? [] : [`--${key}`, String(value)]);
+            const result = await this.cliRegistry!.invoke(command.name, { name: command.name, arguments: cliArgs, rawInput: cliArgs.join(' ') }, { chatId: context.chatId, groupId, senderId: context.senderId, senderName: context.senderName, source: 'agent', workspace: '/', input: args });
+            return [result.stdout, result.stderr ? `stderr:\n${result.stderr}` : ''].filter(Boolean).join('\n');
+          },
+        })),
+      ...mspTools.map((tool) => ({
+        name: tool.name,
+        toolName: tool.name,
+        description: tool.description,
+        inputSchema: tool.inputSchema,
+        run: async (args: Record<string, unknown>, context: { chatId: string; senderId?: number; senderName: string; signal?: AbortSignal }) => {
+          if (tool.name === 'exec_command' && this.sessionCommandRunner) {
+            const request = args as unknown as ExecCommandInput;
+            const result = await this.sessionCommandRunner.run(request.cmd, { chatId: context.chatId, groupId, senderId: context.senderId, senderName: context.senderName, source: 'agent' });
+            return [result.stdout, result.stderr ? `stderr:\n${result.stderr}` : ''].filter(Boolean).join('\n');
+          }
+          if (tool.name === 'exec_command') return this.mspBridge!.execCommand(args as unknown as ExecCommandInput, { chatId: context.chatId, actorId: context.senderId, actorName: context.senderName, signal: context.signal }).then((result) => result.text);
+          return this.mspBridge!.writeStdin(args as unknown as WriteStdinInput, { chatId: context.chatId, actorId: context.senderId, actorName: context.senderName, signal: context.signal }).then((result) => result.text);
+        },
+      })),
+    ];
     const system: LLMMessage = {
       role: 'system',
-      content: `${persona}\n可用工具：${tools.map((x) => x.name).join('、')}`,
+      content: `${persona}\n可用工具：${agentSkills.map((x) => x.toolName ?? x.name).join('、')}`,
     };
     const messages: LLMMessage[] = [system, ...s.buildContext()];
     log.info('开始生成', { chatId, atBot });
@@ -256,10 +357,10 @@ export class Pipeline {
 
     const res = await runAgentLoop({
       provider: this.provider,
-      skills: tools,
+      skills: agentSkills,
       messages,
       maxIterations: this.config.maxToolIterations,
-      temperature: undefined,
+      temperature: this.config.llm.temperature,
       maxTokens: this.config.llm.maxTokens,
       chatId,
       senderId,
@@ -273,52 +374,45 @@ export class Pipeline {
     // 实际发送的文本：格式化层开启时先做 Markdown 清理
     const formatted = this.formatter?.enabled ? this.formatter.cleanText(res.text) : res.text;
 
-    if (res.error) {
-      metrics.errors++;
-      await ctx.reply(text(`（出错了：${res.error}）`));
-      metrics.messagesSent++;
-    } else if (this.formatter?.enabled && this.formatter.lineSplit) {
-      // 格式化分段发送：按结构切段、逐段延时（对应 AstrBot on_decorating_result）
-      const segs = this.formatter.buildSegments(formatted);
-      for (let i = 0; i < segs.length; i++) {
-        const seg = segs[i]!;
-        const rendered = this.formatter.renderSegment(seg);
-        // 群聊且 @ 了机器人时，第一条前加 @ 发送者
-        const chain = atBot && i === 0 ? at(senderId).text(rendered) : text(rendered);
-        await ctx.reply(chain);
-        metrics.messagesSent++;
-        const delay = this.formatter.segmentDelay(seg);
-        if (delay > 0) await sleep(delay * 1000);
+    const responseText = res.error ? `（出错了：${res.error}）` : formatted;
+    try {
+      if (res.error) {
+        metrics.errors++;
+        await sendLogged((out) => ctx.reply(out as never), { module: 'src/pipeline/pipeline.ts', command: 'agent-error', chatId, groupId, senderId, messageType: 'text' }, responseText);
+      } else if (this.formatter?.enabled && this.formatter.lineSplit) {
+        const segs = this.formatter.buildSegments(formatted);
+        for (let i = 0; i < segs.length; i++) {
+          const seg = segs[i]!;
+          const rendered = this.formatter.renderSegment(seg);
+          const chain = atBot && i === 0 ? at(senderId).text(rendered) : text(rendered);
+          await sendLogged((out) => ctx.reply(out as never), { module: 'src/pipeline/pipeline.ts', command: 'agent', chatId, groupId, senderId, messageType: 'text' }, chain);
+          metrics.messagesSent++;
+          const delay = this.formatter.segmentDelay(seg);
+          if (delay > 0) await sleep(delay * 1000);
+        }
+      } else {
+        const chunks = splitText(formatted, MAX_CHUNK);
+        for (let i = 0; i < chunks.length; i++) {
+          const chunk = chunks[i]!;
+          const chain = atBot && i === 0 ? at(senderId).text(chunk) : text(chunk);
+          await sendLogged((out) => ctx.reply(out as never), { module: 'src/pipeline/pipeline.ts', command: 'agent', chatId, groupId, senderId, messageType: 'text' }, chain);
+          metrics.messagesSent++;
+        }
       }
-    } else {
-      const chunks = splitText(formatted, MAX_CHUNK);
-      for (let i = 0; i < chunks.length; i++) {
-        const chunk = chunks[i]!;
-        // 群聊且 @ 了机器人时，第一条前加 @ 发送者
-        const chain = atBot && i === 0 ? at(senderId).text(chunk) : text(chunk);
-        await ctx.reply(chain);
-        metrics.messagesSent++;
-      }
+    } finally {
+      // 即使 OneBot 发送失败，也保留 Agent 最终回复，避免上下文断裂。
+      s.append({ role: 'assistant', senderId: undefined, senderName: this._botNickname, text: responseText, atBot: false, time: Date.now() });
     }
-
-    // 记 bot 回复日志（记录实际发送文本，供上下文连贯）
-    s.append({
-      role: 'assistant',
-      senderId: undefined,
-      senderName: this._botNickname,
-      text: formatted,
-      atBot: false,
-      time: Date.now(),
-    });
   }
 
   /** 非命令路径兜底：异常回复「内部出错了」，绝不冒泡 */
   private async safeErrorReply(ctx: SnowLumaEventContext, err: unknown): Promise<void> {
     const msg = err instanceof Error ? err.message : String(err);
     metrics.errors++;
-    log.error('内部出错了', { err: msg });
+    log.error('内部出错了', { module: 'src/pipeline/pipeline.ts', reason: msg });
     try {
-      await ctx.reply(text(`内部出错了：${msg}`));
+      const message = '内部出错了（模块：src/pipeline/pipeline.ts），请稍后重试。';
+      await sendLogged((out) => ctx.reply(out as never), { module: 'src/pipeline/pipeline.ts', command: 'error', messageType: 'text' }, message);
     } catch {
       // 回复失败也静默，避免二次抛错
     }

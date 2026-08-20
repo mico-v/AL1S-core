@@ -12,6 +12,7 @@ import type { SessionPersistence } from '../session/persistence';
 import { logBuffer, type LogRecord } from '../logging/buffer';
 import { metricsSnapshot } from '../metrics';
 import { adminToken, isAuthorized } from './auth';
+import type { MspRuntime } from '../msp/protocol/types';
 
 /** 管理服务能接触到的 bot 运行态 */
 export interface AdminContext {
@@ -27,6 +28,7 @@ export interface AdminContext {
   version: string;
   /** 优雅关闭（落盘会话 + 关连接 + 退出）；缺省时直接 process.exit */
   shutdown?: () => void;
+  getMspRuntime?: () => MspRuntime;
 }
 
 /** 仅 SSE 允许用 ?token= 鉴权（EventSource 无法自定义请求头）；其余接口只认 Bearer 头 */
@@ -58,12 +60,33 @@ function redactConfigValues(values: Record<string, unknown>): Record<string, unk
   }
   return out;
 }
+const MAX_JSON_BODY_BYTES = 1_000_000;
+
 /** 读取并解析 JSON body */
 function readJsonBody(req: IncomingMessage): Promise<unknown> {
   return new Promise((resolve, reject) => {
     const chunks: Buffer[] = [];
-    req.on('data', (c) => chunks.push(c as Buffer));
+    let totalBytes = 0;
+    let settled = false;
+    const failOnce = (error: Error): void => {
+      if (settled) return;
+      settled = true;
+      reject(error);
+    };
+    req.on('data', (c) => {
+      if (settled) return;
+      const chunk = c as Buffer;
+      totalBytes += chunk.byteLength;
+      if (totalBytes > MAX_JSON_BODY_BYTES) {
+        failOnce(new Error('JSON body 过大'));
+        req.destroy();
+        return;
+      }
+      chunks.push(chunk);
+    });
     req.on('end', () => {
+      if (settled) return;
+      settled = true;
       const raw = Buffer.concat(chunks).toString('utf-8');
       if (!raw.trim()) return resolve({});
       try {
@@ -72,7 +95,7 @@ function readJsonBody(req: IncomingMessage): Promise<unknown> {
         reject(new Error(`JSON 解析失败：${e instanceof Error ? e.message : e}`));
       }
     });
-    req.on('error', reject);
+    req.on('error', (error) => failOnce(error instanceof Error ? error : new Error(String(error))));
   });
 }
 
@@ -150,19 +173,32 @@ export async function handleApiRequest(ctx: AdminContext, req: IncomingMessage, 
       return true;
     }
     if (method === 'PUT' && path === '/api/plugins/enabled') {
-      const body = (await readJsonBody(req)) as { kind?: 'command' | 'skill'; name?: string; enabled?: boolean };
+      const body = (await readJsonBody(req)) as { kind?: 'command' | 'skill' | 'plugin'; id?: string; name?: string; enabled?: unknown };
       const kind = body?.kind;
       const name = body?.name;
-      if ((kind !== 'command' && kind !== 'skill') || typeof name !== 'string') {
-        fail(res, 400, '参数错误：需要 kind(command|skill) 与 name');
+      const enabled = body?.enabled;
+      if (kind === 'command' && typeof body?.id === 'string') {
+        const changedById = ctx.registry.setCommandEnabledById(body.id, enabled as boolean);
+        if (!changedById) { fail(res, 404, `未找到 command ${body.id}`); return true; }
+        ok(res, { enabled });
         return true;
       }
-      const changed = ctx.pluginControl.setEnabled(kind, name, Boolean(body.enabled));
+      if (typeof enabled !== 'boolean') {
+        fail(res, 400, '参数错误：enabled 必须是 boolean');
+        return true;
+      }
+      if ((kind !== 'command' && kind !== 'skill' && kind !== 'plugin') || typeof name !== 'string') {
+        fail(res, 400, '参数错误：需要 kind(command|plugin) 与 name，以及 boolean enabled');
+        return true;
+      }
+      const changed = kind === 'plugin'
+        ? ctx.pluginControl.setPluginEnabled(name, enabled)
+        : ctx.pluginControl.setEnabled(kind, name, enabled);
       if (!changed) {
         fail(res, 404, `未找到 ${kind} ${name}`);
         return true;
       }
-      ok(res, { enabled: Boolean(body.enabled) });
+      ok(res, { enabled });
       return true;
     }
 
@@ -178,7 +214,10 @@ export async function handleApiRequest(ctx: AdminContext, req: IncomingMessage, 
       if (method === 'GET') {
         const group = meta.settings ?? null;
         const values: Record<string, unknown> = {};
-        if (group) for (const f of group.fields) values[f.key] = ctx.configStore.getField(f.key);
+        if (group) for (const f of group.fields) {
+          const value = ctx.configStore.getField(f.key);
+          values[f.key] = f.type === 'password' ? (value ? '••••••••' : '') : value;
+        }
         ok(res, { group, values });
         return true;
       }
@@ -232,7 +271,21 @@ export async function handleApiRequest(ctx: AdminContext, req: IncomingMessage, 
       }
     }
 
-    // --- 日志 ---
+    // --- MSP AgentBridge runtime ---
+    if (method === 'GET' && path === '/api/msp/runtime') {
+      const runtime = ctx.getMspRuntime?.();
+      if (!runtime) { fail(res, 503, 'MSP runtime 不可用'); return true; }
+      ok(res, { capabilities: runtime.getCapabilities(), commands: runtime.listCommands(), formatOutput: ctx.configStore.config.msp.formatOutput, workspace: '/' });
+      return true;
+    }
+    if (method === 'GET' && path === '/api/msp/sessions') {
+      const runtime = ctx.getMspRuntime?.();
+      if (!runtime) { fail(res, 503, 'MSP runtime 不可用'); return true; }
+      ok(res, { sessions: runtime.listSessions(), capabilities: runtime.getCapabilities() });
+      return true;
+    }
+
+
     if (method === 'GET' && path === '/api/logs') {
       const level = url.searchParams.get('level');
       const tag = url.searchParams.get('tag');

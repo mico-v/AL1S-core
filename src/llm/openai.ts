@@ -11,6 +11,7 @@ import type {
   LLMToolSchema,
 } from './types';
 import { logger } from '../logging/logger';
+import { isValidToolName } from '../agent/tool-names';
 
 const log = logger.child('llm');
 
@@ -27,9 +28,11 @@ function describeError(err: unknown): string {
   return String(err);
 }
 
-/** 错误信息是否提示 tools/function calling 不被支持（用于优雅降级） */
-function isToolsError(message: string): boolean {
-  return /tool|function/i.test(message);
+/** 校验工具声明，避免把服务端 schema 错误伪装成不支持 tools。 */
+function invalidTool(tool: LLMToolSchema): string | undefined {
+  if (!isValidToolName(tool.name)) return `工具 ${tool.name}（模块：${tool.module ?? 'unknown'}）名称不符合 ^[a-zA-Z0-9_-]+$ 且长度必须 ≤64`;
+  if (typeof tool.description !== 'string' || tool.description.trim().length === 0 || typeof tool.inputSchema !== 'object' || tool.inputSchema === null || Array.isArray(tool.inputSchema)) return `工具 ${tool.name}（模块：${tool.module ?? 'unknown'}）schema 非法`;
+  return undefined;
 }
 
 /** LLMMessage → OpenAI 消息（assistant 的 tool_calls 与 tool 的 tool_call_id） */
@@ -84,6 +87,21 @@ export class OpenAIProvider implements LLMProvider {
   async *streamChat(options: LLMChatOptions): AsyncIterable<LLMStreamEvent> {
     const { messages, tools, temperature, maxTokens, signal } = options;
     const hasTools = tools !== undefined && tools.length > 0;
+    if (hasTools) {
+      const seen = new Set<string>();
+      const invalid = tools.map((tool) => {
+        const reason = invalidTool(tool);
+        if (reason) return reason;
+        if (seen.has(tool.name)) return `工具 ${tool.name}（模块：${tool.module ?? 'unknown'}）名称重复`;
+        seen.add(tool.name);
+        return undefined;
+      }).find((item): item is string => item !== undefined);
+      if (invalid) {
+        log.error('拒绝非法 LLM 工具 schema', { module: 'src/llm/openai.ts', detail: invalid });
+        yield { type: 'done', message: { role: 'assistant', content: null }, error: invalid };
+        return;
+      }
+    }
     log.debug('LLM 请求', {
       model: this.model,
       msgCount: messages.length,
@@ -92,28 +110,8 @@ export class OpenAIProvider implements LLMProvider {
       maxTokens,
     });
 
-    // 带 tools 时先试一次：若被服务端以 tools 不支持拒绝，自动去掉 tools 重试一次
-    if (hasTools) {
-      const it = this.requestOnce({ messages, tools, temperature, maxTokens, signal })[Symbol.asyncIterator]();
-      const first = await it.next();
-      if (!first.done) {
-        const event = first.value;
-        if (event.type === 'done' && event.error !== undefined && isToolsError(event.error)) {
-          log.warn('工具不支持，去掉 tools 重试', { detail: event.error });
-          yield* this.requestOnce({ messages, temperature, maxTokens, signal });
-          return;
-        }
-        yield event;
-      }
-      // 手动消费剩余事件（避免对裸 AsyncIterator 用 yield*）
-      let next = await it.next();
-      while (!next.done) {
-        yield next.value;
-        next = await it.next();
-      }
-      return;
-    }
-    yield* this.requestOnce({ messages, temperature, maxTokens, signal });
+    if (hasTools) yield* this.requestOnce({ messages, tools, temperature, maxTokens, signal });
+    else yield* this.requestOnce({ messages, temperature, maxTokens, signal });
   }
 
   /** 发起一次 /chat/completions 流式请求并解析 SSE 事件 */

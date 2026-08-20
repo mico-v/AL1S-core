@@ -34,15 +34,28 @@ type ConfigField = {
   min?: number; max?: number; step?: number;
 };
 
-type CommandItem = { name: string; description: string; enabled: boolean };
-type SkillItem = { name: string; description: string; enabled: boolean };
-type PluginItem = {
-  name: string;              // 插件标识（如 xxt / course-schedule）
-  displayName: string;       // 中文显示名（侧栏/卡片/页头）
+type PluginCommandItem = {
+  id: string;
+  plugin: string;
+  name: string;
   description: string;
-  hasSettings: boolean;      // 是否声明了设置项
-  commands: CommandItem[];   // 该插件注册的命令（含启停）
-  skills: SkillItem[];       // 该插件注册的工具（含启停）
+  kind: 'command' | 'skill';
+  aliases: string[];
+  inputSchema?: Record<string, unknown>;
+  entrypoint?: string;
+  execution: 'runtime-cli' | 'host-effect';
+  risk?: 'low' | 'medium' | 'high';
+  supportsChat: boolean;
+  supportsAgent: boolean;
+  enabled: boolean;
+};
+type PluginItem = {
+  name: string;
+  displayName: string;
+  description: string;
+  enabled: boolean;
+  hasSettings: boolean;
+  commands: PluginCommandItem[];
 };
 
 type SessionSummary = {
@@ -89,7 +102,7 @@ Body：`{ values: Record<string, unknown> }`（部分提交即可）。后端热
 返回 `{ groups: ConfigGroup[] }`。
 
 ### `GET /api/plugins`
-返回 `{ plugins: PluginItem[] }` —— 每个插件含其命令/工具列表与启停状态、`hasSettings`。前端据此渲染侧栏「插件」目录 + 插件总览卡片。
+返回 `{ plugins: PluginItem[] }` —— 每个插件包含统一的 `commands` 数组；原有 Skill/命令均作为 command item 展示，含 aliases、参数 schema、执行方式和启停状态。
 
 ### `GET /api/plugins/:name/config`（URL 编码）
 返回 `{ group: ConfigGroup | null, values: Record<string, unknown> }`。
@@ -101,7 +114,7 @@ Body：`{ values: Record<string, unknown> }`（部分提交）。热应用 + 持
 返回 `{ applied: string[], pendingRestart: string[] }`。无设置项的插件返回 400；未知插件返回 404。
 
 ### `PUT /api/plugins/enabled`
-Body：`{ kind: 'command' | 'skill', name: string, enabled: boolean }`。热生效（/命令 与工具调用按此过滤）。
+Body：`{ kind: 'plugin' | 'command' | 'skill', name: string, enabled: boolean }`。前端主路径使用 `plugin` 或 `command`；`skill` 仅为迁移兼容。`enabled` 必须是 boolean。
 
 ### `GET /api/sessions`
 返回 `{ sessions: SessionSummary[] }`，按 lastActivity 降序。

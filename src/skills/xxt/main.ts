@@ -313,7 +313,7 @@ export class XxtPlugin {
       await ctx.reply('该指令仅支持群聊使用。');
       return;
     }
-    const m = (ctx.rest ?? '').match(/(\d+)/);
+    const m = (ctx.input?.count !== undefined ? String(ctx.input.count) : (ctx.rest ?? '')).match(/(\d+)/);
     if (!m) {
       await ctx.reply('用法：/选人 人数，例如 /选人 3');
       return;
@@ -348,6 +348,8 @@ export class XxtPlugin {
       return;
     }
     const selected = sample(candidates, pickCount);
+    const selectedIds = selected.map((mem) => String((mem as Record<string, unknown>)['user_id']));
+    await ctx.reply(`随机选中：${selectedIds.join(' ')}`);
     let output = chain().text('随机选中：');
     selected.forEach((mem, idx) => {
       output = output.at(Number((mem as Record<string, unknown>)['user_id']));
@@ -363,7 +365,7 @@ export class XxtPlugin {
       return;
     }
     if (!this.requireAdmin(ctx)) return;
-    const m = (ctx.rest ?? '').match(/(\d+)/);
+    const m = (ctx.input?.count !== undefined ? String(ctx.input.count) : (ctx.rest ?? '')).match(/(\d+)/);
     let count = 5;
     if (m) {
       count = parseInt(m[1]!, 10);
@@ -394,7 +396,7 @@ export class XxtPlugin {
       return;
     }
     if (!this.requireAdmin(ctx)) return;
-    const m = (ctx.rest ?? '').match(/(\d+)/);
+    const m = (ctx.input?.count !== undefined ? String(ctx.input.count) : (ctx.rest ?? '')).match(/(\d+)/);
     const recordId = m ? parseInt(m[1]!, 10) : 0;
     if (!recordId || recordId <= 0) {
       await ctx.reply('用法：/重放 序号，例如 /重放 3。');

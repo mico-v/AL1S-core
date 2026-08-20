@@ -1,124 +1,186 @@
 # CLAUDE.md
 
-This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
+This file provides guidance to Claude Code (https://claude.ai/code) when working with code in this repository.
 
-## Project overview
+## 项目定位
 
-TypeScript **group-chat AI bot** connecting to a SnowLuma OneBot instance via `@snowluma/sdk`. The bot joins QQ groups, responds to @-mentions / trigger keywords via an OpenAI-compatible LLM, and is extended by registering **skills** (LLM tool-calls) and **slash commands**.
+这是一个 TypeScript/ESM QQ 群聊 AI Bot，通过 `@snowluma/sdk` 连接 SnowLuma OneBot，使用 OpenAI-compatible LLM，并通过插件 CLI、会话沙箱和管理后台扩展能力。
 
-ESM throughout (`"type": "module"`). Requires Node ≥ 22 (`.node-version` pins 24.13.0, managed via fnm). **Zero runtime dependencies beyond `@snowluma/sdk`** — the LLM client is hand-rolled over `fetch`. Keeping it dependency-light is an explicit project goal.
+入口是：
 
-The codebase (README, comments, log output) is written in **Chinese** — match that language in new comments and user-facing strings.
+```text
+src/index.ts → loadConfig() → new Bot(config) → bot.start()
+```
 
-## Commands
+部署基线是 Node 24（`.node-version` 为 24.13.0，Docker 使用 `node:24-slim`）；`package.json` 的 Node >=22 是最低声明。代码和用户可见文本以中文为主，新注释和消息保持中文。
+
+## 常用命令
+
+根目录执行：
 
 ```bash
 npm install
-cp .env.example .env   # fill in SNOWLUMA_TOKEN, LLM_API_KEY, LLM_BASE_URL, LLM_MODEL, BOT_PERSONA…
-
-npm run dev            # dev mode: tsx watch, auto-restart on file change, loads .env
-npm start              # normal run
-npm run http:check     # one-shot HTTP transport self-check (getLoginInfo / get_status) — needs SnowLuma
-npm run llm:check      # smoke-test the LLM provider directly (no QQ needed); skips if no LLM_API_KEY
-npm run format:check   # smoke-test the AL1S formatter (cleanText/buildSegments) offline
-npm run plugins:check  # dry-run register all plugins, assert command/skill presence
-npm run admin:check    # offline self-check of the admin HTTP service (auth/config-hot/plugin-toggle)
-npm run build:frontend # build the Vue3+Vuetify admin frontend (frontend/dist)
-npm run typecheck      # tsc --noEmit
+cp .env.example .env
+npm run dev                 # tsx watch，加载 .env
+npm start                   # tsx 启动 Bot
+npm run typecheck           # 根目录 TypeScript 检查
+npm run format:check        # AL1S formatter 离线检查
+npm run plugins:check       # 插件注册/命令元数据检查
+npm run admin:check         # Admin API 离线检查
+npm run msp:check           # MSP 协议、workspace、session 检查
+npm run plugin-cli:check    # CLI manifest/registry 检查
+npm run plugin-cli:runtime-check
+npm run command-broker:check
+npm run session-cli:check   # 真实 bash + 插件 CLI 管道/重定向检查
+npm run sandbox:check       # sandbox backend 可用性与 fail-closed 检查
+npm run integration:check   # typecheck + MSP/CLI/broker/sandbox 集成检查
+npm run shell:check         # Shell policy/executor 检查
+npm run build:frontend      # frontend typecheck + Vite build
 ```
 
-There is no test suite. `npm run typecheck` + the `*:check` scripts are the verification steps.
+需要外部服务的检查：
 
-## Runtime gotchas
-
-- **Always run through `tsx`, never plain `node`.** The published `@snowluma/sdk` dist has extensionless relative imports that Node's native ESM resolver rejects; `tsx` loads it fine. Every script uses `tsx` with `--env-file=.env`. Same reason the repo has no compiled output.
-- `npm run dev` / `npm start` need a running SnowLuma instance; the bot just connects and waits (Ctrl+C to exit).
-- When running one-off scripts with `tsx`, files in `/tmp` are treated as CommonJS — use a `.mts` extension there, or place scripts under `src/`.
-
-## Architecture
-
-Layered, each layer replaceable. Data flow for one group message:
-
-`onGroupMessage → Pipeline → normalize → log to ChatSession → trigger check → agent loop (LLM + tool calls) → ctx.reply → log bot reply`
-
-```
-src/
-  index.ts                # entry: loadConfig() → new Bot() → await bot.start()
-  config.ts               # BotConfig + loadConfig(env); env vars, defaults, validation
-  config/
-    schema.ts             # 配置元数据（分组/字段类型/hint/requiresRestart）→ 驱动前端 schema 表单
-    store.ts              # ConfigStore：env 默认 + data/settings.json 覆盖层；运行时可变 config，现读即热
-  bot.ts                  # Bot: owns SDK client, SessionManager, SkillRegistry, provider; binds events; assembles admin
-  admin/
-    server.ts             # Node http 管理服务：静态托管 frontend/dist + /api + SSE，127.0.0.1
-    router.ts             # /api 处理器（status/config/schema/plugins/sessions/logs/restart）+ 日志 SSE（Last-Event-ID 续传）
-    auth.ts               # ADMIN_TOKEN Bearer 校验（未配置则不开服务）
-  logging/
-    logger.ts             # zero-dep logger: levels (LOG_LEVEL), child tags, colored terminal, optional file (LOG_FILE) with rotation
-    buffer.ts             # 日志环形缓冲（最近 N 条）+ 订阅 → 供 /api/logs 与 SSE
-  metrics.ts              # 消息收发/工具调用/错误计数（仪表盘）
-  llm/
-    types.ts              # LLMProvider contract (never throws; errors → done.error event), LLMMessage, estimateTokens (chars/4)
-    openai.ts             # OpenAI-compatible client: fetch + SSE streaming, function-calling, graceful tools-fallback retry
-  session/
-    session.ts            # ChatSession: per-chat bounded log; buildContext() = token-budget window with "since bot's last reply" guarantee
-    manager.ts            # SessionManager: Map keyed by chatId (`g:<group>` / `p:<user>`), LRU eviction, createSession 工厂
-    persistence.ts        # 会话历史落盘 data/sessions/<chatId>.json（防抖写 + 启动恢复 + 退出 flush）——对话跨重启保留
-  pipeline/
-    normalize.ts          # OneBot segments ↔ text (@昵称, [图片], [DIRECTED AT YOU], reply/face/video…), detects atBot
-    trigger.ts            # evaluateTrigger: @bot || keyword-in-text
-    pipeline.ts           # orchestration: whitelist → normalize → command dispatch → log → trigger → cooldown → isGenerating guard → generate → reply
-  agent/
-    loop.ts               # runAgentLoop: stream LLM; if tool-calls, execute skills, feed results back; ≤ MAX_TOOL_ITERATIONS rounds
-  format/
-    output-spec.ts        # AL1S 格式化核心：cleanText（Markdown 清理）、buildSegments（结构分段）、表格对齐、calcDelay —— 纯逻辑零依赖
-    formatter.ts          # OutputFormatter 接口 + Al1sFormatter（读 config.al1sFormat，开关用 getter 现读 → 热切换）
-  skills/
-    registry.ts           # SkillRegistry (registerSkill/registerCommand/find*, 命令/skill enabled 启停, message/notice hooks, setApi), validateArgs
-    plugins.ts            # registerPlugins(): imports & registers every plugin — ADD A PLUGIN HERE
-    builtin/help.ts, reset.ts, persona.ts   # /help /reset /persona commands
-    example/dice.ts       # example tool skill (roll_dice) demonstrating the full function-calling path
-    xxt/                  # 学习通模仿娱乐插件：/选人、防撤回(/查撤回 /重放 /清空撤回)、/课堂提醒（消息钩子+撤回钩子+定时器）
-    courseSchedule/       # 课程表插件：/今日课表(canvas 图片)、/同步课表(群文件 .ics 双向同步) + 两个 SQL 工具（sql.js）
-  plugins/control.ts      # 命令/skill 启停 + 持久化 data/plugin-toggles.json（热生效）
-  scripts/http-check.ts, llm-check.ts, format-check.ts, plugins-check.ts, admin-check.ts
-frontend/                 # Vue3 + Vuetify 管理前端（独立工程，构建到 frontend/dist）
-  API.md                  # 前端实现依据的 API 契约
+```bash
+npm run http:check           # 需要可访问的 SnowLuma HTTP/WS
+npm run llm:check            # 需要有效的 LLM_API_KEY 和可用余额/服务
 ```
 
-### Logging
+前端也可以单独执行：
 
-Each module uses a child logger (`logger.child('pipeline')` etc.). Record format is one physical line:
-`[YYYY-MM-DD HH:mm:ss.mmm] [INFO ] [tag] message key=value`. Colorized when the terminal is a TTY (respects `NO_COLOR` / `FORCE_COLOR`); files are always plain. `error` records append the Error stack. Field values are escaped (newlines → `\n`) and truncated at 300 chars to keep lines greppable.
+```bash
+cd frontend
+npm install
+npm run typecheck
+npm run build
+npm run dev
+```
 
-Debug workflow: run with `LOG_LEVEL=debug` (and optionally `LOG_FILE=/path/to/bot.log` when running under systemd/background — auto-rotated at `LOG_MAX_SIZE_MB`, default 10 MB, keeps one `.1`). Key trace for one reply: `pipeline 收到群消息` → `未触发`/`冷却跳过`/`生成中，忽略` → `开始生成` → `agent 调用工具` (if any) → `llm LLM 完成` → `回复完成 ms=… toolCalls=…`. The logger never throws and degrades silently if file writes fail.
+必须通过 `tsx` 运行根目录 TypeScript 脚本，不要用 plain `node` 直接启动源码；已发布的 SnowLuma SDK 含 Node 原生 ESM 无法解析的 extensionless import。`deploy/healthcheck.mjs` 是纯 Node 健康脚本，不适用这条规则。
 
-### Key design decisions
+## 高层架构
 
-- **Triggering**: group replies only to @-mentions (at segment targeting `self_id`) or `TRIGGER_KEYWORDS`; `REPLY_COOLDOWN_SECONDS` prevents spam; `ENABLED_GROUPS` whitelist (empty = all groups). Private messages always reply. **Not** triggered by bot nickname substring — deliberate (avoids short-name false positives).
-- **Group-level shared context**: every message (including bot's own replies) is logged to that group's `ChatSession`. `buildContext()` walks newest→oldest within a token budget (`chars/4` heuristic, no tokenizer), **unconditionally including everything after the bot's last reply** (AstrBot continuity guarantee). Speaker-tagged as `昵称: 内容` (MaiBot style).
-- **Concurrency**: `ChatSession.isGenerating` — one in-flight generation per chat; messages arriving mid-generation are logged but don't trigger. No queue.
-- **Extension**: two extension kinds — **tool skills** (LLM function-calling, natural-language triggered) and **slash commands** (`/`-prefixed, explicit). A plugin bundles either/both as `{ name, description, register(registry) }`; wire it in `skills/plugins.ts`. Skills need no pipeline changes. Plugins can also register **message/notice hooks** (`addMessageHook`/`addNoticeHook`) for background listening (防撤回、课堂提醒), and use `CommandContext.api` / `SkillRegistry.getApi()` to call arbitrary OneBot actions (`ctx.client` is the SDK `SnowLumaApiClient`).
-- **CommandContext**: carries `groupId/senderId/senderName` (from the message event), `reply(text)`, `send(OutgoingMessage)` (rich segments incl. images), and `api` — commands can @ people, send images, upload group files, etc.
-- **LLM output formatting**: optional, toggleable layer (`AL1S_FORMAT_ENABLED` + `AL1S_LLM_LINE_SPLIT` + `AL1S_GLOBAL_MARKDOWN_KILLER`). When on, `pipeline.generate()` runs the formatter (`src/format/`) after the agent loop: clean Markdown, split by structure, send with per-segment delay; the session log records the actual sent text. Off by default — existing behavior unchanged.
-- **LLM provider**: contract is "never throws" — all failures surface as `{ type:'done', error }`. `openai.ts` aggregates tool_calls (arguments may be delta-chunked by index), and auto-retries once without `tools` if the server rejects function-calling.
-- **Memory & persistence**: in-memory sessions (LRU-capped), `/reset` clears a chat — **but chat logs now persist to `data/sessions/<chatId>.json`**（防抖写 + 退出 flush + 启动恢复，跨重启保留对话）. The course-schedule plugin persists to `COURSE_DATA_FILE` and renders with `@napi-rs/canvas`; those two deps (`@napi-rs/canvas`, `sql.js`) plus the admin frontend are the user-approved additions beyond `@snowluma/sdk`.
-- **Management backend** (`ADMIN_TOKEN`/`ADMIN_PORT`): bot 内嵌 Node http 服务（127.0.0.1），同一端口托管 `frontend/dist`（Vue3+Vuetify）+ `/api/*` REST + 日志 SSE。配置走运行时 `ConfigStore`（env 默认 + `data/settings.json` 覆盖层，**现读即热**：persona/触发词/格式化开关/日志级别/模型等即时生效；wsUrl/LLM apiKey 等标 `requiresRestart`）；命令/skill 启停热生效并持久化到 `data/plugin-toggles.json`；管理接口用 `ADMIN_TOKEN` Bearer 鉴权。`admin:check` 离线自检。
+一次消息的主链路是：
 
-### Config (`.env`)
+```text
+SnowLuma event
+  → Bot 记录 receive 日志
+  → SkillRegistry message/notice hooks
+  → Pipeline 归一化和管理命令处理
+  → SessionManager/ChatSession
+  → 群触发、冷却、并发锁
+  → Agent loop + LLM tools
+  → formatter
+  → 统一发送日志/OneBot reply
+  → SessionPersistence
+```
 
-`SNOWLUMA_WS_URL`, `SNOWLUMA_TOKEN`, `LLM_BASE_URL` (default `https://api.deepseek.com/v1`), `LLM_API_KEY`, `LLM_MODEL`, `LLM_TEMPERATURE`, `LLM_MAX_TOKENS`, `BOT_PERSONA`, `TRIGGER_KEYWORDS`, `REPLY_COOLDOWN_SECONDS`, `CONTEXT_TOKEN_BUDGET`, `MAX_TOOL_ITERATIONS`, `ENABLED_GROUPS`, `MAX_SESSIONS`, `LOG_LEVEL`, `LOG_FILE`, `LOG_MAX_SIZE_MB`, `ADMIN_TOKEN`（管理后台 token，不配置则不开）/ `ADMIN_PORT`（默认 6185）, `BOT_ADMINS`（逗号 QQ 号，空=不限制）, `AL1S_FORMAT_ENABLED` / `AL1S_GLOBAL_MARKDOWN_KILLER` / `AL1S_LLM_LINE_SPLIT` / `AL1S_SPLIT_CHARS_PER_SECOND` / `AL1S_SPLIT_MIN_SECONDS` / `AL1S_SPLIT_MAX_SECONDS`（AL1S 格式化）, `COURSE_DATA_FILE` / `COURSE_ICS_FOLDER` / `COURSE_FONT_PATH`（课程表）, `XXT_CLASS_PERIODS` / `XXT_CLASS_WARNING_COOLDOWN_SECONDS` / `XXT_CLASS_REPLY_TIMEOUT_SECONDS`（XXT 课堂提醒）。运行时改设置走管理后台（`data/settings.json` 覆盖层），不改 `.env`。
+### Bot
 
-## Code style constraints (tsconfig)
+`Bot` 是运行时装配根节点，连接 SnowLuma、ConfigStore、SessionManager、SkillRegistry、插件控制、Agent/LLM、MSP/sandbox、CommandBroker 和 AdminServer。修改启动顺序、连接重试或依赖注入时，应同时检查 `src/index.ts`、`src/bot.ts` 和对应的 `*:check`。
 
-Strict settings in `tsconfig.json` that shape how code must be written:
+### Pipeline / Agent
 
-- `verbatimModuleSyntax: true` — type-only imports must use `import type`.
-- `erasableSyntaxOnly: true` — no enums, namespaces, or parameter properties (only TS that erases cleanly).
-- `noUncheckedIndexedAccess: true` — indexing returns `T | undefined`; guard or handle accordingly.
+`Pipeline` 负责消息归一化、`/` builtin 管理命令、群白名单、触发条件、冷却、生成锁、Agent 生成和回复记录。`runAgentLoop()` 负责流式 LLM、多轮 tool call、参数校验和 tool result 回填。
 
-## Misc
+`/help`、`/reset`、`/persona`、`/llm ...` 是 builtin 管理命令，不要重新放入普通插件 CLI。普通插件功能应作为标准 CLI，通过统一会话 Bash 执行。
 
-- `ref/` contains zipped reference implementations of other bot frameworks (pi, MaiBot, AstrBot). Reference material only — not part of the build or runtime.
-- `.env` is gitignored; `.env.example` is the template. Don't commit real tokens.
-- SDK types worth knowing: `SnowLumaWebSocketClient` (`onGroupMessage`, `onPrivateMessage`, `command`, `use` middleware, `when` predicate, `onEvent`); `ctx.reply()` takes `OutgoingMessage`; message building via `text()`, `at()`, `chain()` (all return chainable `MessageChain`); `event.self_id`, `event.sender.nickname`, `event.raw_message`.
+### Session
+
+会话 ID 使用：
+
+```text
+g:<groupId>
+p:<userId>
+```
+
+`ChatSession` 管理有界消息历史、上下文 token 窗口、persona override、生成锁和最近 Bot 回复时间。`SessionManager` 负责 LRU；`SessionPersistence` 将会话持久化到 `data/sessions/`，因此不要再假设“重启即丢失”。
+
+### Plugin / Registry
+
+`SkillRegistry` 管理插件元数据、兼容 skill/command 查询、插件启停和 message/notice hooks。插件显式注册于 `src/skills/plugins.ts`。
+
+插件可有：
+
+- 标准 CLI command；
+- Agent skill 视图；
+- message/notice hooks；
+- 宿主状态和配置 reload/dispose。
+
+xxt 的撤回缓存、课堂提醒 timer、course 的 ScheduleStore 和 OneBot API 状态必须留在 Bot 宿主；CLI 子进程通过受限 CommandBroker 使用它们，不要在 CLI 中重新创建空插件实例。
+
+### 标准插件 CLI / Session Bash
+
+消息和 Agent 的命令执行必须走同一个会话 runner：
+
+```text
+完整命令文本
+  → SessionCommandRunner
+  → 选择会话 sandbox
+  → bash -c
+  → PATH 中的插件 CLI wrapper 或系统命令
+  → stdout/stderr/exitCode
+```
+
+宿主不要在 Bash 之前按空格拆分并执行插件。这样才能保留：
+
+```bash
+选人 1 | grep 123
+选人 1 > result.txt
+今日课表 | head -20
+python - <<'PY' | tee result.txt
+print("hello")
+PY
+```
+
+插件 CLI 的 stdout 必须是可被 pipe/redirection 消费的业务数据；stderr 是诊断；OneBot 图片、@、群文件等 effects 通过 broker 独立处理，不能混入 stdout。
+
+### MSP / sandbox
+
+`SessionSandboxManager` 为会话选择 rootless Podman、rootless Docker 或明确允许的 local-bash fallback；`SessionCommandRunner` 是统一执行入口；`MspAgentBridge` 向 Agent 提供 `exec_command`/`write_stdin` 等协议能力；`CommandBroker` 是 CLI 到 Bot 宿主能力的受限边界。
+
+生产不变量：
+
+- MSP/sandbox 不可用时 fail-closed，不得伪装成隔离或静默回退宿主 shell；
+- local-bash 仅在显式离线开发配置中允许；
+- 禁止挂载 Docker/Podman socket；
+- 禁止 `privileged`、host network、host PID/IPC、任意宿主路径挂载和设备映射；
+- sandbox 使用非 root、网络隔离、能力收缩和 CPU/内存/PID/输出限制；
+- 容器 root 只用于 entrypoint 修正 bind mount 权限，实际 Bot 使用 UID 10001；
+- 只读根文件系统下只能写 `/app/data`、`/tmp`、运行时目录、缓存目录等明确可写位置；
+- 容器内的 `127.0.0.1` 是容器自身。Compose 部署的 SnowLuma URL 必须是容器可访问的远端、服务名或 `host.docker.internal` 地址。
+
+### Admin
+
+配置 `ADMIN_TOKEN` 后启动内嵌 Node HTTP 管理服务，托管 `frontend/dist`、REST API 和日志 SSE。Compose 中通常让服务监听容器 `0.0.0.0`，但只向宿主发布 `127.0.0.1:6185`；不要直接公网开放。
+
+健康检查只代表进程存活或管理端口可连通，不代表 SnowLuma 或 LLM 一定可用。
+
+## 配置和部署陷阱
+
+- 本地默认 SnowLuma 地址可使用 `127.0.0.1`；容器中不能把容器自身 localhost 当成宿主/远端服务。
+- 生产推荐 `MSP_RUNTIME_MODE=podman`、`MSP_ALLOW_LOCAL_BASH_FALLBACK=false`；必须准备可用的 rootless runtime 和 `al1s-sandbox` 镜像。
+- `MSP_SANDBOX_BOOTSTRAP=false` 可避免容器每次启动同步从 registry 构建 sandbox；生产镜像应在部署阶段预构建或导入。
+- Docker 使用 `docker compose` v2；先运行 `docker compose config -q`，再构建/启动。不要把完整 `docker compose config` 输出到日志，因为它可能展开 `.env` 机密。
+- 部署前确认 bind-mounted `data/` 对容器 entrypoint/UID 10001 可遍历；broker socket 应放在容器运行目录，不应写入受限的持久化数据根目录。
+- Dockerfile 运行时包含 Python 3、`python`/`python3`/`pip3`、中文字体和 rootless Podman 相关工具；Python heredoc、管道和重定向应通过 MSP Bash 执行。
+- `@napi-rs/canvas`、`sql.js` 是当前课程表功能使用的运行时依赖；`frontend/` 是独立 npm 工程，不要把前端检查误认为根目录 `typecheck` 已覆盖。
+
+## 检查分层
+
+- 只改普通 TypeScript 逻辑：`npm run typecheck` + 受影响的 `*:check`。
+- 改 Agent/LLM tool schema：至少 `typecheck`、相关 Agent/LLM check 和 `integration:check`；工具名必须符合 provider 允许的 ASCII 约束。
+- 改插件 CLI、MSP、Broker、Session sandbox 或命令路由：必须运行 `npm run integration:check`、`command-broker:check`、`session-cli:check` 和 `sandbox:check`。
+- 改前端：必须运行 `npm run build:frontend`。
+- 改 Docker、entrypoint、Compose 或部署：运行 `docker compose config -q`、shell 语法检查和镜像构建检查；若 Docker/Podman 后端不可用，明确记录，不能宣称生产隔离已验证。
+
+## TypeScript 约束
+
+`tsconfig.json` 开启严格检查，包括：
+
+- `verbatimModuleSyntax`：类型导入使用 `import type`；
+- `erasableSyntaxOnly`：不要使用 enum、namespace 或 parameter properties；
+- `noUncheckedIndexedAccess`：数组/对象索引可能为 `undefined`，必须显式处理。
+
+## 规则文件
+
+未发现额外的 Cursor 或 Copilot 指令文件；本文件、`package.json`、TypeScript 配置、Docker/部署文档是项目操作依据。

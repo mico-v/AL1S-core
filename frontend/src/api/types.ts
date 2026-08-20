@@ -64,25 +64,29 @@ export interface ConfigGroup {
   fields: ConfigField[]
 }
 
-export interface CommandItem {
+export interface PluginCommandItem {
+  id: string
+  plugin: string
   name: string
   description: string
-  enabled: boolean
-}
-
-export interface SkillItem {
-  name: string
-  description: string
+  kind: 'command' | 'skill'
+  aliases: string[]
+  inputSchema?: Record<string, unknown>
+  entrypoint?: string
+  execution: 'runtime-cli' | 'host-effect'
+  risk?: 'low' | 'medium' | 'high'
+  supportsChat: boolean
+  supportsAgent: boolean
   enabled: boolean
 }
 
 export interface PluginItem {
-  name: string // 插件标识（如 xxt / course-schedule）
-  displayName: string // 中文显示名（侧栏/卡片/页头）
+  name: string
+  displayName: string
   description: string
-  hasSettings: boolean // 是否声明了设置项
-  commands: CommandItem[] // 该插件注册的命令（含启停）
-  skills: SkillItem[] // 该插件注册的工具（含启停）
+  enabled: boolean
+  hasSettings: boolean
+  commands: PluginCommandItem[]
 }
 
 export interface SessionSummary {

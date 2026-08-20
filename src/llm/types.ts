@@ -27,6 +27,8 @@ export interface LLMToolSchema {
   name: string;
   description: string;
   inputSchema: Record<string, unknown>;
+  /** 仅用于本地审计，不会发送给 provider。 */
+  module?: string;
 }
 
 /** 流式事件：文本增量 / 完整工具调用 / 结束 */

@@ -1,43 +1,46 @@
-# ============================================================
-# AL1S-core 群聊机器人 —— 多阶段构建
-# 阶段一：构建管理前端（Vue3 + Vite → frontend/dist）
-# 阶段二：运行时（tsx 启动，含原生依赖与中文字体）
-# 用法：docker compose build（配置见 docker-compose.yml）
-# ============================================================
-
-# ---------- 阶段一：前端构建 ----------
+# AL1S-core 多阶段构建：管理前端 + 非 root 运行时
 FROM node:24-slim AS frontend
 WORKDIR /build
-# 先拷锁文件装依赖（利用层缓存，源码改动不重装依赖）
 COPY frontend/package.json frontend/package-lock.json ./
 RUN npm ci
 COPY frontend/ .
 RUN npm run build
 
-# ---------- 阶段二：运行时 ----------
 FROM node:24-slim AS runtime
-
-# 课程表图片渲染需要中文字体：
-# render.ts 恰好会探测 /usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc
-# （Debian 安装 fonts-noto-cjk 后正好落在该路径）
 RUN apt-get update \
- && apt-get install -y --no-install-recommends fonts-noto-cjk \
- && rm -rf /var/lib/apt/lists/*
+ && apt-get install -y --no-install-recommends \
+      fonts-noto-cjk python3 python3-pip python-is-python3 podman uidmap slirp4netns fuse-overlayfs \
+ && rm -rf /var/lib/apt/lists/* \
+ && useradd --create-home --uid 10001 --shell /bin/bash al1s \
+ && printf '10001:100000:65536\n' > /etc/subuid \
+ && printf '10001:100000:65536\n' > /etc/subgid \
+ && mkdir -p /app/data /app/data/msp-workspace \
+ && chown -R al1s:al1s /app
 
 WORKDIR /app
 COPY package.json package-lock.json ./
-
-# npm ci 完整安装（tsx 是 devDependencies，运行时必须保留；
-# @napi-rs/canvas 平台二进制随 optionalDependencies 以预编译包形式带入）
 RUN npm ci
-
 COPY . .
-# 从阶段一拿构建好的管理前端
 COPY --from=frontend /build/dist frontend/dist
+COPY deploy/entrypoint.sh /usr/local/bin/al1s-entrypoint
+RUN chmod 755 /usr/local/bin/al1s-entrypoint && chown -R al1s:al1s /app
 
-# 运行时数据：会话持久化 / 课程表 / 设置覆盖层 / 插件开关
+ENV HOME=/home/al1s \
+    XDG_RUNTIME_DIR=/run/user/10001 \
+    CONTAINERS_STORAGE_CONF=/home/al1s/.config/containers/storage.conf \
+    MSP_RUNTIME_MODE=podman \
+    MSP_ALLOW_LOCAL_BASH_FALLBACK=false \
+    MSP_SANDBOX_BOOTSTRAP=false \
+    MSP_SANDBOX_FAIL_FAST=false
+# 为 rootless Podman 预建运行时目录、配置与存储目录。vfs 不依赖容器内 /dev/fuse，
+# 因而在 Docker/WSL2 的嵌套 rootless 场景中失败时只会使 sandbox 不可用，不会影响 Bot 启动。
+RUN mkdir -p /run/user/10001 /run/al1s \
+    /home/al1s/.config/containers /home/al1s/.config/cni \
+    /home/al1s/.local/share/containers /home/al1s/.local/share/podman \
+    /home/al1s/.cache \
+ && printf '[storage]\ndriver = "vfs"\nrunroot = "/run/user/10001/containers"\ngraphroot = "/home/al1s/.local/share/containers/storage"\n' > /home/al1s/.config/containers/storage.conf \
+ && chown -R al1s:al1s /run/user/10001 /run/al1s /home/al1s/.config /home/al1s/.local /home/al1s/.cache \
+ && chmod 700 /run/user/10001 /run/al1s
 VOLUME ["/app/data"]
-
-# 注意：不用 --env-file（镜像内无 .env），
-# 环境变量由 docker-compose.yml 的 env_file / environment 注入
-CMD ["node", "node_modules/tsx/dist/cli.mjs", "src/index.ts"]
+# entrypoint 以 root 修正 bind mount 权限后，通过 su 降权到 al1s。
+ENTRYPOINT ["/usr/local/bin/al1s-entrypoint"]

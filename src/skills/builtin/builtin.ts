@@ -18,28 +18,17 @@ const builtinSettings: ConfigGroupMeta = {
 
 registerConfigFields(builtinSettings);
 
+/**
+ * 内置插件只负责声明设置与插件元数据。
+ * /help、/reset、/persona 属于宿主管理命令，由 AdminCommandDispatcher 直接处理，
+ * 不进入普通插件命令注册表或 CLI 执行管道。
+ */
 export const builtinPlugin: Plugin = {
   name: 'builtin',
   displayName: '内置功能',
   description: 'AL1S 格式化、帮助、重置上下文和人设管理',
   settings: builtinSettings,
-  register(registry: SkillRegistry): void {
-    registry.registerCommand({ name: 'help', description: '显示帮助', async handler(ctx) {
-      const lines = ['—— 可用命令 ——'];
-      for (const c of registry.getEnabledCommands()) lines.push(`/${c.name}：${c.description}`);
-      lines.push('', '—— 可用工具 ——');
-      for (const s of registry.getEnabledSkills()) lines.push(`${s.name}：${s.description}`);
-      await ctx.reply(lines.join('\n'));
-    }});
-    registry.registerCommand({ name: 'reset', description: '清空本群上下文', async handler(ctx) {
-      ctx.sessions.clear(ctx.chatId);
-      await ctx.reply('已清空本群/本会话上下文。');
-    }});
-    registry.registerCommand({ name: 'persona', description: '查看或修改人设，/persona 新的人设内容', async handler(ctx) {
-      const session = ctx.sessions.get(ctx.chatId);
-      const rest = ctx.rest.trim();
-      if (!rest) await ctx.reply(`当前人设：${session.personaOverride ?? ctx.config.persona}`);
-      else { session.setPersonaOverride(rest); await ctx.reply('已更新本会话人设。'); }
-    }});
+  register(_registry: SkillRegistry): void {
+    // 管理命令由宿主 pipeline/admin dispatcher 处理。
   },
 };

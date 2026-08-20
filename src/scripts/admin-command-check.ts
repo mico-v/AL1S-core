@@ -1,0 +1,36 @@
+import { ConfigStore } from '../config/store';
+import { AdminCommandDispatcher, BuiltinCommandDispatcher, LlmAdminService } from '../admin/commands';
+import { SessionManager } from '../session/manager';
+import { SkillRegistry } from '../skills/registry';
+import { registerPlugins } from '../skills/plugins';
+import { PluginCliRegistry } from '../msp/plugin-cli-registry';
+import { registerBuiltinCliPlugins } from '../cli/plugins';
+
+const store = new ConfigStore(`./data/admin-command-check-${Date.now()}.json`);
+store.config.adminIds = [123];
+const sessions = new SessionManager({ tokenBudget: 1000, maxSessions: 10 });
+const skills = new SkillRegistry();
+registerPlugins(skills);
+const cli = new PluginCliRegistry();
+registerBuiltinCliPlugins(cli);
+const dispatcher = new AdminCommandDispatcher(new LlmAdminService(store), new BuiltinCommandDispatcher(skills, sessions, store.config));
+const replies: string[] = [];
+const reply = async (text: string): Promise<void> => { replies.push(text); };
+
+const unknown = await dispatcher.dispatch('/status', { chatId: 'p:7', senderId: 7, senderName: 'u', reply });
+if (unknown || replies.length !== 0) throw new Error('admin-command-check：普通命令不应被管理 dispatcher 截获');
+const denied = await dispatcher.dispatch('/llm status', { chatId: 'p:7', senderId: 7, senderName: 'u', reply });
+if (!denied || !replies.at(-1)?.includes('仅允许')) throw new Error('admin-command-check：非管理员未拒绝');
+const allowed = await dispatcher.dispatch('/llm model test-model', { chatId: 'p:123', senderId: 123, senderName: 'admin', reply });
+if (!allowed || store.config.llm.model !== 'test-model') throw new Error('admin-command-check：管理员模型命令未生效');
+await dispatcher.dispatch('/llm temperature 9', { chatId: 'p:123', senderId: 123, senderName: 'admin', reply });
+if (!replies.at(-1)?.includes('0 到 2')) throw new Error('admin-command-check：温度范围未校验');
+await dispatcher.dispatch('/reset', { chatId: 'p:123', senderId: 123, senderName: 'admin', reply });
+if (!replies.at(-1)?.includes('已清空')) throw new Error('admin-command-check：builtin reset 未处理');
+await dispatcher.dispatch('/persona 新人设', { chatId: 'p:123', senderId: 123, senderName: 'admin', reply });
+if (!replies.at(-1)?.includes('已更新')) throw new Error('admin-command-check：builtin persona 未处理');
+const helpBefore = replies.length;
+await dispatcher.dispatch('/help', { chatId: 'p:123', senderId: 123, senderName: 'admin', reply });
+if (replies.length !== helpBefore + 1 || !replies.at(-1)?.includes('/选人')) throw new Error('admin-command-check：builtin help 未列出插件命令');
+if (cli.list().some((item) => ['help', 'reset', 'persona'].includes(item.name))) throw new Error('admin-command-check：builtin 命令错误注册为 CLI');
+console.log('admin-command-check ok');

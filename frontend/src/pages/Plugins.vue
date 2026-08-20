@@ -16,8 +16,7 @@
           <v-card-text class="plugin-description">{{ p.description || '暂无插件描述' }}</v-card-text>
           <v-divider />
           <v-card-actions class="px-4 py-3">
-            <span class="dashboard-pill"><v-icon size="15">mdi-console-line</v-icon>{{ t('plugins.commandCount', { n: p.commands.length }) }}</span>
-            <span class="dashboard-pill"><v-icon size="15">mdi-tools</v-icon>{{ t('plugins.skillCount', { n: p.skills.length }) }}</span>
+            <span class="dashboard-pill"><v-icon size="15">mdi-console-line</v-icon>命令 {{ p.commands.length }}</span>
             <v-spacer />
             <v-btn variant="text" color="primary" size="small" append-icon="mdi-chevron-right">{{ t('plugins.open') }}</v-btn>
           </v-card-actions>

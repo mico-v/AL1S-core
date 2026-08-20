@@ -18,6 +18,15 @@ import { normalizeMessage } from './pipeline/normalize';
 import { Al1sFormatter } from './format/formatter';
 import { Pipeline } from './pipeline/pipeline';
 import { AdminServer } from './admin/server';
+import { LlmAdminService, AdminCommandDispatcher, BuiltinCommandDispatcher } from './admin/commands';
+import { MspAgentBridge } from './msp/agent-bridge';
+import { SessionMspRuntime } from './msp/session-runtime';
+import { PluginCliRegistry } from './msp/plugin-cli-registry';
+import { CommandBroker } from './msp/command-broker';
+import { SessionCommandRunner } from './msp/session-command-runner';
+import { SessionSandboxManager } from './msp/session-sandbox-manager';
+import { PluginCommandRouter } from './pipeline/command-router';
+import { registerBuiltinCliPlugins } from './cli/plugins';
 import type { AdminContext } from './admin/router';
 
 const log = logger.child('bot');
@@ -47,6 +56,12 @@ export class Bot {
   private readonly pipeline: Pipeline;
   private readonly persistence: SessionPersistence;
   private readonly adminServer?: AdminServer;
+  private readonly mspRuntime: SessionMspRuntime;
+  private readonly mspBridge: MspAgentBridge;
+  private readonly cliRegistry: PluginCliRegistry;
+  private readonly commandBroker?: CommandBroker;
+  private readonly sessionCommandRunner: SessionCommandRunner;
+  private readonly sessionSandboxManager: SessionSandboxManager;
   private readonly startedAt = Date.now();
   private botNickname = '';
 
@@ -64,6 +79,9 @@ export class Bot {
     this.registry = new SkillRegistry();
     this.registry.setConfig(cfg);
     this.pluginControl = new PluginControl(this.registry);
+    this.cliRegistry = new PluginCliRegistry();
+    this.cliRegistry.setConfig(cfg);
+    this.registry.setCliRegistry(this.cliRegistry);
 
     const sessions = new SessionManager({
       tokenBudget: cfg.contextTokenBudget,
@@ -72,6 +90,8 @@ export class Bot {
       getMaxSessions: () => cfg.maxSessions,
     });
     this.persistence = new SessionPersistence(sessions);
+    this.registry.setSessionManager(sessions);
+    this.commandBroker = cfg.msp.enabled ? new CommandBroker(this.registry, sessions, this.client, cfg, process.env.MSP_COMMAND_SOCKET ?? '/run/al1s/msp-command.sock') : undefined;
     this.persistence.attach(); // 会话磁盘恢复 + 防抖落盘
     sessions.setPersistenceHooks({
       onEvict: (session) => this.persistence.flush(session.chatId),
@@ -96,10 +116,26 @@ export class Bot {
     });
 
     const formatter = new Al1sFormatter(cfg.al1sFormat);
-    this.pipeline = new Pipeline({ config: cfg, provider, sessions, registry: this.registry, formatter });
+    this.sessionSandboxManager = new SessionSandboxManager(cfg.msp, this.commandBroker);
+    this.sessionCommandRunner = new SessionCommandRunner(this.sessionSandboxManager, this.cliRegistry, this.commandBroker);
+    this.mspRuntime = new SessionMspRuntime(this.sessionCommandRunner, () => this.cliRegistry.list());
+    this.mspBridge = new MspAgentBridge(this.mspRuntime);
+    this.cliRegistry.setSessionRunner(this.sessionCommandRunner);
+    this.registry.setSessionCommandRunner(this.sessionCommandRunner);
+    this.cliRegistry.setRuntimeEnabled(cfg.msp.enabled);
+    this.registry.setMspRuntime(cfg.msp.enabled ? this.mspRuntime : undefined);
+    this.configStore.registerApplier((store) => {
+      this.cliRegistry.setRuntimeEnabled(store.config.msp.enabled);
+      this.registry.setMspRuntime(store.config.msp.enabled ? this.mspRuntime : undefined);
+    });
+    const adminCommands = new AdminCommandDispatcher(new LlmAdminService(this.configStore), new BuiltinCommandDispatcher(this.registry, sessions, cfg));
+    this.registry.setCommandRouter(new PluginCommandRouter(this.registry, this.cliRegistry, sessions, cfg));
+    this.pipeline = new Pipeline({ config: cfg, provider, sessions, registry: this.registry, formatter, mspBridge: this.mspBridge, adminCommands, cliRegistry: this.cliRegistry, sessionCommandRunner: this.sessionCommandRunner });
 
     // 管理后台（未配置 ADMIN_TOKEN 时不启动）
+    // ADMIN_HOST 默认 127.0.0.1；容器内需 0.0.0.0 才能被 docker-proxy 转发到 loopback 端口映射
     const adminPort = Number(process.env.ADMIN_PORT ?? 6185);
+    const adminHost = process.env.ADMIN_HOST ?? '127.0.0.1';
     if (adminTokenEnabled()) {
       const adminCtx: AdminContext = {
         configStore: this.configStore,
@@ -119,8 +155,9 @@ export class Bot {
         startedAt: this.startedAt,
         version: readVersion(),
         shutdown: () => this.stop(),
+        getMspRuntime: () => this.mspRuntime,
       };
-      this.adminServer = new AdminServer(adminCtx, adminPort);
+      this.adminServer = new AdminServer(adminCtx, adminPort, adminHost);
     }
   }
 
@@ -128,6 +165,9 @@ export class Bot {
     // 注入 api 通道，再注册插件（插件可能在 register 时读取）
     this.registry.setApi(this.client);
     registerPlugins(this.registry);
+    registerBuiltinCliPlugins(this.cliRegistry);
+    this.mspRuntime.setCommandDescriptors(() => this.cliRegistry.list());
+    if (this.commandBroker) await this.commandBroker.start();
     // 插件注册后再恢复启停状态（避免被 register 的默认启用覆盖）
     this.pluginControl.attach();
 
@@ -166,19 +206,40 @@ export class Bot {
     // 通知事件（撤回、入群等）→ 插件通知钩子
     this.client.onNotice((event, ctx) => this.registry.runNoticeHooks(event, ctx));
 
-    // 连接状态日志
-    this.client.on('open', () => log.info('已连接', { url: this.client.url }));
-    this.client.on('close', (info) => log.warn('连接关闭', { code: info?.code ?? '', reason: info?.reason ?? '' }));
-    this.client.on('error', (err) => log.error('连接错误', { err }));
+    // 连接状态日志；URL 仅记录协议、主机和端口，避免把 token 或查询参数写入日志
+    this.client.on('open', () => log.info('SnowLuma WebSocket 已连接', { url: safeEndpoint(this.client.url) }));
+    this.client.on('close', (info) => log.warn('SnowLuma WebSocket 连接关闭，将自动重连', { code: info?.code ?? '', reason: info?.reason ?? '', url: safeEndpoint(this.client.url) }));
+    this.client.on('error', (err) => log.error('SnowLuma WebSocket 连接错误', { err, url: safeEndpoint(this.client.url) }));
 
-    // 先建立事件连接；身份 API 失败不阻塞消息处理，优先 HTTP，回退 WS
-    await this.client.connect();
+    // 优雅关闭：即使首次连接正在退避重试，也能落盘并结束子运行时。
+    process.once('SIGINT', () => this.stop());
+    process.once('SIGTERM', () => this.stop());
+
+    // 连接失败不能让容器退出；SDK 只会在已建立连接后处理断线重连，首次连接由这里负责退避重试。
+    await this.connectWithRetry();
     await this.refreshBotIdentity();
     log.info('就绪，等待事件……（Ctrl+C 退出）');
+  }
 
-    // 优雅关闭
-    process.on('SIGINT', () => this.stop());
-    process.on('SIGTERM', () => this.stop());
+  private async connectWithRetry(): Promise<void> {
+    let attempt = 0;
+    for (;;) {
+      try {
+        log.info('正在连接 SnowLuma WebSocket', { attempt: attempt + 1, url: safeEndpoint(this.client.url) });
+        await this.client.connect();
+        return;
+      } catch (err) {
+        attempt += 1;
+        const delayMs = Math.min(30_000, 1_000 * 2 ** Math.min(attempt - 1, 5));
+        log.error('SnowLuma WebSocket 首次连接失败，将重试', {
+          attempt,
+          retryInMs: delayMs,
+          url: safeEndpoint(this.client.url),
+          err,
+        });
+        await new Promise<void>((resolve) => setTimeout(resolve, delayMs));
+      }
+    }
   }
 
   private async refreshBotIdentity(): Promise<void> {
@@ -212,8 +273,21 @@ export class Bot {
     } catch (err) {
       log.error('会话落盘失败', { err: err instanceof Error ? err.message : String(err) });
     }
+    try {
+      void this.commandBroker?.stop();
+      void this.sessionSandboxManager.dispose();
+    } catch { /* broker 关闭失败不阻止最终退出 */ }
     this.client.close(1000, 'bye');
     process.exit(0);
+  }
+}
+
+function safeEndpoint(raw: string): string {
+  try {
+    const url = new URL(raw);
+    return `${url.protocol}//${url.hostname}${url.port ? `:${url.port}` : ''}${url.pathname}`;
+  } catch {
+    return '<invalid-url>';
   }
 }
 

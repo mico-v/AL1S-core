@@ -2,6 +2,9 @@ import { randomUUID } from 'node:crypto';
 import { logger } from '../logging/logger';
 import type { ShellPolicy, ShellRequest, ShellResult } from './types';
 import { executeShell } from './executor';
+import type { MspRuntime } from '../msp/protocol/types';
+import { evaluateShellRequest } from './policy';
+import { executeMsp } from './msp-executor';
 
 const log = logger.child('shell-tasks');
 
@@ -16,6 +19,7 @@ export interface ShellTask {
   owner: ShellTaskOwner;
   request: ShellRequest;
   requestId?: string;
+  runtimeSessionId?: number;
   startedAt: number;
   stopRequested: boolean;
   controller: AbortController;
@@ -27,6 +31,11 @@ export interface ShellTaskFinished {
   decision: Awaited<ReturnType<typeof executeShell>>['decision'];
   requestId: string;
   error?: unknown;
+}
+
+export interface ShellTaskHandle {
+  task: ShellTask;
+  completion: Promise<ShellTaskFinished>;
 }
 
 /** 进程任务表：只保存运行中的任务，避免阻塞 OneBot 事件处理。 */
@@ -45,8 +54,9 @@ export class ShellTaskManager {
     request: ShellRequest,
     owner: ShellTaskOwner,
     policy: ShellPolicy,
-    onFinished: (finished: ShellTaskFinished) => Promise<void> | void,
-  ): ShellTask {
+    onFinished?: (finished: ShellTaskFinished) => Promise<void> | void,
+    runtime?: MspRuntime,
+  ): ShellTaskHandle {
     const task: ShellTask = {
       taskId: randomUUID().slice(0, 8),
       owner,
@@ -56,10 +66,14 @@ export class ShellTaskManager {
       controller: new AbortController(),
     };
     this.tasks.set(task.taskId, task);
+    let resolveCompletion!: (finished: ShellTaskFinished) => void;
+    const completion = new Promise<ShellTaskFinished>((resolve) => { resolveCompletion = resolve; });
     void (async () => {
       let finished: ShellTaskFinished;
       try {
-        const execution = await executeShell(request, policy, owner.senderId, task.controller.signal);
+        const execution = runtime
+          ? await executeMsp(runtime, request, owner, task.controller.signal, (sessionId) => { task.runtimeSessionId = sessionId; })
+          : await executeShell(request, policy, owner.senderId, task.controller.signal);
         task.requestId = execution.requestId;
         finished = { task, result: execution.result, decision: execution.decision, requestId: execution.requestId };
       } catch (error) {
@@ -71,15 +85,16 @@ export class ShellTaskManager {
         };
       }
       try {
-        await onFinished(finished);
+        await onFinished?.(finished);
       } catch (error) {
         // 回复通道失败不应形成未处理 rejection，也不能让任务残留在表中。
         log.error('shell 任务完成回调失败', { err: error instanceof Error ? error.message : String(error) });
       } finally {
+        resolveCompletion(finished);
         this.tasks.delete(task.taskId);
       }
     })();
-    return task;
+    return { task, completion };
   }
 
   stop(task: ShellTask): void {

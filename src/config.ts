@@ -2,7 +2,8 @@
  * 配置：从环境变量解析 BotConfig。
  * 所有数字均为可选，非数字或负数时回退内置默认值。
  */
-/** AL1S 格式化功能配置（加在 LLM 回复管线上的可开关格式化层） */
+import { resolve } from 'node:path';
+
 export interface Al1sFormatConfig {
   enabled: boolean; // 总开关
   globalMarkdownKiller: boolean; // 对所有最终文本清理 Markdown
@@ -27,6 +28,24 @@ export interface ShellConfig {
   selfModifyMode: 'disabled' | 'reserved';
 }
 
+export interface MspConfig {
+  enabled: boolean;
+  runtimeMode: 'podman' | 'docker' | 'local-bash' | 'auto';
+  allowLocalFallback: boolean;
+  image: string;
+  workspaceRoot: string;
+  shell: string;
+  maxLiveSessions: number;
+  defaultYieldTimeMs: number;
+  maxYieldTimeMs: number;
+  emptyPollMs: number;
+  maxEmptyPollMs: number;
+  maxOutputTokens: number;
+  maxOutputBytes: number;
+  formatOutput: boolean;
+  timeoutMs: number;
+}
+
 export interface BotConfig {
   wsUrl: string;
   httpUrl?: string;
@@ -48,6 +67,7 @@ export interface BotConfig {
   adminIds: number[]; // 管理员 QQ 号（BOT_ADMINS），空数组 = 不限制
   al1sFormat: Al1sFormatConfig;
   shell: ShellConfig;
+  msp: MspConfig;
 }
 
 /** 默认人设 */
@@ -97,7 +117,7 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): BotConfig {
       baseUrl: env.LLM_BASE_URL ?? 'https://api.deepseek.com/v1',
       apiKey: env.LLM_API_KEY || undefined,
       model: env.LLM_MODEL ?? 'deepseek-chat',
-      temperature: undefined,
+      temperature: num(env, 'LLM_TEMPERATURE', 0.7),
       maxTokens: num(env, 'LLM_MAX_TOKENS', 4096),
     },
     persona: env.BOT_PERSONA || DEFAULT_PERSONA,
@@ -117,9 +137,9 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): BotConfig {
       maxDelay: num(env, 'AL1S_SPLIT_MAX_SECONDS', 3.0),
     },
     shell: {
-      enabled: bool(env, 'SHELL_ENABLED', true),
+      enabled: bool(env, 'SHELL_ENABLED', false),
       runtime: 'local',
-      cwd: env.SHELL_CWD || process.cwd(),
+      cwd: env.SHELL_CWD ? resolve(env.SHELL_CWD) : process.cwd(),
       triggerPrefix: env.SHELL_TRIGGER_PREFIX || '$',
       allowlist: strList(env, 'SHELL_ALLOWLIST'),
       denylist: strList(env, 'SHELL_DENYLIST'),
@@ -131,6 +151,23 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): BotConfig {
       })(),
       scrubEnv: bool(env, 'SHELL_SCRUB_ENV', true),
       selfModifyMode: 'disabled',
+    },
+    msp: {
+      enabled: bool(env, 'MSP_ENABLED', true),
+      runtimeMode: (['podman', 'docker', 'local-bash', 'auto'] as const).includes((env.MSP_RUNTIME_MODE ?? 'podman') as 'podman' | 'docker' | 'local-bash' | 'auto') ? (env.MSP_RUNTIME_MODE ?? 'podman') as 'podman' | 'docker' | 'local-bash' | 'auto' : 'podman',
+      allowLocalFallback: bool(env, 'MSP_ALLOW_LOCAL_BASH_FALLBACK', false),
+      image: env.MSP_CONTAINER_IMAGE || 'al1s-sandbox:latest',
+      workspaceRoot: env.MSP_WORKSPACE_ROOT || './data/msp-workspace',
+      shell: env.MSP_SHELL || '/bin/bash',
+      maxLiveSessions: Math.max(1, num(env, 'MSP_MAX_LIVE_SESSIONS', 64)),
+      defaultYieldTimeMs: Math.max(250, num(env, 'MSP_DEFAULT_YIELD_TIME_MS', 10000)),
+      maxYieldTimeMs: Math.max(250, num(env, 'MSP_MAX_YIELD_TIME_MS', 30000)),
+      emptyPollMs: Math.max(5000, num(env, 'MSP_EMPTY_POLL_MS', 5000)),
+      maxEmptyPollMs: Math.max(5000, num(env, 'MSP_MAX_EMPTY_POLL_MS', 300000)),
+      maxOutputTokens: Math.max(0, num(env, 'MSP_MAX_OUTPUT_TOKENS', 10000)),
+      maxOutputBytes: Math.max(1, num(env, 'MSP_MAX_OUTPUT_BYTES', 40000)),
+      formatOutput: bool(env, 'MSP_FORMAT_OUTPUT', true),
+      timeoutMs: Math.max(1, num(env, 'MSP_TIMEOUT_MS', 120000)),
     },
   };
 }

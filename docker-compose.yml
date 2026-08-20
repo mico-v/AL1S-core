@@ -1,33 +1,89 @@
-# AL1S-core docker-compose
-#
-# 设计要点：
-#  - network_mode: host：bot 要连宿主机上的 SnowLuma（ws://127.0.0.1:3001），
-#    且管理后台本就设计为只监听 127.0.0.1（更安全）——host 网络两者都天然满足。
-#    注意：用 host 网络时不要再写 ports:（会被忽略/报错）。
-#  - env_file: .env：密钥不进镜像，从服务器上的 .env 注入（.env 已被 .dockerignore 排除）。
-#  - volumes: ./data 挂到 /app/data：会话历史、settings.json、课程表、插件开关持久化。
-#  - 服务器部署前务必确认 .env 里 SHELL_ENABLED=false。
-#
-# 构建并启动：    docker compose up -d --build
-# 查看日志：      docker compose logs -f
-# 重启/停止/删除：docker compose restart | stop | down
-
+# AL1S-core 部署：Bot 本身不使用 host network、privileged 或宿主 socket。
+# MSP 子命令由 rootless Podman 后端启动，并在每会话目录上挂载唯一工作区；容器内 sandbox 使用 --network=none。
+# 默认跳过嵌套 sandbox 构建；若显式开启 MSP_SANDBOX_BOOTSTRAP，则需允许构建阶段访问所需网络。
 services:
   al1s:
     build: .
-    image: al1s-bot:latest   # 推送到服务器时改成 <registry>/al1s-bot:latest 再 push
+    image: al1s-bot:latest
     container_name: al1s-bot
     restart: unless-stopped
-    network_mode: host
+    # entrypoint 以 root 仅修正 bind mount 权限，随后降权为 uid 10001 运行 Bot。
+    user: "0:0"
+    init: true
     env_file: .env
     environment:
-      - TZ=Asia/Shanghai      # 课表/课堂提醒依赖本地时区
+      TZ: Asia/Shanghai
+      # 连接地址只从部署目录 .env 注入；禁止依赖镜像内 127.0.0.1 默认值。
+      SNOWLUMA_WS_URL: ${SNOWLUMA_WS_URL:?SNOWLUMA_WS_URL must be set in .env}
+      SNOWLUMA_HTTP_URL: ${SNOWLUMA_HTTP_URL:-}
+      PYTHONUNBUFFERED: "1"
+      ADMIN_HOST: 0.0.0.0
+      MSP_RUNTIME_MODE: podman
+      MSP_ALLOW_LOCAL_BASH_FALLBACK: "false"
+      MSP_CONTAINER_IMAGE: al1s-sandbox:latest
+      MSP_WORKSPACE_ROOT: /app/data/msp-workspace
+      MSP_COMMAND_SOCKET: /run/al1s/msp-command.sock
+      # 默认跳过嵌套 sandbox 构建，避免网络故障阻塞 Bot；运行时仍 fail-closed。
+      MSP_SANDBOX_BOOTSTRAP: ${MSP_SANDBOX_BOOTSTRAP:-false}
+      MSP_SANDBOX_FAIL_FAST: ${MSP_SANDBOX_FAIL_FAST:-false}
     volumes:
       - ./data:/app/data
+      - podman_storage:/home/al1s/.local/share/containers
+    # 不挂载 /var/run/docker.sock 或 Podman socket；不授予 privileged。
+    cap_drop: [ALL]
+    # rootless podman 需要：setuid 的 newuidmap/newgidmap 写 uid_map/gid_map（SETUID/SETGID），
+    # 以及通过 /proc/<pid>/uid_map 访问的 ptrace 权限（SYS_PTRACE）与命名空间挂载（SYS_ADMIN）等。
+    # 经验证的最小可用集合；应用进程本身以 uid 10001 运行且 CapEff=0，这些 cap 只对 podman 的 setuid 工具生效。
+    cap_add:
+      - SYS_ADMIN
+      - SETUID
+      - SETGID
+      - SYS_PTRACE
+      - CHOWN
+      - DAC_OVERRIDE
+      - FOWNER
+      - FSETID
+      - MKNOD
+    pids_limit: 256
+    mem_limit: 1g
+    cpus: 2.0
+    # 容器内 rootless podman 需要创建用户命名空间 + setuid 提权：
+    #  - Docker 默认 seccomp 会拦截 unshare(CLONE_NEWUSER)，必须放行（podman 官方推荐做法）；
+    #  - 不能保留 no-new-privileges：setuid 的 newuidmap 会被 no_new_privs 阻止提权，
+    #    podman 给沙箱子进程自身仍带 no-new-privileges + cap-drop ALL（见 src/msp/session-sandbox-manager.ts）。
+    security_opt:
+      - seccomp:unconfined
+    read_only: true
+    tmpfs:
+      - /tmp:rw,noexec,nosuid,size=64m
+      # podman 的 vfs 存储驱动在 /var/tmp 建临时目录（read_only rootfs 上需 tmpfs）
+      - /var/tmp:rw,size=64m
+      # XDG_RUNTIME_DIR 必须属于容器内用户（10001），否则 rootless podman 拒绝启动
+      - /run/user/10001:rw,noexec,nosuid,size=16m,uid=10001,gid=10001,mode=0700
+      # read_only rootfs 上 podman 的其它可写宿主目录（.config 放 cni 等、.cache 放缓存）
+      - /home/al1s/.config:rw,nosuid,size=16m,uid=10001,gid=10001,mode=0700
+      - /home/al1s/.cache:rw,nosuid,size=16m,uid=10001,gid=10001,mode=0700
+      # broker socket 是短生命周期文件，不写入持久化 data。
+      - /run/al1s:rw,noexec,nosuid,size=16m,uid=10001,gid=10001,mode=0700
+      # 仅监听绑定到宿主 127.0.0.1 的 loopback，不对外暴露
+    ports:
+      - "127.0.0.1:6185:6185"
+    # Linux 上如 SnowLuma 跑在 Docker 宿主机，可在 .env 使用 ws://host.docker.internal:3001/；不使用容器内 127.0.0.1。
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    networks:
+      - bot_net
     healthcheck:
       test: ["CMD", "node", "deploy/healthcheck.mjs"]
       interval: 30s
       timeout: 5s
       retries: 3
       start_period: 20s
-    stop_grace_period: 15s    # 给 SIGTERM 优雅落盘（会话持久化 flush）留时间
+    stop_grace_period: 15s
+
+networks:
+  bot_net:
+    driver: bridge
+
+volumes:
+  podman_storage:

@@ -6,15 +6,8 @@ import type { Plugin, SkillRegistry } from '../registry';
 export const resetPlugin: Plugin = {
   name: 'reset',
   displayName: '重置上下文',
-  description: '清空上下文',
-  register(registry: SkillRegistry): void {
-    registry.registerCommand({
-      name: 'reset',
-      description: '清空本群上下文',
-      async handler(ctx) {
-        ctx.sessions.clear(ctx.chatId);
-        await ctx.reply('已清空本群/本会话上下文。');
-      },
-    });
+  description: '重置上下文（已由宿主管理命令处理）',
+  register(_registry: SkillRegistry): void {
+    // 兼容保留模块；正式注册由 builtinPlugin 元数据完成。
   },
 };

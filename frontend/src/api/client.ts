@@ -104,7 +104,7 @@ const put = <T>(path: string, body?: unknown): Promise<ApiResponse<T>> =>
 const del = <T>(path: string): Promise<ApiResponse<T>> => request<T>(path, { method: 'DELETE' })
 
 export interface PluginTogglePayload {
-  kind: 'command' | 'skill'
+  kind: 'command' | 'skill' | 'plugin'
   name: string
   enabled: boolean
 }

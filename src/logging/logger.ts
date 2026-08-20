@@ -165,6 +165,11 @@ export class Logger {
     this.write('info', msg, fields);
   }
 
+  /** 记录 OneBot 发送消息的统一日志，调用方传模块/动作/目标即可定位来源。 */
+  sentMessage(fields: { module: string; transport?: string; target?: string; messageType?: string; messageId?: number | string; text?: string; effect?: string }): void {
+    this.info('发送消息', fields);
+  }
+
   warn(msg: string, fields?: Record<string, unknown>): void {
     this.write('warn', msg, fields);
   }

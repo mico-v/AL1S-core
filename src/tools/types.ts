@@ -36,6 +36,7 @@ export interface ShellResult {
   stdoutTruncated: boolean;
   stderrTruncated: boolean;
   durationMs: number;
+  displayText?: string;
   error?: string;
 }
 

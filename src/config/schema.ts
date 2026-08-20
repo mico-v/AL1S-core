@@ -66,10 +66,29 @@ export const CONFIG_GROUPS: ConfigGroupMeta[] = [
     description: 'OpenAI 兼容接口',
     fields: [
       { key: 'llm.baseUrl', label: 'Base URL', type: 'string', group: 'llm', applyMode: 'live' },
-      { key: 'llm.apiKey', label: 'API Key', type: 'password', group: 'llm', applyMode: 'live' },
+      { key: 'llm.apiKey', label: 'API Key', type: 'password', group: 'llm', applyMode: 'restart' },
       { key: 'llm.model', label: '模型', type: 'string', group: 'llm', applyMode: 'live' },
-      // OpenAI 兼容接口通常由 provider/model 决定采样策略，不再展示温度设置。
+      { key: 'llm.temperature', label: 'Temperature', type: 'number', group: 'llm', min: 0, max: 2, step: 0.1 },
       { key: 'llm.maxTokens', label: '最大输出 tokens', type: 'number', group: 'llm', min: 1 },
+    ],
+  },
+  {
+    key: 'msp',
+    label: 'MSP Agent Runtime',
+    description: 'msp-agent.v1 本地 bash 模拟执行器配置；full runtime 接入后替换实现',
+    fields: [
+      { key: 'msp.enabled', label: '启用 MSP 模拟器', type: 'boolean', group: 'msp', hint: '仅开发阶段；使用 local-bash' },
+      { key: 'msp.workspaceRoot', label: '工作区目录', type: 'string', group: 'msp', hint: '模型只看到虚拟路径 /' },
+      { key: 'msp.shell', label: '模拟 Shell', type: 'string', group: 'msp', hint: '默认 /bin/bash' },
+      { key: 'msp.maxLiveSessions', label: '最大 live session', type: 'number', group: 'msp', min: 1 },
+      { key: 'msp.defaultYieldTimeMs', label: '默认首次等待(毫秒)', type: 'number', group: 'msp', min: 250 },
+      { key: 'msp.maxYieldTimeMs', label: '最大首次等待(毫秒)', type: 'number', group: 'msp', min: 250 },
+      { key: 'msp.emptyPollMs', label: '空轮询等待(毫秒)', type: 'number', group: 'msp', min: 5000 },
+      { key: 'msp.maxEmptyPollMs', label: '空轮询最大等待(毫秒)', type: 'number', group: 'msp', min: 5000 },
+      { key: 'msp.maxOutputTokens', label: '模型输出上限(tokens)', type: 'number', group: 'msp', min: 0 },
+      { key: 'msp.maxOutputBytes', label: '内部输出上限(字节)', type: 'number', group: 'msp', min: 1 },
+      { key: 'msp.formatOutput', label: '使用 MSP 格式输出', type: 'boolean', group: 'msp', hint: '关闭后仅输出清洗后的命令文本' },
+      { key: 'msp.timeoutMs', label: '命令超时(毫秒)', type: 'number', group: 'msp', min: 1 },
     ],
   },
   // 课程表 / XXT / Shell 的设置由各自插件声明并显示在插件详情页。
