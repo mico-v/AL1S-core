@@ -10,11 +10,9 @@ node_modules/
 data/
 
 # --- 日志 ---
+logs/
 *.log
-
-# --- 前端构建产物（管理后台） ---
-frontend/dist/
-frontend/node_modules/
+*.log.*
 
 # --- 参考实现（仅本地参考） ---
 ref/
@@ -22,6 +20,4 @@ ref/
 # --- 系统/编辑器 ---
 .DS_Store
 Thumbs.db
-
-#agent
 .claude/

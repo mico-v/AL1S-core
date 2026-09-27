@@ -1,8 +1,8 @@
 {
-  "name": "lumabot",
-  "version": "0.1.0",
+  "name": "al1s-core",
+  "version": "0.2.0",
   "private": true,
-  "description": "A bot connecting to a SnowLuma OneBot instance via @snowluma/sdk",
+  "description": "QQ 官方机器人（QQ Open Platform）协议框架，基于 @tencent-connect/qqbot-nodejs",
   "type": "module",
   "engines": {
     "node": ">=22"
@@ -10,31 +10,18 @@
   "scripts": {
     "dev": "tsx watch --env-file=.env src/index.ts",
     "start": "tsx --env-file=.env src/index.ts",
-    "http:check": "tsx --env-file=.env src/scripts/http-check.ts",
-    "llm:check": "tsx --env-file=.env src/scripts/llm-check.ts",
-    "format:check": "tsx --env-file=.env src/scripts/format-check.ts",
-    "plugins:check": "tsx --env-file=.env src/scripts/plugins-check.ts",
-    "admin:check": "tsx --env-file=.env src/scripts/admin-check.ts",
-    "msp:check": "tsx src/scripts/msp-check.ts",
-    "plugin-cli:check": "tsx src/scripts/plugin-cli-check.ts",
-    "plugin-cli:runtime-check": "tsx src/scripts/plugin-cli-runtime-check.ts",
-    "command-broker:check": "tsx src/scripts/command-broker-check.ts",
-    "session-cli:check": "tsx src/scripts/session-cli-check.ts",
-    "admin-command:check": "tsx src/scripts/admin-command-check.ts",
-    "shell:check": "tsx src/scripts/shell-check.ts",
-    "sandbox:check": "tsx src/scripts/sandbox-check.ts",
-    "integration:check": "npm run typecheck && npm run msp:check && npm run session-cli:check && npm run plugin-cli:runtime-check && npm run command-broker:check && npm run sandbox:check",
-    "build:frontend": "npm --prefix frontend run build",
-    "typecheck": "tsc --noEmit"
+    "typecheck": "tsc --noEmit",
+    "qq:login": "tsx src/scripts/qq-login.ts",
+    "qq:check": "tsx src/scripts/qq-check.ts",
+    "webhook:check": "tsx src/scripts/webhook-check.ts",
+    "integration:check": "pnpm typecheck && pnpm qq:check && pnpm webhook:check"
   },
   "dependencies": {
-    "@napi-rs/canvas": "^1.0.6",
-    "@snowluma/sdk": "^1.14.8",
-    "sql.js": "^1.14.1"
+    "@tencent-connect/qqbot-connector": "^1.2.0",
+    "@tencent-connect/qqbot-nodejs": "^1.0.4"
   },
   "devDependencies": {
     "@types/node": "^24.13.3",
-    "@types/sql.js": "^1.4.11",
     "tsx": "^4.23.12",
     "typescript": "^5.9.3"
   }

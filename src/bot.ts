@@ -1,297 +1,226 @@
 /**
- * Bot 类：持有 WebSocket 客户端、会话管理、skill 注册中心与 LLM provider。
- * 负责注册插件、绑定消息事件、获取登录昵称（写入 pipeline）、优雅关闭。
- * 同时装配管理后台：运行时 ConfigStore、会话持久化、插件启停控制、AdminServer。
+ * Bot：`@tencent-connect/qqbot-nodejs` 的薄封装。
+ *
+ * 只负责：
+ *   - 生命周期（start / stop）；
+ *   - 事件分发（message / interaction / rawEvent）；
+ *   - 聊天记录落盘（可选，见 chat-log.ts）；
+ *   - 常用回复方法的转发。
+ *
+ * 协议细节（鉴权、WebSocket 心跳、RESUME、Webhook 验签、重试）全部
+ * 由连接器实现；这里不重新造轮子，也不引入插件 / 路由 / 沙箱等上层设计。
  */
-import { SnowLumaWebSocketClient, SnowLumaHttpClient } from '@snowluma/sdk';
-import { readFileSync } from 'node:fs';
-import type { BotConfig } from './config';
-import { ConfigStore } from './config/store';
-import { logger } from './logging/logger';
-import { OpenAIProvider } from './llm/openai';
-import { SessionManager } from './session/manager';
-import { SessionPersistence } from './session/persistence';
-import { SkillRegistry } from './skills/registry';
-import { PluginControl } from './plugins/control';
-import { registerPlugins } from './skills/plugins';
-import { normalizeMessage } from './pipeline/normalize';
-import { Al1sFormatter } from './format/formatter';
-import { Pipeline } from './pipeline/pipeline';
-import { AdminServer } from './admin/server';
-import { LlmAdminService, AdminCommandDispatcher, BuiltinCommandDispatcher } from './admin/commands';
-import { MspAgentBridge } from './msp/agent-bridge';
-import { SessionMspRuntime } from './msp/session-runtime';
-import { PluginCliRegistry } from './msp/plugin-cli-registry';
-import { CommandBroker } from './msp/command-broker';
-import { SessionCommandRunner } from './msp/session-command-runner';
-import { SessionSandboxManager } from './msp/session-sandbox-manager';
-import { PluginCommandRouter } from './pipeline/command-router';
-import { registerBuiltinCliPlugins } from './cli/plugins';
-import type { AdminContext } from './admin/router';
 
-const log = logger.child('bot');
-const receiveLog = logger.child('receive');
+import {
+  QQBot,
+  type InlineKeyboard,
+  type InteractionContext,
+  type InteractionEvent,
+  type MessageResponse,
+  type QQBotInboundMessage,
+  type RawEventContext,
+  type ReplyTarget,
+  type SendMessageOptions,
+  type UploadMediaResponse,
+} from '@tencent-connect/qqbot-nodejs';
+import { ChatStore } from './chat-log.js';
+import type { BotConfig } from './config.js';
+import { createLogger, type AppLogger } from './logger.js';
 
-/** 是否记录「收到消息」日志：LOG_RECEIVE='0'|'false'|'off' 时关闭，缺省开启 */
-function logReceiveEnabled(): boolean {
-  const raw = process.env.LOG_RECEIVE;
-  return raw === undefined || !['0', 'false', 'off'].includes(raw.trim().toLowerCase());
-}
-
-function readVersion(): string {
-  try {
-    const pkg = JSON.parse(readFileSync(new URL('../package.json', import.meta.url), 'utf-8')) as { version?: string };
-    return pkg.version ?? '0.0.0';
-  } catch {
-    return '0.0.0';
-  }
-}
+export type MessageHandler = (message: QQBotInboundMessage, bot: Bot) => unknown | Promise<unknown>;
+export type InteractionHandler = (
+  event: InteractionEvent,
+  ctx: InteractionContext,
+  bot: Bot,
+) => unknown | Promise<unknown>;
+export type RawEventHandler = (ctx: RawEventContext, bot: Bot) => unknown | Promise<unknown>;
 
 export class Bot {
-  private readonly client: SnowLumaWebSocketClient;
-  private readonly httpClient?: SnowLumaHttpClient;
-  private readonly configStore: ConfigStore;
-  private readonly registry: SkillRegistry;
-  private readonly pluginControl: PluginControl;
-  private readonly pipeline: Pipeline;
-  private readonly persistence: SessionPersistence;
-  private readonly adminServer?: AdminServer;
-  private readonly mspRuntime: SessionMspRuntime;
-  private readonly mspBridge: MspAgentBridge;
-  private readonly cliRegistry: PluginCliRegistry;
-  private readonly commandBroker?: CommandBroker;
-  private readonly sessionCommandRunner: SessionCommandRunner;
-  private readonly sessionSandboxManager: SessionSandboxManager;
-  private readonly startedAt = Date.now();
-  private botNickname = '';
+  readonly client: QQBot;
+  readonly config: BotConfig;
+  private readonly log: AppLogger;
+  private readonly messageHandlers: MessageHandler[] = [];
+  private readonly interactionHandlers: InteractionHandler[] = [];
+  private readonly rawEventHandlers: RawEventHandler[] = [];
+  private readonly chatStore?: ChatStore;
+  private started = false;
 
-  constructor(config: BotConfig) {
-    // 先建 ConfigStore：加载 settings.json 覆盖层 → 再以可变 config 构造各组件（现读即热）
-    this.configStore = new ConfigStore();
-    const cfg = this.configStore.config;
+  constructor(config: BotConfig, log?: AppLogger) {
+    this.config = config;
+    this.log = log ?? createLogger(config.logging);
 
-    this.client = new SnowLumaWebSocketClient({
-      url: cfg.wsUrl,
-      accessToken: cfg.accessToken,
-      reconnect: true,
-    });
-    this.httpClient = cfg.httpUrl ? new SnowLumaHttpClient({ baseUrl: cfg.httpUrl, accessToken: cfg.accessToken }) : undefined;
-    this.registry = new SkillRegistry();
-    this.registry.setConfig(cfg);
-    this.pluginControl = new PluginControl(this.registry);
-    this.cliRegistry = new PluginCliRegistry();
-    this.cliRegistry.setConfig(cfg);
-    this.registry.setCliRegistry(this.cliRegistry);
-
-    const sessions = new SessionManager({
-      tokenBudget: cfg.contextTokenBudget,
-      maxSessions: cfg.maxSessions,
-      getTokenBudget: () => cfg.contextTokenBudget,
-      getMaxSessions: () => cfg.maxSessions,
-    });
-    this.persistence = new SessionPersistence(sessions);
-    this.registry.setSessionManager(sessions);
-    this.commandBroker = cfg.msp.enabled ? new CommandBroker(this.registry, sessions, this.client, cfg, process.env.MSP_COMMAND_SOCKET ?? '/run/al1s/msp-command.sock') : undefined;
-    this.persistence.attach(); // 会话磁盘恢复 + 防抖落盘
-    sessions.setPersistenceHooks({
-      onEvict: (session) => this.persistence.flush(session.chatId),
-      onClear: (chatId) => this.persistence.remove(chatId),
-    });
-
-    // apiKey 缺失时也构造 provider：运行时请求会以 done.error 返回（llm-check 已提示）
-    const provider = new OpenAIProvider({
-      baseUrl: cfg.llm.baseUrl,
-      apiKey: cfg.llm.apiKey,
-      model: cfg.llm.model,
-    });
-    // LLM 连接参数与模型全部支持运行时更新（请求内部读取当前 provider 状态）
-    this.configStore.registerApplier((store) => {
-      this.pluginControl.reloadPlugin('xxt');
-      this.pluginControl.reloadPlugin('course-schedule');
-      provider.updateConfig({
-        baseUrl: store.config.llm.baseUrl,
-        apiKey: store.config.llm.apiKey,
-        model: store.config.llm.model,
+    if (config.chatLog.enabled) {
+      this.chatStore = new ChatStore({
+        root: config.chatLog.root,
+        saveMedia: config.chatLog.saveMedia,
+        maxMediaBytes: config.chatLog.maxMediaBytes,
+        logger: this.log,
       });
-    });
-
-    const formatter = new Al1sFormatter(cfg.al1sFormat);
-    this.sessionSandboxManager = new SessionSandboxManager(cfg.msp, this.commandBroker);
-    this.sessionCommandRunner = new SessionCommandRunner(this.sessionSandboxManager, this.cliRegistry, this.commandBroker);
-    this.mspRuntime = new SessionMspRuntime(this.sessionCommandRunner, () => this.cliRegistry.list());
-    this.mspBridge = new MspAgentBridge(this.mspRuntime);
-    this.cliRegistry.setSessionRunner(this.sessionCommandRunner);
-    this.registry.setSessionCommandRunner(this.sessionCommandRunner);
-    this.cliRegistry.setRuntimeEnabled(cfg.msp.enabled);
-    this.registry.setMspRuntime(cfg.msp.enabled ? this.mspRuntime : undefined);
-    this.configStore.registerApplier((store) => {
-      this.cliRegistry.setRuntimeEnabled(store.config.msp.enabled);
-      this.registry.setMspRuntime(store.config.msp.enabled ? this.mspRuntime : undefined);
-    });
-    const adminCommands = new AdminCommandDispatcher(new LlmAdminService(this.configStore), new BuiltinCommandDispatcher(this.registry, sessions, cfg));
-    this.registry.setCommandRouter(new PluginCommandRouter(this.registry, this.cliRegistry, sessions, cfg));
-    this.pipeline = new Pipeline({ config: cfg, provider, sessions, registry: this.registry, formatter, mspBridge: this.mspBridge, adminCommands, cliRegistry: this.cliRegistry, sessionCommandRunner: this.sessionCommandRunner });
-
-    // 管理后台（未配置 ADMIN_TOKEN 时不启动）
-    // ADMIN_HOST 默认 127.0.0.1；容器内需 0.0.0.0 才能被 docker-proxy 转发到 loopback 端口映射
-    const adminPort = Number(process.env.ADMIN_PORT ?? 6185);
-    const adminHost = process.env.ADMIN_HOST ?? '127.0.0.1';
-    if (adminTokenEnabled()) {
-      const adminCtx: AdminContext = {
-        configStore: this.configStore,
-        registry: this.registry,
-        pluginControl: this.pluginControl,
-        sessions,
-        persistence: this.persistence,
-        isConnected: () => this.client.isConnected,
-        getLogin: async () => {
-          try {
-            return await this.client.getLoginInfo();
-          } catch {
-            return undefined;
-          }
-        },
-        getBotNickname: () => this.botNickname,
-        startedAt: this.startedAt,
-        version: readVersion(),
-        shutdown: () => this.stop(),
-        getMspRuntime: () => this.mspRuntime,
-      };
-      this.adminServer = new AdminServer(adminCtx, adminPort, adminHost);
     }
+
+    this.client = new QQBot({
+      appId: config.appId,
+      appSecret: config.appSecret,
+      accountId: config.accountId,
+      transport: config.transport,
+      markdownSupport: config.markdownSupport,
+      tokenPrefetch: config.tokenPrefetch,
+      logger: this.log,
+      ...(config.intents !== undefined ? { intents: config.intents } : {}),
+      ...(config.apiBaseUrl !== undefined ? { baseUrl: config.apiBaseUrl } : {}),
+      ...(config.tokenBaseUrl !== undefined ? { tokenBaseUrl: config.tokenBaseUrl } : {}),
+      ...(config.transport === 'webhook'
+        ? { webhook: { port: config.webhook.port, path: config.webhook.path } }
+        : {}),
+    });
+
+    this.client.on('ready', (data) => {
+      this.log.info('网关已就绪', { transport: config.transport, data });
+    });
+    this.client.on('resumed', (data) => {
+      this.log.info('会话已恢复', { data });
+    });
+    this.client.on('error', (error) => {
+      this.log.error('QQ 客户端错误', { message: error.message });
+    });
+    this.client.on('message', async (ctx, message) => {
+      await this.dispatchMessage(message, ctx.signal);
+    });
+    this.client.on('interaction', async (ctx, event) => {
+      await this.dispatchInteraction(event, ctx);
+    });
+    this.client.on('rawEvent', async (ctx) => {
+      await this.dispatchRawEvent(ctx);
+    });
   }
 
+  /** 注册消息处理器，按注册顺序依次执行。 */
+  onMessage(handler: MessageHandler): this {
+    this.messageHandlers.push(handler);
+    return this;
+  }
+
+  /** 注册互动事件处理器。 */
+  onInteraction(handler: InteractionHandler): this {
+    this.interactionHandlers.push(handler);
+    return this;
+  }
+
+  /** 注册原始事件处理器，用于 SDK 未归一化的事件类型。 */
+  onRawEvent(handler: RawEventHandler): this {
+    this.rawEventHandlers.push(handler);
+    return this;
+  }
+
+  /** 启动收发。WebSocket 模式下会阻塞到 stop() 或进程退出。 */
   async start(): Promise<void> {
-    // 注入 api 通道，再注册插件（插件可能在 register 时读取）
-    this.registry.setApi(this.client);
-    registerPlugins(this.registry);
-    registerBuiltinCliPlugins(this.cliRegistry);
-    this.mspRuntime.setCommandDescriptors(() => this.cliRegistry.list());
-    if (this.commandBroker) await this.commandBroker.start();
-    // 插件注册后再恢复启停状态（避免被 register 的默认启用覆盖）
-    this.pluginControl.attach();
-
-    this.adminServer ? void this.adminServer.start() : undefined;
-
-    // 绑定消息事件：先记「收到消息」日志 + 跑插件后台钩子（防撤回缓存/课堂提醒等），再走主 pipeline
-    this.client.onGroupMessage(async (event, ctx) => {
-      if (logReceiveEnabled()) {
-        const norm = normalizeMessage(event);
-        receiveLog.info('收到群消息', {
-          chatId: `g:${event.group_id}`,
-          group: event.group_id,
-          senderId: event.user_id,
-          senderName: event.sender.nickname || `用户${event.user_id}`,
-          atBot: norm.atBot,
-          text: norm.text,
-        });
-      }
-      const handled = await this.registry.runMessageHooks(event, ctx);
-      if (!handled) await this.pipeline.handleGroupMessage(event, ctx);
-    });
-    this.client.onPrivateMessage(async (event, ctx) => {
-      if (logReceiveEnabled()) {
-        const norm = normalizeMessage(event);
-        receiveLog.info('收到私聊消息', {
-          chatId: `p:${event.user_id}`,
-          senderId: event.user_id,
-          senderName: event.sender.nickname || `用户${event.user_id}`,
-          atBot: norm.atBot,
-          text: norm.text,
-        });
-      }
-      const handled = await this.registry.runMessageHooks(event, ctx);
-      if (!handled) await this.pipeline.handlePrivateMessage(event, ctx);
-    });
-    // 通知事件（撤回、入群等）→ 插件通知钩子
-    this.client.onNotice((event, ctx) => this.registry.runNoticeHooks(event, ctx));
-
-    // 连接状态日志；URL 仅记录协议、主机和端口，避免把 token 或查询参数写入日志
-    this.client.on('open', () => log.info('SnowLuma WebSocket 已连接', { url: safeEndpoint(this.client.url) }));
-    this.client.on('close', (info) => log.warn('SnowLuma WebSocket 连接关闭，将自动重连', { code: info?.code ?? '', reason: info?.reason ?? '', url: safeEndpoint(this.client.url) }));
-    this.client.on('error', (err) => log.error('SnowLuma WebSocket 连接错误', { err, url: safeEndpoint(this.client.url) }));
-
-    // 优雅关闭：即使首次连接正在退避重试，也能落盘并结束子运行时。
-    process.once('SIGINT', () => this.stop());
-    process.once('SIGTERM', () => this.stop());
-
-    // 连接失败不能让容器退出；SDK 只会在已建立连接后处理断线重连，首次连接由这里负责退避重试。
-    await this.connectWithRetry();
-    await this.refreshBotIdentity();
-    log.info('就绪，等待事件……（Ctrl+C 退出）');
-  }
-
-  private async connectWithRetry(): Promise<void> {
-    let attempt = 0;
-    for (;;) {
-      try {
-        log.info('正在连接 SnowLuma WebSocket', { attempt: attempt + 1, url: safeEndpoint(this.client.url) });
-        await this.client.connect();
-        return;
-      } catch (err) {
-        attempt += 1;
-        const delayMs = Math.min(30_000, 1_000 * 2 ** Math.min(attempt - 1, 5));
-        log.error('SnowLuma WebSocket 首次连接失败，将重试', {
-          attempt,
-          retryInMs: delayMs,
-          url: safeEndpoint(this.client.url),
-          err,
-        });
-        await new Promise<void>((resolve) => setTimeout(resolve, delayMs));
-      }
+    if (this.started) {
+      return;
     }
+    this.started = true;
+    this.log.info('启动 QQ 机器人', {
+      appId: this.config.appId,
+      transport: this.config.transport,
+      markdownSupport: this.config.markdownSupport,
+    });
+    await this.client.start();
   }
 
-  private async refreshBotIdentity(): Promise<void> {
-    const getIdentity = async (): Promise<{ user_id: number; nickname: string }> => {
-      if (this.httpClient) return await this.httpClient.getLoginInfo();
-      return await Promise.race([
-        this.client.getLoginInfo(),
-        new Promise<never>((_, reject) => setTimeout(() => reject(new Error('WS get_login_info 超时')), 5000)),
-      ]);
-    };
-    try {
-      const login = await getIdentity();
-      this.botNickname = login.nickname;
-      this.pipeline.setBotNickname(login.nickname);
-      log.info('登录账号', { userId: login.user_id, nickname: login.nickname, transport: this.httpClient ? 'http' : 'ws' });
-    } catch (err) {
-      const detail = err instanceof Error ? { name: err.name, message: err.message, stack: err.stack } : { error: String(err) };
-      log.warn('获取登录信息失败，继续运行', { ...detail, wsConnected: this.client.isConnected, hasHttpFallback: Boolean(this.httpClient) });
-    }
+  /** 等待聊天记录里进行中的媒体下载完成（用于优雅退出 / 测试）。 */
+  async flush(): Promise<void> {
+    await this.chatStore?.flush();
   }
-  /** 优雅关闭：落盘会话、关闭 WebSocket 并退出 */
+
+  /** 停止收发并释放资源。 */
   stop(): void {
-    log.info('正在关闭……');
-    try {
-      void this.registry.disposePlugins();
-    } catch (err) {
-      log.warn('插件清理失败', { err: err instanceof Error ? err.message : String(err) });
+    if (!this.started) {
+      return;
     }
-    try {
-      this.persistence.flushAll();
-    } catch (err) {
-      log.error('会话落盘失败', { err: err instanceof Error ? err.message : String(err) });
+    this.started = false;
+    this.log.info('停止 QQ 机器人');
+    this.client.stop();
+  }
+
+  /** 回复文本（有 msgId 时为被动回复，否则为主动推送）。 */
+  replyText(target: ReplyTarget, content: string): Promise<MessageResponse> {
+    return this.client.sendText(target, content);
+  }
+
+  /** 回复 Markdown。 */
+  replyMarkdown(target: ReplyTarget, content: string, opts?: { keyboard?: InlineKeyboard }): Promise<MessageResponse> {
+    return this.client.sendMarkdown(target, content, opts);
+  }
+
+  /** 通用发送，支持全部 msg_type。 */
+  send(opts: SendMessageOptions): Promise<MessageResponse> {
+    return this.client.send(opts);
+  }
+
+  /** 上传并发送富媒体。 */
+  sendMedia(opts: Parameters<QQBot['sendMedia']>[0]): Promise<{
+    upload: UploadMediaResponse;
+    message: MessageResponse | undefined;
+  }> {
+    return this.client.sendMedia(opts);
+  }
+
+  /** 撤回消息。 */
+  recall(target: ReplyTarget, messageId: string): Promise<void> {
+    return this.client.recallMessage(target, messageId);
+  }
+
+  /** 回应互动事件，避免客户端一直 loading。 */
+  acknowledgeInteraction(interactionId: string, code = 0): Promise<void> {
+    return this.client.acknowledgeInteraction(interactionId, code);
+  }
+
+  private async dispatchMessage(message: QQBotInboundMessage, _signal: AbortSignal): Promise<void> {
+    this.log.debug('收到消息事件', {
+      kind: message.kind,
+      senderId: message.senderId,
+      groupOpenid: message.groupOpenid,
+      messageId: message.messageId,
+    });
+
+    if (this.chatStore !== undefined) {
+      try {
+        await this.chatStore.record(message);
+      } catch (error) {
+        this.log.error('保存聊天记录失败', { error, messageId: message.messageId });
+      }
     }
-    try {
-      void this.commandBroker?.stop();
-      void this.sessionSandboxManager.dispose();
-    } catch { /* broker 关闭失败不阻止最终退出 */ }
-    this.client.close(1000, 'bye');
-    process.exit(0);
+
+    for (const handler of this.messageHandlers) {
+      try {
+        await handler(message, this);
+      } catch (error) {
+        this.log.error('消息处理器异常', { error: describeError(error) });
+      }
+    }
+  }
+
+  private async dispatchInteraction(event: InteractionEvent, ctx: InteractionContext): Promise<void> {
+    this.log.debug('收到互动事件', { type: event.type, scene: event.scene });
+    for (const handler of this.interactionHandlers) {
+      try {
+        await handler(event, ctx, this);
+      } catch (error) {
+        this.log.error('互动处理器异常', { error: describeError(error) });
+      }
+    }
+  }
+
+  private async dispatchRawEvent(ctx: RawEventContext): Promise<void> {
+    for (const handler of this.rawEventHandlers) {
+      try {
+        await handler(ctx, this);
+      } catch (error) {
+        this.log.error('原始事件处理器异常', { error: describeError(error), type: ctx.eventType });
+      }
+    }
   }
 }
 
-function safeEndpoint(raw: string): string {
-  try {
-    const url = new URL(raw);
-    return `${url.protocol}//${url.hostname}${url.port ? `:${url.port}` : ''}${url.pathname}`;
-  } catch {
-    return '<invalid-url>';
-  }
-}
-
-function adminTokenEnabled(): boolean {
-  const raw = process.env.ADMIN_TOKEN;
-  return raw !== undefined && raw.trim() !== '';
+function describeError(error: unknown): string {
+  return error instanceof Error ? `${error.name}: ${error.message}` : String(error);
 }
