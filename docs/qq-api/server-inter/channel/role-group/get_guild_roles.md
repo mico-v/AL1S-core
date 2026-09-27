@@ -1,0 +1,101 @@
+<!-- source: https://bot.q.qq.com/wiki/develop/api-v2/server-inter/channel/role-group/get_guild_roles.html -->
+
+#  获取频道身份组列表
+
+##  接口
+
+```
+GET /guilds/{guild_id}/roles
+
+```
+
+1
+
+##  功能描述
+
+用于获取 `guild_id`指定的频道下的身份组列表。
+
+##  Content-Type
+
+```
+application/json
+
+```
+
+1
+
+##  返回
+
+| 字段名 | 类型 | 描述 |
+
+| guild_id | string | 频道 ID |
+
+| roles | Role 对象数组 | 一组频道身份组对象 |
+
+| role_num_limit | string | 默认分组上限 |
+
+##  错误码
+
+详见错误码。
+
+##  示例
+
+请求数据包
+
+```
+GET /guilds/123456/roles
+
+```
+
+1
+
+响应数据包
+
+```
+{
+  "guild_id": "123456",
+  "roles": [
+    {
+      "id": "4",
+      "name": "创建者",
+      "color": 4294927682,
+      "hoist": 1,
+      "number": 1,
+      "member_limit": 1
+    },
+    {
+      "id": "2",
+      "name": "管理员",
+      "color": 4280276644,
+      "hoist": 1,
+      "number": 5,
+      "member_limit": 50
+    }
+  ],
+  "role_num_limit": "30"
+}
+
+```
+
+1
+2
+3
+4
+5
+6
+7
+8
+9
+10
+11
+12
+13
+14
+15
+16
+17
+18
+19
+20
+21
+22
