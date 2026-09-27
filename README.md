@@ -1,91 +1,148 @@
-# lumabot
+# AL1S-core
 
-一个通过 [@snowluma/sdk](https://snowluma.github.io/sdk/) 连接 SnowLuma OneBot 端口的**群聊 AI 机器人**（TypeScript）。
+基于 [QQ 开放平台](https://bot.q.qq.com/wiki/develop/api-v2/) 官方协议的 QQ 机器人框架
+（TypeScript / ESM）。使用两个官方包：
 
-机器人像群里的一员：被 @ 或命中关键词时，用 OpenAI 兼容的 LLM 结合群聊上下文回复；支持工具调用（skill）与斜杠命令，可轻量扩展。
+- [`@tencent-connect/qqbot-connector`](https://www.npmjs.com/package/@tencent-connect/qqbot-connector)：
+  扫码绑定机器人，换取 `AppID` / `AppSecret`（**只拿凭据，不收消息**）；
+- [`@tencent-connect/qqbot-nodejs`](https://www.npmjs.com/package/@tencent-connect/qqbot-nodejs)：
+  协议层，负责连接与收发消息。
+
+当前阶段只实现**协议框架**：配置、连接生命周期、事件分发与回复。
+不包含 OneBot 适配、LLM、插件、沙箱等上层设计。
+
+## 架构
+
+```text
+src/index.ts      入口：加载配置 → 创建 Bot → 注册事件 → start
+src/config.ts     环境变量解析与校验
+src/logger.ts     分级日志（兼容连接器 Logger 接口，密钥脱敏）
+src/bot.ts        对协议层的薄封装：生命周期 / 事件分发 / 回复转发
+src/scripts/qq-login.ts   扫码获取凭据并写入 .env
+src/scripts/qq-check.ts   离线协议自检
+src/scripts/webhook-check.ts  webhook 端到端自检
+```
+
+协议细节由 `qqbot-nodejs` 负责：
+
+- Access Token 获取与自动刷新；
+- WebSocket 网关连接、心跳、`RESUME`、重连、分片；
+- Webhook 模式下的 Ed25519 验签与 `op=13` 回包；
+- 消息 / 富媒体 / 流式发送，限流与重试。
+
+我们的代码只做组装与业务，不重新实现协议。
 
 ## 要求
 
-- Node.js ≥ 22（推荐 24 LTS），本项目用 **fnm** 管理：
-
-  ```bash
-  fnm use   # 按 .node-version 自动切换到 v24.13.0（可在 fnm 配置中开启 use-on-cd 实现进目录自动切换）
-  ```
-
-- 一个正在运行的 SnowLuma 实例，且已启用 OneBot HTTP / WebSocket 网络适配器
-  - HTTP 默认 `http://127.0.0.1:3000/`
-  - WebSocket 默认 `ws://127.0.0.1:3001/`
-- 一个 OpenAI 兼容的 LLM 端点（DeepSeek / Kimi / GLM / Qwen / 本地 Ollama 均可），配置 `LLM_BASE_URL` + `LLM_API_KEY` + `LLM_MODEL`
-
-## 安装
+- Node.js ≥ 22（推荐 24，`.node-version` 为 24.13.0）
+- pnpm
 
 ```bash
-npm install
-cp .env.example .env   # 填入 SNOWLUMA_TOKEN 与 LLM_API_KEY 等
+pnpm install
+cp .env.example .env
 ```
+
+## 获取凭据（扫码）
+
+不需要手动去开放平台复制凭据，用官方扫码连接器一步拿到：
+
+```bash
+pnpm qq:login
+```
+
+终端会打印二维码 → 手机 QQ 扫码完成机器人绑定 → 自动把
+`QQBOT_APP_ID` / `QQBOT_APP_SECRET` 写回 `.env`。
+
+> `@tencent-connect/qqbot-connector` 只负责**扫码换取凭据**（HTTPS 轮询
+> `q.qq.com`，本地 AES-256-GCM 解密 secret），它**不接收消息**。
+> 收发消息由 `@tencent-connect/qqbot-nodejs` 协议层负责。
+> 也可以跳过这步，手动在 `.env` 填入平台上的 AppID / AppSecret。
 
 ## 运行
 
 ```bash
-npm run dev         # 开发模式（文件变更自动重启）
-npm start           # 正常运行
-npm run http:check  # 用 HTTP 传输做一次连接自检（getLoginInfo / get_status）
-npm run llm:check   # 冒烟测试 LLM provider（无需 QQ；未配 LLM_API_KEY 时自动跳过）
-npm run typecheck   # 类型检查
+pnpm dev         # 开发模式（文件变更自动重启）
+pnpm start       # 正常运行
+pnpm typecheck   # 类型检查
+pnpm qq:login    # 扫码获取 AppID / AppSecret 并写入 .env
+pnpm qq:check    # 离线协议自检（不联网）
+pnpm webhook:check  # 本地起 webhook 服务，端到端验证收消息
+pnpm integration:check  # typecheck + qq:check + webhook:check
 ```
 
-## 调试
+## 配置
 
-日志模块提供分级日志（零依赖）。查看完整链路：
+见 `.env.example`。关键项：
+
+| 变量 | 说明 |
+| --- | --- |
+| `QQBOT_APP_ID` / `QQBOT_APP_SECRET` | QQ 开放平台机器人凭据（必填） |
+| `QQBOT_TRANSPORT` | `websocket`（默认）或 `webhook` |
+| `QQBOT_WEBHOOK_PORT` / `QQBOT_WEBHOOK_PATH` | 仅 webhook 模式使用 |
+| `QQBOT_INTENTS` | 自定义 intents 位掩码，默认群 + 单聊 + 互动 |
+| `QQBOT_MARKDOWN_SUPPORT` | 机器人是否有 Markdown 权限 |
+| `QQBOT_TOKEN_PREFETCH` | `sync`（默认，凭据错误立即暴露）或 `async` |
+| `QQBOT_API_BASE_URL` / `QQBOT_TOKEN_BASE_URL` | 可选，覆盖 OpenAPI / token 基址（自建代理或测试） |
+| `LOG_LEVEL` | `debug` / `info` / `warn` / `error` |
+| `LOG_CONSOLE` | 是否输出到控制台，默认 `true` |
+| `LOG_FILE` | 落盘文件，默认 `logs/bot.log`；`off` 关闭落盘 |
+| `LOG_MAX_SIZE_MB` | 单文件大小上限，默认 10，超过自动轮转 |
+| `LOG_MAX_FILES` | 保留的日志文件总数（含当前），默认 5 |
+| `CHAT_LOG_ENABLED` | 是否保存聊天记录，默认 `true` |
+| `CHAT_DATA_DIR` | 数据根目录，默认 `./data` |
+| `CHAT_SAVE_MEDIA` | 是否下载图片/语音/视频/文件，默认 `true` |
+| `CHAT_MEDIA_MAX_MB` | 单个媒体大小上限，默认 50 |
+
+## 日志
+
+- 四级：`debug` / `info` / `warn` / `error`，按 `LOG_LEVEL` 过滤；
+- 同时输出控制台与文件，文件按大小自动轮转为 `bot.log.1` / `bot.log.2`…；
+- 每行格式：`[ISO 时间] [级别] 消息 {结构化 meta}`；
+- `Error` 对象自动展开 `name` / `message` / `stack`；
+- `appSecret` / `accessToken` / `authorization` 等密钥字段自动脱敏；
+- 未捕获异常与未处理的 Promise 拒绝也会落盘；
+- 落盘失败（磁盘满等）只告警一次并降级为仅控制台，不影响机器人运行。
 
 ```bash
-LOG_LEVEL=debug npm run dev                 # 终端彩色详细日志
-LOG_LEVEL=debug LOG_FILE=/var/log/lumabot.log npm run dev   # 同时落盘（自动按大小轮转）
+tail -f logs/bot.log        # 实时看日志
+LOG_LEVEL=debug pnpm start  # 调试模式
 ```
 
-- 级别：`debug` / `info`（默认） / `warn` / `error`，见 `LOG_LEVEL`
-- 文件输出：`LOG_FILE` 填路径即追加写文件，`LOG_MAX_SIZE_MB` 控制轮转阈值（默认 10MB，保留一份 `.1`）
-- 一条回复的完整链路：`收到群消息 → 未触发/冷却跳过/生成中忽略 → 开始生成 → 调用工具(如有) → LLM 完成 → 回复完成(耗时/工具次数)`
+## 聊天记录
 
-## 使用
+按聊天目标分目录，消息以 JSONL 追加保存，媒体附件自动下载：
 
-- **触发**：群聊中 @ 机器人，或消息包含 `TRIGGER_KEYWORDS`（如「机器人」「小助手」）；机器人回复后 `REPLY_COOLDOWN_SECONDS` 秒内不重复回复。私聊消息恒回复。
-- **命令**：
-  - `/help` —— 查看可用命令与工具
-  - `/reset` —— 清空本群上下文
-  - `/persona` —— 查看人设；`/persona 新的人设` 覆盖本会话人设
-- **工具**：模型通过 function calling 调用注册的工具，例如对机器人说「帮我掷个骰子」会调用 `roll_dice`。
-
-## 目录结构
-
-```
-src/
-  index.ts            # 入口：加载配置 → 启动 Bot
-  bot.ts              # Bot：持有 SDK 客户端 / 会话管理 / skill 注册中心 / LLM provider
-  config.ts           # 环境变量解析与校验
-  logging/            # 日志器：分级过滤 / 彩色终端 / 可选文件轮转
-  llm/                # LLM 层：极简 OpenAI 兼容客户端（SSE 流式 + 工具调用）
-  session/            # 会话层：每群有界上下文日志 + token 预算窗口 + LRU
-  pipeline/           # 消息管道：归一化 → 触发判定 → 冷却 → 生成 → 回复
-  agent/              # agent loop：LLM 流式 + 工具调用循环
-  skills/             # 扩展层：skill / 命令注册中心 + 内置插件
-  scripts/            # http:check / llm:check 冒烟脚本
-.env.example          # 环境变量模板
+```text
+data/chats/
+  group/<group_openid>/
+    messages.jsonl          # 每行一条完整消息记录
+    media/
+      <messageId>-0.png     # 图片/视频/语音/文件
+      <messageId>-0-wav.wav # 语音的 WAV 版本（如有）
+      download-errors.log   # 下载失败记录（超限/网络错误）
+  c2c/<user_openid>/...
+  guild/<guildId>/<channelId>/...
+  dm/<user_openid>/...
 ```
 
-## 扩展
+每条记录包含：记录时间、消息时间、发送者 openid/昵称、正文、`msgType`、
+群/频道标识、@ 列表、消息场景、附件元信息及**本地路径**。
 
-新增一个工具 skill 或命令：
+行为说明：
 
-1. 在 `src/skills/` 下新建一个插件文件，导出 `{ name, description, register(registry) }`，在 `register` 里调用 `registry.registerSkill({ name, description, inputSchema, run })`（工具，供模型调用）或 `registry.registerCommand({ name, description, handler })`（斜杠命令）。
-2. 在 `src/skills/plugins.ts` 里 import 并调用 `plugin.register(registry)`（新增一行）。
+- 同一 `messageId` 重复推送会去重（不重复记录、不重复下载）；
+- 媒体在写入记录后**异步下载**，不阻塞消息回复；
+- 文件名由 `messageId + 序号` 推导，已存在则跳过，天然幂等；
+- 超过 `CHAT_MEDIA_MAX_MB` 的媒体跳过并写入 `download-errors.log`；
+- 优雅退出（SIGINT/SIGTERM）会等待进行中的下载完成。
 
-参考 `src/skills/example/dice.ts`（工具）与 `src/skills/builtin/help.ts`（命令）。
+## 官方文档快照
 
-## 说明
+`docs/qq-api/` 是 QQ 开放平台 API v2 的官方文档离线快照，含事件、OpenAPI、
+网关、错误码与消息类型，供开发时直接检索，不需要联网。
 
-- SDK 为纯 ESM 包（`"type": "module"`），项目同样使用 ESM。
-- 运行时使用 `tsx`：`@snowluma/sdk` 当前发布的 dist 包含无扩展名的相对导入，
-  Node 原生 ESM 解析会失败，tsx 可正常加载。
-- `accessToken` 来自 SnowLuma 的 OneBot 配置，未设置时留空即可。
-- 会话上下文保存在内存中（LRU 上限 `MAX_SESSIONS`），重启即失；`/reset` 手动清空。
+## 接入方式
+
+- **WebSocket（推荐）**：本地或无公网时使用。机器人主动连接 QQ 网关。
+- **Webhook**：需要公网 HTTPS 回调地址，端口只能是 80 / 443 / 8080 / 8443；
+  保存回调配置时平台会立即发 `op=13` 验证请求，服务必须已在线。
