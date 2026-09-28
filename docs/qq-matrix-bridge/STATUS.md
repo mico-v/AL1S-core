@@ -9,7 +9,7 @@
 
 ## 当前迭代
 
-- 目标：让真实 Tuwunel 联调不依赖 Docker，直接使用本机二进制完成同一套
+- 目标：让真实 Tuwunel 联调不依赖容器运行时，直接使用本机二进制完成同一套
   端到端检查。
 - 状态：DONE。
 - 验收：`TUWUNEL_CHECK_MODE=host` 能通过 `TUWUNEL_BIN` 或
@@ -50,8 +50,8 @@
 | typing/receipt/presence | DONE | 明确不桥接，registration 设置 `receive_ephemeral: false`，避免无对称语义的噪声 |
 | Tuwunel 协议联调 | DONE | Tuwunel 1.9.3 固定 digest 实际加载 registration、ping、创建 room、ghost 发事件并回推 transaction |
 | 可重复 Tuwunel 集成检查 | DONE | `pnpm tuwunel:check` 使用固定 1.9.3 digest 和版本断言，通过假 QQ 端口验证群聊/单聊/guild/DM 文本、引用、撤回、结构化消息、媒体限制、房间授权、transaction 与重启持久化 |
-| 无 Docker 宿主联调 | DONE | Tuwunel 1.9.3（源码 `7801b8ec6`）本机 release 二进制完整通过 `pnpm tuwunel:check:host`，覆盖双向 transaction、媒体、重启持久化和生产入口生命周期 |
-| 生产部署资产 | DONE | `Dockerfile` 编译运行镜像；`deploy/compose.example.yml` 编排 Tuwunel 与 bridge，并通过 Compose 配置和镜像内离线检查 |
+| 原生宿主联调 | DONE | Tuwunel 1.9.3 本机 release 二进制完整通过 `pnpm tuwunel:check`，覆盖双向 transaction、媒体、重启持久化和生产入口生命周期 |
+| 生产部署资产 | DONE | `deploy/systemd/*.service`、`deploy/tuwunel.toml.example` 与 `deploy/deploy-server.sh`；服务器只运行 Node 与 Tuwunel 二进制，本地构建后同步运行包 |
 | 部署前配置检查 | DONE | `pnpm deploy:check` 校验 registration/.env token、ID、namespace、URL 与文件权限；离线检查覆盖接受和拒绝路径 |
 | 生产入口生命周期 | DONE | `pnpm tuwunel:check` 编译并启动 `dist/matrix-bridge.js`，用假 QQ Webhook 验证 health、registration ping、QQ 入站写入 Tuwunel；滞留 appservice 请求存在时 `SIGTERM` 仍按关闭预算退出并释放端口 |
 | 故障关闭与 HTTP 错误分类 | DONE | `matrix:check` 覆盖非法 JSON `400`、超限请求体 `413`、脱敏 `500`、指标分类、bridge 在途任务等待、状态写入失败重试和 appservice 滞留连接超时关闭；`tuwunel:check` 直接注入未捕获异常/未处理拒绝，验证统一优雅关闭、非零退出码和端口释放 |
@@ -82,7 +82,7 @@
   `matrix:check` 增加响应脱敏和错误指标断言。
 - 本轮验证：`pnpm integration:check`（含 `typecheck`、`build`、`qq:check`、
   `matrix:check`、`webhook:check`）和 `git diff --check` 通过；按要求未运行
-  Docker、Compose、`pnpm ci:check` 或 `pnpm tuwunel:check`。
+  `pnpm ci:check` 或 `pnpm tuwunel:check`。
 
 ### 2026-09-27
 
@@ -135,32 +135,30 @@
 - 修复同一 QQ 会话首次并发消息可能重复创建 Matrix room 的竞态：按
   `target.key` 合并进行中的创建 Promise，新增并发回归检查并验证两条消息
   使用同一 room 投递。
-- 增加 `pnpm tuwunel:check`：自动启动临时 Tuwunel 容器，生成随机
-  registration/token/identity secret，并通过假 QQ 端口
+- 增加 `pnpm tuwunel:check`：用 `TUWUNEL_BIN` 启动临时 Tuwunel 本机进程，
+  生成随机 registration/token/identity secret，并通过假 QQ 端口
   驱动 `QqMatrixBridge`。检查覆盖 appservice ping、QQ 到 Matrix 的 room 与
-  ghost 事件、appservice bot 入房、持久卷重启后的 registration 和 alias、
-  Matrix transaction 回推及 Matrix 到 QQ 的发送调用；结束后删除容器、
-  volume 和临时状态。
-- 将 `pnpm tuwunel:check` 默认镜像固定为 Tuwunel 1.9.3 多架构 digest，并
-  增加 `TUWUNEL_CHECK_VERSION` 断言；需要升级测试基线时必须显式同时更新
-  镜像和版本。
-- 增加 `pnpm build`、`tsconfig.build.json`、`Dockerfile` 和
-  `deploy/compose.example.yml`。生产镜像先编译 TypeScript，再裁剪开发
-  依赖；Compose 使用内部 DNS、Tuwunel 命名卷、bridge 命名卷和固定 digest，
-  只向宿主机回环地址发布 Tuwunel 端口。
+  ghost 事件、appservice bot 入房、持久数据目录重启后的 registration 和
+  alias、Matrix transaction 回推及 Matrix 到 QQ 的发送调用；结束后删除
+  临时进程和临时状态。
+- `TUWUNEL_CHECK_VERSION` 断言测试基线为 Tuwunel 1.9.3；升级基线时同步
+  更新版本断言和验证证据。
+- 增加 `pnpm build`、`tsconfig.build.json` 和 `deploy/deploy-server.sh`。
+  运行包先由本地编译 TypeScript，再裁剪开发依赖，通过 ssh 同步到服务器
+  `/opt/al1s/app`；Tuwunel 与 bridge 由 systemd 管理，appservice 端口只
+  监听回环地址。
 - 增加 `pnpm deploy:check` 和零依赖预检模块：严格解析 registration 模板所需
   YAML 子集，检查 token/ID/sender/namespace/URL 一致性、模板或弱 token、
-  `receive_ephemeral`、`.env`/registration 权限和 Compose/宿主机模式；
+  `receive_ephemeral`、`.env`/registration 权限和宿主机部署模式；
   真实 `deploy/appservice.yaml` 已加入 `.gitignore`。`matrix:check` 覆盖
   匹配、token 不一致、namespace 不匹配、错误 URL、模板 token 和缺字段。
-- Dockerfile 的 Node 基础镜像改为可通过 `NODE_BASE_IMAGE` 覆盖；默认 digest
-  明确只声明 `linux/amd64` 已验证，ARM64 构建需先确认多架构 index digest。
+- 部署使用上游预编译的 Tuwunel 二进制；更换 CPU 架构时需改用对应架构的
+  发布产物。
 - 本轮验证：`pnpm typecheck`、`pnpm matrix:check`、`pnpm integration:check`
   和 `git diff --check` 通过；`pnpm tuwunel:check` 在 Tuwunel 1.9.3 上通过。
   真实 QQ 与生产环境联调仍受凭据和部署环境阻塞。
 - 本轮补充验证：`pnpm integration:check`（现含 `pnpm build`）、
-  `pnpm tuwunel:check`、`docker compose ... config --quiet`、
-  `docker build` 和镜像内 `node dist/scripts/matrix-check.js` 均通过。
+  `pnpm tuwunel:check` 和 `node dist/scripts/matrix-check.js` 均通过。
 - 宿主机部署模式复核：使用临时 `.env` 与 registration（权限均为 `600`）
   运行 `pnpm deploy:check -- --mode host`，身份、token、namespace 与
   `http://127.0.0.1:29328` URL 校验全部通过。
@@ -222,15 +220,12 @@
   `SIGTERM` 正常退出、退出后不再监听 appservice 端口。
 - 本轮验证：`pnpm typecheck` 与 `pnpm tuwunel:check`（Tuwunel 1.9.3
   固定 digest）通过；真实 QQ 凭据与生产环境联调仍受外部条件阻塞。
-- 修复 Docker 构建未复制 `pnpm-workspace.yaml` 与 `patches/` 导致的
-  `ERR_PNPM_LOCKFILE_CONFIG_MISMATCH`。`docker build`、
-  `docker run --rm ... node dist/scripts/matrix-check.js` 和
-  `docker compose ... config --quiet` 均已通过；镜像内离线检查确认
-  `pnpm prune --prod` 后生产依赖完整。
-- 增加 `pnpm ci:check` 和 GitHub Actions push/PR 门禁。该命令顺序执行
-  `pnpm integration:check`、`pnpm tuwunel:check`、Compose 配置校验、
-  生产镜像构建和镜像内 `matrix-check`；本地完整运行通过，workflow YAML
-  语法解析通过。
+- 修复打包运行包未复制 `pnpm-workspace.yaml` 与 `patches/` 导致的
+  `ERR_PNPM_LOCKFILE_CONFIG_MISMATCH`。`pnpm build` 与运行包内
+  `node dist/scripts/matrix-check.js` 均已通过；离线检查确认生产依赖完整。
+- 增加 `pnpm ci:check` 和 GitHub Actions push/PR 门禁。该命令执行
+  `pnpm integration:check`（含编译与全部离线检查）；本地完整运行通过，
+  workflow YAML 语法解析通过。
 - Appservice HTTP 错误按输入类型分类：超限请求体返回 `413 M_TOO_LARGE`，
   非法 JSON、transaction 类型和 transaction ID 编码返回 `400`，内部处理
   失败保留 `500`。`matrix-check` 断言客户端错误不会调用 transaction
@@ -238,19 +233,19 @@
 - 生产入口将 `uncaughtException`、`unhandledRejection` 与信号退出统一到
   同一个关闭 Promise：先停止 Bot 与 appservice 接收端，等待 bridge 在途
   QQ 任务，再 flush store 和 Bot；严重异常立即设置非零 `process.exitCode`，
-  避免容器继续运行在可能已损坏的状态。SIGTERM 正常退出码仍由生产入口
+  避免进程继续运行在可能已损坏的状态。SIGTERM 正常退出码仍由生产入口
   检查覆盖。
 - 本轮验证：`pnpm ci:check` 完整通过，覆盖离线检查、真实 Tuwunel 1.9.3
-  生命周期、Compose 配置、生产镜像构建和镜像内 `matrix-check`；新增的
-  `400`/`413` 分类与 `bridge.flush` 在途任务等待在宿主和镜像内均通过。
+  生命周期和运行包内 `matrix-check`；新增的 `400`/`413` 分类与
+  `bridge.flush` 在途任务等待均通过。
   `git diff --check` 通过。
 - Appservice 关闭增加 `MATRIX_BRIDGE_SHUTDOWN_TIMEOUT_MS`：停止监听和
   空闲连接后，超时强制关闭滞留请求，避免慢客户端阻塞进程退出。关闭编排
   会在任一步失败后继续尝试 bridge、store 和 Bot 清理。`BridgeStore`
   写入失败后保留 dirty 状态，`flush()` 可重试并恢复落盘。
 - `matrix-check` 新增滞留 HTTP 请求关闭测试和状态写入失败后恢复测试；
-  Compose bridge 设置 `stop_grace_period: 45s`，为默认 30 秒关闭预算留出
-  容器退出余量。
+  `al1s-bridge.service` 设置 `TimeoutStopSec=45`，为默认 30 秒关闭预算
+  留出退出余量。
 - `tuwunel-check` 的生产入口场景新增滞留 appservice 请求：保持未完成
   transaction 请求后发送 `SIGTERM`，断言编译入口按 250ms 测试预算退出、
   返回正常退出码并释放监听端口。

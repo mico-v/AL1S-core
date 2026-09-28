@@ -19,11 +19,11 @@
     "matrix:check": "tsx src/scripts/matrix-check.ts",
     "matrix:admin": "tsx --env-file=.env src/scripts/matrix-admin.ts",
     "tuwunel:check": "tsx src/scripts/tuwunel-check.ts",
-    "tuwunel:check:host": "TUWUNEL_CHECK_MODE=host tsx src/scripts/tuwunel-check.ts",
     "deploy:check": "tsx src/scripts/deploy-check.ts",
+    "deploy:server": "bash deploy/deploy-server.sh",
     "webhook:check": "tsx src/scripts/webhook-check.ts",
     "integration:check": "pnpm typecheck && pnpm build && pnpm qq:check && pnpm matrix:check && pnpm webhook:check",
-    "ci:check": "pnpm integration:check && pnpm tuwunel:check && docker compose --env-file .env.example -f deploy/compose.example.yml config --quiet && docker build --tag al1s-core-bridge:ci . && docker run --rm al1s-core-bridge:ci node dist/scripts/matrix-check.js"
+    "ci:check": "pnpm integration:check"
   },
   "dependencies": {
     "@tencent-connect/qqbot-connector": "^1.2.0",

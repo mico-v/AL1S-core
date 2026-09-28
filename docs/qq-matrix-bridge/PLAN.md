@@ -63,8 +63,9 @@ AL1S Bot
 | `src/matrix/admin.ts` | 房间成员状态、邀请和踢出的可复用管理逻辑 |
 | `src/scripts/matrix-admin.ts` | 面向运维的房间成员管理 CLI |
 | `src/scripts/deploy-check.ts` | 生产启动前检查 registration、`.env` 和文件权限 |
-| `Dockerfile` | 编译 TypeScript 并生成不依赖 `tsx` 的 bridge 运行镜像 |
-| `deploy/compose.example.yml` | 单实例 Tuwunel 与 bridge 的容器编排模板 |
+| `deploy/deploy-server.sh` | 本地构建运行包并同步到服务器重启服务 |
+| `deploy/systemd/*.service` | Tuwunel 与 bridge 的原生 systemd 单元 |
+| `deploy/tuwunel.toml.example` | Tuwunel 原生配置模板 |
 | `.github/workflows/ci.yml` | 在 push/PR 上运行与本地一致的完整 CI 门禁 |
 
 Tuwunel 使用 appservice registration YAML 接入。`url` 指向本服务，
@@ -74,23 +75,13 @@ Tuwunel 使用 appservice registration YAML 接入。`url` 指向本服务，
 
 ## Tuwunel 联调基线
 
-推荐先运行自动检查。默认 Docker 模式使用已实测的 Tuwunel 1.9.3 多架构 digest
-`ghcr.io/matrix-construct/tuwunel@sha256:678b7f5350e06a41614444497c587da9dddf66767e4068a27480402f3c1367d0`，
-并断言服务端版本。需要升级基线时同时设置 `TUWUNEL_IMAGE` 和
-`TUWUNEL_CHECK_VERSION`。检查会创建临时 registration、Docker volume 和
-随机端口，结束后自动清理：
+推荐先运行自动检查。检查需要一个本机 Tuwunel 1.9.3 可执行文件，通过
+`TUWUNEL_BIN` 指向它，或设置 `TUWUNEL_SOURCE_DIR` 指向源码仓库的
+`target/release/tuwunel`。检查使用临时数据库目录和随机端口，断言服务端
+版本，结束后自动清理，不依赖任何容器运行时：
 
 ```bash
-pnpm tuwunel:check
-```
-
-开发阶段可以不使用 Docker：设置 `TUWUNEL_CHECK_MODE=host`，再通过
-`TUWUNEL_BIN` 指向本机 Tuwunel 可执行文件，或通过 `TUWUNEL_SOURCE_DIR`
-指向源码仓库的 `target/release/tuwunel`。宿主模式使用临时数据库目录，
-并执行与 Docker 模式相同的启动、重启、持久化和双向 transaction 场景：
-
-```bash
-TUWUNEL_BIN=/path/to/tuwunel pnpm tuwunel:check:host
+TUWUNEL_BIN=/path/to/tuwunel pnpm tuwunel:check
 ```
 
 该命令验证 registration 加载与 ping、QQ 到 Matrix 的 room/ghost 投递
@@ -101,36 +92,33 @@ TUWUNEL_BIN=/path/to/tuwunel pnpm tuwunel:check:host
 健康检查、Tuwunel ping、QQ 事件入站、优雅退出和端口释放。它不连接 QQ
 开放平台，也不替代真实 QQ 凭据联调。
 
-手工流程用于需要观察生产式端口、配置或容器日志的场景，使用
-`matrix.test`、端口 `18008` 和独立 Docker volume 做本地验证。
-替换 YAML 与 `.env` 中的 token、domain 和 namespace 正则时必须保持一致。
+手工流程用于需要观察生产式端口和配置的场景，使用 `matrix.test`、端口
+`18008` 和独立数据目录做本地验证。替换 YAML 与 `.env` 中的 token、domain
+和 namespace 正则时必须保持一致。
 
-1. 准备 registration。可从 `appservice.example.yaml` 复制，并将
+1. 准备 registration。可从 `deploy/appservice.example.yaml` 复制，并将
    `url`、tokens、domain 和 64 位 hex namespace 改成实际值。
-2. 启动仅用于联调的 Tuwunel。bridge 在宿主机运行时，容器必须通过
-   `host.docker.internal` 访问它；Linux 需要显式添加 host-gateway：
+2. 启动仅用于联调的 Tuwunel 本机进程，配置指向临时数据库与 registration：
 
 ```bash
-docker run -d --name al1s-tuwunel \
-  --add-host=host.docker.internal:host-gateway \
-  -p 127.0.0.1:18008:8008 \
-  -v al1s-tuwunel-data:/var/lib/tuwunel \
-  -v "$PWD/docs/qq-matrix-bridge/appservice.yaml:/etc/tuwunel/appservices/al1s-qq-bridge.yaml:ro" \
-  -e TUWUNEL_SERVER_NAME=matrix.test \
-  -e TUWUNEL_DATABASE_PATH=/var/lib/tuwunel \
-  -e TUWUNEL_ADDRESS=0.0.0.0 \
-  -e TUWUNEL_PORT=8008 \
-  -e TUWUNEL_APPSERVICE_DIR=/etc/tuwunel/appservices \
-  -e TUWUNEL_ALLOW_FEDERATION=false \
-  -e TUWUNEL_ALLOW_REGISTRATION=false \
-  --stop-timeout 1800 \
-  ghcr.io/matrix-construct/tuwunel@sha256:678b7f5350e06a41614444497c587da9dddf66767e4068a27480402f3c1367d0
+mkdir -p /tmp/al1s-tuwunel/appservices /tmp/al1s-tuwunel/data
+cp docs/qq-matrix-bridge/appservice.yaml /tmp/al1s-tuwunel/appservices/al1s-qq-bridge.yaml
+cat > /tmp/al1s-tuwunel/tuwunel.toml <<'TOML'
+[global]
+server_name = "matrix.test"
+database_path = "/tmp/al1s-tuwunel/data"
+address = ["127.0.0.1"]
+port = 18008
+allow_registration = false
+allow_federation = false
+appservice_dir = "/tmp/al1s-tuwunel/appservices"
+TOML
+tuwunel -c /tmp/al1s-tuwunel/tuwunel.toml
 ```
 
-若 Tuwunel 与 bridge 都以宿主机进程运行，registration 的 `url` 才可使用
-`http://127.0.0.1:29328`。Tuwunel 容器访问宿主机 bridge 时应使用
-`http://host.docker.internal:29328`，并设置
-`MATRIX_BRIDGE_LISTEN_HOST=0.0.0.0`；否则请求只能到达容器自身。
+Tuwunel 与 bridge 都监听回环地址时，registration 的 `url` 使用
+`http://127.0.0.1:29328`，`.env` 中的
+`MATRIX_BRIDGE_HOMESERVER_URL` 使用 `http://127.0.0.1:18008`。
 
 3. 配置 `.env` 并启动 bridge：
 
@@ -145,7 +133,7 @@ MATRIX_BRIDGE_ALLOWED_SENDERS=@alice:matrix.test,@bob:matrix.test
 MATRIX_BRIDGE_MIN_POWER_LEVEL=10
 MATRIX_BRIDGE_REFERENCE_TTL_DAYS=30
 MATRIX_BRIDGE_REFERENCE_MAX_ENTRIES=10000
-MATRIX_BRIDGE_LISTEN_HOST=0.0.0.0
+MATRIX_BRIDGE_LISTEN_HOST=127.0.0.1
 MATRIX_BRIDGE_PORT=29328
 pnpm bridge
 ```
@@ -284,15 +272,14 @@ curl -i -X POST \
   规则示例，实际 Alertmanager 接入仍按运行环境配置。
 - 已完成可重复的 Tuwunel 单实例与持久卷重启检查；生产反向代理、监控和
   实际存储参数仍需按目标环境验证。
-- 已提供 bridge `Dockerfile`、`.dockerignore` 和
-  `deploy/compose.example.yml`；Compose 使用内部 DNS、命名卷和固定镜像
-  digest，不公开 appservice 端口。
-- Dockerfile 在 `pnpm install --frozen-lockfile` 前复制
-  `pnpm-workspace.yaml` 和 `patches/`，确保锁文件声明的 QQ SDK patch
-  与构建上下文一致；`docker build` 和镜像内 `matrix-check` 用于验证。
-- 提供 `pnpm ci:check`，顺序执行离线检查、真实 Tuwunel 集成检查、
-  Compose 配置校验、生产镜像构建和镜像内检查；GitHub Actions 在
-  push/PR 上调用同一命令，避免本地与远端门禁漂移。
+- 已提供原生部署资产：`deploy/systemd/*.service`、
+  `deploy/tuwunel.toml.example` 和 `deploy/deploy-server.sh`；服务器只
+  运行 Node 与 Tuwunel 二进制，不公开 appservice 端口。
+- `deploy/deploy-server.sh` 在打包生产依赖前复制 `pnpm-workspace.yaml` 和
+  `patches/`，确保锁文件声明的 QQ SDK patch 与运行包一致；服务器不编译
+  TypeScript。
+- 提供 `pnpm ci:check`（等同 `pnpm integration:check`），执行离线检查与
+  编译；GitHub Actions 在 push/PR 上调用同一命令，避免本地与远端门禁漂移。
 - 已提供 `pnpm deploy:check`：在启动前校验 registration、`.env`、
   namespace、共享 token、部署 URL 和敏感文件权限，避免配置漂移。
 - 已完成生产入口生命周期检查：`pnpm tuwunel:check` 会停止测试内嵌
@@ -339,9 +326,7 @@ curl -i -X POST \
 13. 临时 Tuwunel 在持久卷重启后保留 registration、room alias 与映射，
     且 Matrix 到 QQ 的 transaction 仍可完成。
 14. `pnpm build` 生成可执行的 `dist/matrix-bridge.js`；
-    `deploy/compose.example.yml` 能通过 `docker compose config` 校验，
-    `docker build` 能应用锁文件声明的 SDK patch 并通过镜像内
-    `matrix-check`。
+    `deploy/deploy-server.sh` 能打包生产依赖并应用锁文件声明的 SDK patch。
 15. 生产文件准备完成后，`pnpm deploy:check` 能在不连接 QQ/Tuwunel 的情况下
     发现 registration、`.env`、namespace、URL 或文件权限不一致。
 16. QQ `message_type=3/101/102/103` 结构化消息转换为有界文本并转发嵌套
@@ -357,13 +342,12 @@ curl -i -X POST \
     Tuwunel 上完成健康检查、registration ping、假 QQ Webhook 入站、
     ghost 事件写入、`SIGTERM` 优雅退出和监听端口释放。
 20. `.github/workflows/ci.yml` 在 push 和 pull request 上使用固定 Node/pnpm
-    版本运行 `pnpm ci:check`，覆盖离线检查、Tuwunel 集成、Compose、
-    生产镜像和镜像内检查。
+    版本运行 `pnpm ci:check`，覆盖离线检查与编译。
 21. Appservice 对超限请求体返回 `413`，对非法 JSON、transaction 类型或
     transaction ID 编码返回 `400`，内部处理失败仍返回 `500`；生产入口的
     `uncaughtException` 和 `unhandledRejection` 会进入同一优雅关闭流程，
     等待 bridge 在途 QQ 任务、flush 持久化状态并以非零退出码结束，避免
-    容器保留不确定状态。`tuwunel:check` 直接触发这两种异常，验证进程完成
+    进程保留不确定状态。`tuwunel:check` 直接触发这两种异常，验证进程完成
     清理后以非零退出码结束并释放 appservice 监听端口。
 22. `MATRIX_BRIDGE_SHUTDOWN_TIMEOUT_MS` 控制 appservice 等待活跃连接的
     上限；超时后强制关闭连接。关闭任一步骤失败时仍继续尝试其余清理，
@@ -376,9 +360,9 @@ curl -i -X POST \
 24. QQ 入站消息在 Matrix 投递前持久化入队；bridge 重启后能恢复到期消息，
     失败按配置指数退避，成功消息不会重复发送。队列满时记录错误并丢弃新
     消息，状态文件不包含明文 QQ 身份或正文。
-25. `TUWUNEL_CHECK_MODE=host` 能使用 `TUWUNEL_BIN` 或
-    `TUWUNEL_SOURCE_DIR` 启动本机 Tuwunel，不依赖 Docker；临时数据库、
-    registration、重启持久化、双向 transaction 和清理行为与默认模式一致。
+25. `TUWUNEL_BIN` 或 `TUWUNEL_SOURCE_DIR` 能启动本机 Tuwunel，不依赖
+    容器运行时；临时数据库、registration、重启持久化、双向 transaction
+    和清理行为保持一致。
 
 ## 风险评估
 
@@ -399,11 +383,10 @@ curl -i -X POST \
   平台重投和上层可用性要求必须覆盖该窗口。
 - 引用映射的 TTL 和容量只在 bridge 进程内执行，不依赖外部定时任务；
   运维时应保留状态文件写入权限并监控磁盘空间。
-- 测试和部署模板固定 Tuwunel 镜像 digest。升级时必须先阅读上游迁移说明、
-  备份数据库和 bridge 状态，再显式更新 digest、版本断言和验证证据。
-- `Dockerfile` 默认 Node 基础镜像 digest 当前只在 `linux/amd64` 验证。
-  ARM64 构建必须先用 `docker buildx imagetools inspect` 确认多架构 index
-  digest，并通过 `NODE_BASE_IMAGE` 构建参数覆盖，不能假设默认 digest 跨架构。
+- 联调基线固定为 Tuwunel 1.9.3。升级时必须先阅读上游迁移说明、备份数据库
+  和 bridge 状态，再更新版本断言和验证证据。
+- 部署使用上游预编译的 Tuwunel 二进制；更换 CPU 架构时必须改用对应架构的
+  发布产物，不能假设 x86_64-v1 的二进制在其他架构上可用。
 - `/health` 和 `/metrics` 当前不鉴权，必须只监听内网或置于受控反向代理后；
   不要把 appservice 监听端口直接暴露到公网。
 - `MATRIX_BRIDGE_IDENTITY_SECRET` 同时是稳定 ghost 身份和状态解密密钥。

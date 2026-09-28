@@ -1,0 +1,31 @@
+[Unit]
+Description=Tuwunel Matrix homeserver
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+User=tuwunel
+Group=tuwunel
+Type=notify
+WatchdogSec=30
+Environment="TUWUNEL_CONFIG=/opt/al1s/tuwunel/tuwunel.toml"
+Environment="MALLOC_CONF=background_thread:false"
+ExecStart=/opt/al1s/bin/tuwunel
+ExecReload=/bin/kill -s USR1 $MAINPID
+# 仅数据目录可写；配置与 appservice registration 只读加载。
+ReadWritePaths=/opt/al1s/data
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+PrivateDevices=yes
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+Restart=on-failure
+RestartSec=5
+TimeoutStopSec=2m
+TimeoutStartSec=5m
+StartLimitInterval=60
+StartLimitBurst=5
+
+[Install]
+WantedBy=multi-user.target

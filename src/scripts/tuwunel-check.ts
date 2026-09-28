@@ -1,14 +1,13 @@
 /**
  * 真实 Tuwunel appservice 集成检查。
  *
- * 自动启动临时 Tuwunel（Docker 或本机二进制），并通过假 QQ 端口驱动完整 bridge：
+ * 启动临时 Tuwunel 本机二进制，并通过假 QQ 端口驱动完整 bridge：
  * registration/ping、QQ -> Matrix（文本、结构化消息、引用与媒体）、
  * transaction 回推、Tuwunel 重启持久化、Matrix -> QQ（文本、引用与媒体）。
- * 检查不需要 QQ 凭据。
+ * 检查不需要 QQ 凭据，也不需要容器运行时。
  *
- * 运行：
- *   pnpm tuwunel:check
- *   TUWUNEL_CHECK_MODE=host TUWUNEL_BIN=/path/to/tuwunel pnpm tuwunel:check
+ * 运行（需提供 tuwunel 1.9.3 可执行文件路径）：
+ *   TUWUNEL_BIN=/path/to/tuwunel pnpm tuwunel:check
  */
 
 import { spawn, type ChildProcessWithoutNullStreams } from 'node:child_process';
@@ -54,9 +53,6 @@ const DOMAIN = 'matrix.test';
 const SERVER_NAME = 'matrix.test';
 const TUWUNEL_PORT = 8008;
 const TUWUNEL_TEST_VERSION = '1.9.3';
-const DEFAULT_TUWUNEL_IMAGE =
-  'ghcr.io/matrix-construct/tuwunel@sha256:678b7f5350e06a41614444497c587da9dddf66767e4068a27480402f3c1367d0';
-const TUWUNEL_MODES = new Set<TuwunelCheckMode>(['docker', 'host']);
 const ALLOWED_USER = `@alice:${DOMAIN}`;
 const GROUP_OPENID = 'TUWUNEL-CHECK-GROUP';
 const QQ_USER_ID = 'TUWUNEL-CHECK-QQ-USER';
@@ -119,8 +115,6 @@ interface RunningEntry {
   output: () => string;
   exit: Promise<number | null>;
 }
-
-type TuwunelCheckMode = 'docker' | 'host';
 
 function check(name: string, condition: boolean, detail?: string): void {
   if (!condition) {
@@ -231,16 +225,6 @@ async function waitFor<T>(
   throw new Error(
     `${description} 超时：${lastError instanceof Error ? lastError.message : String(lastError)}`,
   );
-}
-
-function parseTuwunelMode(value: string | undefined): TuwunelCheckMode {
-  const mode = value ?? 'docker';
-  if (!TUWUNEL_MODES.has(mode as TuwunelCheckMode)) {
-    throw new Error(
-      `TUWUNEL_CHECK_MODE 必须是 docker 或 host，当前为 ${JSON.stringify(mode)}`,
-    );
-  }
-  return mode as TuwunelCheckMode;
 }
 
 function isExecutable(file: string): boolean {
@@ -778,19 +762,11 @@ function hostTuwunelEnvironment(
 }
 
 async function main(): Promise<void> {
-  const mode = parseTuwunelMode(process.env['TUWUNEL_CHECK_MODE']);
-  const image = process.env['TUWUNEL_IMAGE'] ?? DEFAULT_TUWUNEL_IMAGE;
   const expectedVersion = process.env['TUWUNEL_CHECK_VERSION'] ?? TUWUNEL_TEST_VERSION;
-  const appserviceHost =
-    process.env['TUWUNEL_CHECK_APPSERVICE_HOST'] ??
-    (mode === 'host' ? '127.0.0.1' : 'host.docker.internal');
+  const appserviceHost = process.env['TUWUNEL_CHECK_APPSERVICE_HOST'] ?? '127.0.0.1';
   const tempDir = mkdtempSync(join(tmpdir(), 'al1s-tuwunel-check-'));
   const registrationDir = join(tempDir, 'appservices');
   const hostDatabaseDir = join(tempDir, 'tuwunel-data');
-  const containerName = `al1s-tuwunel-check-${String(process.pid)}-${randomBytes(4).toString('hex')}`;
-  const volumeName = `${containerName}-data`;
-  let containerStarted = false;
-  let volumeCreated = false;
   let hostTuwunel: RunningEntry | undefined;
   let hostTuwunelBinary: string | undefined;
   let appservice: MatrixAppserviceServer | undefined;
@@ -806,24 +782,12 @@ async function main(): Promise<void> {
     mediaFixture = await startMediaFixture();
 
     section('运行环境');
-    if (mode === 'host') {
-      hostTuwunelBinary = resolveTuwunelBinary();
-      check('Tuwunel 本机二进制可用', true, hostTuwunelBinary);
-    } else {
-      const dockerVersion = await runCommand('docker', [
-        'version',
-        '--format',
-        '{{.Server.Version}}',
-      ]);
-      check('Docker 可用', dockerVersion.stdout.trim() !== '', dockerVersion.stdout.trim());
-    }
+    hostTuwunelBinary = resolveTuwunelBinary();
+    check('Tuwunel 本机二进制可用', true, hostTuwunelBinary);
 
     const hostPort = await getFreePort();
     const baseUrl = `http://127.0.0.1:${String(hostPort)}`;
-    const hostEnv =
-      mode === 'host'
-        ? hostTuwunelEnvironment(hostDatabaseDir, registrationDir, hostPort)
-        : undefined;
+    const hostEnv = hostTuwunelEnvironment(hostDatabaseDir, registrationDir, hostPort);
     const appserviceId = 'al1s-tuwunel-check';
     const asToken = randomBytes(24).toString('base64url');
     const hsToken = randomBytes(24).toString('base64url');
@@ -953,54 +917,17 @@ async function main(): Promise<void> {
     );
 
     section('Tuwunel registration');
-    if (mode === 'host') {
-      const binary = hostTuwunelBinary;
-      if (binary === undefined || hostEnv === undefined) {
-        throw new Error('宿主 Tuwunel 启动参数不完整');
-      }
-      mkdirSync(hostDatabaseDir, { recursive: true });
-      hostTuwunel = startCapturedProcess(binary, [], hostEnv, tempDir);
-    } else {
-      await runCommand('docker', ['volume', 'create', volumeName]);
-      volumeCreated = true;
-      await runCommand('docker', [
-        'run',
-        '-d',
-        '--name',
-        containerName,
-        '--add-host',
-        'host.docker.internal:host-gateway',
-        '--publish',
-        `127.0.0.1:${String(hostPort)}:${String(TUWUNEL_PORT)}`,
-        '--volume',
-        `${volumeName}:/var/lib/tuwunel`,
-        '--volume',
-        `${registrationDir}:/etc/tuwunel/appservices:ro`,
-        '--env',
-        `TUWUNEL_SERVER_NAME=${SERVER_NAME}`,
-        '--env',
-        'TUWUNEL_DATABASE_PATH=/var/lib/tuwunel',
-        '--env',
-        'TUWUNEL_ADDRESS=0.0.0.0',
-        '--env',
-        `TUWUNEL_PORT=${String(TUWUNEL_PORT)}`,
-        '--env',
-        'TUWUNEL_APPSERVICE_DIR=/etc/tuwunel/appservices',
-        '--env',
-        'TUWUNEL_ALLOW_FEDERATION=false',
-        '--env',
-        'TUWUNEL_ALLOW_REGISTRATION=false',
-        '--stop-timeout',
-        '1800',
-        image,
-      ]);
-      containerStarted = true;
+    const binary = hostTuwunelBinary;
+    if (binary === undefined) {
+      throw new Error('宿主 Tuwunel 启动参数不完整');
     }
+    mkdirSync(hostDatabaseDir, { recursive: true });
+    hostTuwunel = startCapturedProcess(binary, [], hostEnv, tempDir);
     const version = await waitForTuwunel(baseUrl, () => hostTuwunel?.output() ?? '');
     check(
       'Tuwunel 已启动',
       version !== 'unknown',
-      `${mode === 'host' ? (hostTuwunelBinary ?? 'tuwunel') : image} (${version})`,
+      `${hostTuwunelBinary ?? 'tuwunel'} (${version})`,
     );
     check(
       'Tuwunel 版本符合测试基线',
@@ -1140,19 +1067,14 @@ async function main(): Promise<void> {
     check('appservice bot 已加入映射房间', bridgeMember?.membership === 'join');
 
     section('Tuwunel 重启与持久化');
-    if (mode === 'host') {
-      const runningHost = hostTuwunel;
-      const binary = hostTuwunelBinary;
-      if (runningHost === undefined || binary === undefined || hostEnv === undefined) {
-        throw new Error('宿主 Tuwunel 重启参数不完整');
-      }
-      const exitCode = await stopProcess(runningHost, 30_000);
-      check('Tuwunel 本机进程已正常停止', exitCode === 0, `exit=${String(exitCode)}`);
-      hostTuwunel = startCapturedProcess(binary, [], hostEnv, tempDir);
-    } else {
-      await runCommand('docker', ['stop', '--time', '30', containerName], 40_000);
-      await runCommand('docker', ['start', containerName], 30_000);
+    const runningHost = hostTuwunel;
+    const restartBinary = hostTuwunelBinary;
+    if (runningHost === undefined || restartBinary === undefined) {
+      throw new Error('宿主 Tuwunel 重启参数不完整');
     }
+    const exitCode = await stopProcess(runningHost, 30_000);
+    check('Tuwunel 本机进程已正常停止', exitCode === 0, `exit=${String(exitCode)}`);
+    hostTuwunel = startCapturedProcess(restartBinary, [], hostEnv, tempDir);
     const restartedVersion = await waitForTuwunel(
       baseUrl,
       () => hostTuwunel?.output() ?? '',
@@ -1897,14 +1819,6 @@ async function main(): Promise<void> {
         console.error('\nTuwunel 本机进程日志：');
         console.error(logs);
       }
-    } else if (containerStarted) {
-      try {
-        const logs = await runCommand('docker', ['logs', '--tail', '100', containerName]);
-        console.error('\nTuwunel 容器日志：');
-        console.error(logs.stdout.trim() || logs.stderr.trim());
-      } catch {
-        // 容器可能尚未启动或已被移除。
-      }
     }
     throw error;
   } finally {
@@ -1917,12 +1831,6 @@ async function main(): Promise<void> {
     await mediaFixture?.close().catch(() => undefined);
     if (hostTuwunel !== undefined) {
       await stopProcess(hostTuwunel, 30_000).catch(() => undefined);
-    }
-    if (containerStarted) {
-      await runCommand('docker', ['rm', '-f', containerName]).catch(() => undefined);
-    }
-    if (volumeCreated) {
-      await runCommand('docker', ['volume', 'rm', volumeName]).catch(() => undefined);
     }
     rmSync(tempDir, { recursive: true, force: true });
   }

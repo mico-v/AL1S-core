@@ -1,5 +1,5 @@
-# Prometheus 运行在宿主机时使用 127.0.0.1；容器部署请改为 bridge 的内网 DNS
-# 名称或专用 Docker network 地址，不要把 /metrics 暴露到公网。
+# Prometheus 与 bridge 同主机时使用 127.0.0.1；若不在同一主机，改为 bridge 的
+# 内网地址，不要把 /metrics 暴露到公网。
 global:
   scrape_interval: 15s
   evaluation_interval: 15s

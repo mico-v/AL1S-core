@@ -1,0 +1,27 @@
+[Unit]
+Description=AL1S QQ/Matrix bridge
+Wants=network-online.target
+After=network-online.target tuwunel.service
+
+[Service]
+User=al1s
+Group=al1s
+WorkingDirectory=/opt/al1s/app
+# 密钥与 QQ 凭据来自 /opt/al1s/.env（权限 600，属主 al1s）。
+EnvironmentFile=/opt/al1s/.env
+Environment=MATRIX_BRIDGE_HOMESERVER_URL=http://127.0.0.1:8008
+Environment=MATRIX_BRIDGE_LISTEN_HOST=127.0.0.1
+Environment=MATRIX_BRIDGE_DATA_FILE=/opt/al1s/data/matrix-bridge/state.json
+Environment=NODE_ENV=production
+ExecStart=/usr/bin/node dist/matrix-bridge.js
+Restart=on-failure
+RestartSec=5
+TimeoutStopSec=45
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+ReadWritePaths=/opt/al1s/data /opt/al1s/logs
+
+[Install]
+WantedBy=multi-user.target

@@ -1,10 +1,10 @@
 /**
  * 生产部署前检查 registration、.env 与运行模式的一致性。
  *
- * 默认读取 deploy/appservice.yaml 和 .env，并按 Compose 内部服务名
- * 校验 registration URL。宿主机进程部署使用 `--mode host`。
+ * 默认读取 deploy/appservice.yaml 和 .env，并按宿主机部署校验
+ * registration URL（Tuwunel 与 bridge 都在 127.0.0.1 上）。
  *
- * 运行：pnpm deploy:check [-- --mode compose|host]
+ * 运行：pnpm deploy:check
  */
 
 import { readFileSync, statSync } from 'node:fs';
@@ -17,12 +17,9 @@ import {
   validateDeploymentConfig,
 } from '../deploy/preflight.js';
 
-type DeploymentMode = 'compose' | 'host';
-
 interface Options {
   envPath: string;
   registrationPath: string;
-  mode: DeploymentMode;
   bridgeUrl?: string;
 }
 
@@ -33,7 +30,6 @@ function usage(): string {
     '选项：',
     '  --env <path>          环境文件，默认 .env',
     '  --registration <path> registration 文件，默认 deploy/appservice.yaml',
-    '  --mode <compose|host> 部署模式，默认 compose',
     '  --bridge-url <url>    显式覆盖 registration 中预期的 bridge URL',
     '  --help                显示帮助',
   ].join('\n');
@@ -43,7 +39,6 @@ function parseArgs(args: string[]): Options | undefined {
   const options: Options = {
     envPath: '.env',
     registrationPath: 'deploy/appservice.yaml',
-    mode: 'compose',
   };
 
   for (let index = 0; index < args.length; index += 1) {
@@ -62,11 +57,6 @@ function parseArgs(args: string[]): Options | undefined {
       options.envPath = value;
     } else if (argument === '--registration') {
       options.registrationPath = value;
-    } else if (argument === '--mode') {
-      if (value !== 'compose' && value !== 'host') {
-        throw new Error('--mode 只支持 compose 或 host');
-      }
-      options.mode = value;
     } else if (argument === '--bridge-url') {
       options.bridgeUrl = value;
     } else {
@@ -99,13 +89,7 @@ function checkPrivateFile(path: string, label: string, errors: string[], checks:
 }
 
 function expectedBridgeUrl(options: Options, port: number): string {
-  if (options.bridgeUrl !== undefined) {
-    return options.bridgeUrl;
-  }
-  if (options.mode === 'compose') {
-    return `http://bridge:${String(port)}`;
-  }
-  return `http://127.0.0.1:${String(port)}`;
+  return options.bridgeUrl ?? `http://127.0.0.1:${String(port)}`;
 }
 
 function printResult(checks: string[], warnings: string[], errors: string[]): void {
@@ -166,7 +150,7 @@ async function main(): Promise<void> {
     warnings.push(...result.warnings);
     if (result.errors.length === 0) {
       checks.push('registration 与 .env 的身份、密钥和 namespace 配置一致');
-      checks.push(`registration URL 符合 ${options.mode} 部署模式`);
+      checks.push('registration URL 符合宿主机部署模式');
     }
   } catch (error) {
     if (error instanceof ConfigError || error instanceof RegistrationParseError) {

@@ -1,0 +1,16 @@
+# Tuwunel homeserver 配置模板（原生 systemd 部署，无容器）。
+#
+# 复制到 /opt/al1s/tuwunel/tuwunel.toml 并按需修改。domain 必须与
+# MATRIX_BRIDGE_DOMAIN 以及 registration namespace 一致。
+[global]
+server_name = "matrix.example"
+database_path = "/opt/al1s/data/tuwunel"
+address = ["127.0.0.1"]
+port = 8008
+allow_registration = false
+allow_federation = false
+appservice_dir = "/opt/al1s/tuwunel/appservices"
+max_request_size = "64 MiB"
+
+[global.well_known]
+client = "https://matrix.example"

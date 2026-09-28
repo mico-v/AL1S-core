@@ -77,14 +77,14 @@ pnpm qq:login
 pnpm dev         # 开发模式（文件变更自动重启）
 pnpm start       # 正常运行
 pnpm typecheck   # 类型检查
-pnpm build       # 编译到 dist/，供生产镜像运行
+pnpm build       # 编译到 dist/，供部署脚本打包
 pnpm qq:login    # 扫码获取 AppID / AppSecret 并写入 .env
 pnpm qq:check    # 离线协议自检（不联网）
 pnpm matrix:check   # Matrix bridge 离线自检
 pnpm matrix:admin   # 查询、邀请或踢出 Matrix 房间成员
-pnpm tuwunel:check  # 临时启动 Tuwunel，检查双向桥接与生产入口生命周期
-pnpm tuwunel:check:host  # 使用 TUWUNEL_BIN 的本机 Tuwunel 执行同一检查
+pnpm tuwunel:check  # 用 TUWUNEL_BIN 的本机 Tuwunel 检查双向桥接与生产入口生命周期
 pnpm deploy:check   # 校验生产 registration、.env、权限与部署 URL
+pnpm deploy:server  # 本地构建运行包并同步到服务器重启服务
 pnpm bridge       # 启动独立 QQ / Tuwunel bridge
 pnpm webhook:check  # 本地起 webhook 服务，端到端验证收消息
 pnpm integration:check  # typecheck + 全部离线检查
@@ -123,7 +123,8 @@ pnpm ci:check      # 与 GitHub Actions 相同的完整门禁
 [`docs/qq-matrix-bridge/DEPLOYMENT.md`](docs/qq-matrix-bridge/DEPLOYMENT.md)。
 当前实现状态、实施日志、验证证据和阻塞项见
 [`docs/qq-matrix-bridge/STATUS.md`](docs/qq-matrix-bridge/STATUS.md)。
-生产容器模板位于 [`deploy/compose.example.yml`](deploy/compose.example.yml)。
+原生部署资产位于 [`deploy/`](deploy)：systemd 单元、Tuwunel 配置模板与
+`deploy-server.sh`（本地构建后同步到服务器）。
 `/health` 与 `/metrics` 不鉴权，只应暴露在 Tuwunel 可达的内网。
 QQ 侧已支持文本、媒体、引用与结构化消息（`message_type=3/101/102/103`
 卡片、并行消息、聊天记录、引用），结构化内容合并为有界文本并递归转发
