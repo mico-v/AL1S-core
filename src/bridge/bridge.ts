@@ -745,6 +745,9 @@ export class QqMatrixBridge {
       this.config.userPrefix,
     )}:${this.config.domain}`;
     const room = await this.ensureRoom(target, ghostUserId, message.senderName);
+    // 群聊中每个 QQ 用户都是独立 ghost；房间已存在时新 ghost 仍未加入，
+    // 发送前必须确保其 membership 为 join，否则 homeserver 会拒绝事件。
+    await this.ensureGhostJoined(room.roomId, ghostUserId);
 
     const structured = extractStructuredMessage(message);
     if (structured.truncated) {
@@ -949,6 +952,24 @@ export class QqMatrixBridge {
         error: error instanceof Error ? error.message : String(error),
       });
     }
+  }
+
+  private async ensureGhostJoined(roomId: string, ghostUserId: string): Promise<void> {
+    const member = await this.matrix.getRoomMember(roomId, ghostUserId);
+    if (member?.membership === 'join') {
+      return;
+    }
+    // 映射房间为 private，非成员无法直接 join；先由已加入的 appservice bot
+    // 邀请该 ghost，再以 ghost 身份加入。
+    try {
+      await this.matrix.inviteUser(roomId, ghostUserId, this.matrix.userId);
+    } catch (error) {
+      this.logger.debug('邀请 ghost 加入房间失败，尝试直接加入', {
+        roomId,
+        error: error instanceof Error ? error.message : String(error),
+      });
+    }
+    await this.matrix.joinRoom(roomId, ghostUserId);
   }
 
   private async forwardQqAttachment(
