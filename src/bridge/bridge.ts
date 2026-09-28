@@ -582,6 +582,7 @@ export class QqMatrixBridge {
     }
     this.replayStarted = true;
     try {
+      await this.reconcileMappedRooms();
       await this.replayDueQqMessages();
       this.replayTimer = setInterval(() => {
         void this.replayDueQqMessages().catch((error: unknown) => {
@@ -744,7 +745,9 @@ export class QqMatrixBridge {
       message.senderId,
       this.config.userPrefix,
     )}:${this.config.domain}`;
-    const room = await this.ensureRoom(target, ghostUserId, message.senderName);
+    const senderDisplayName = this.qqSenderDisplayName(message);
+    await this.refreshGhostDisplayName(ghostUserId, senderDisplayName);
+    const room = await this.ensureRoom(target, ghostUserId);
     // 群聊中每个 QQ 用户都是独立 ghost；房间已存在时新 ghost 仍未加入，
     // 发送前必须确保其 membership 为 join，否则 homeserver 会拒绝事件。
     await this.ensureGhostJoined(room.roomId, ghostUserId);
@@ -766,7 +769,7 @@ export class QqMatrixBridge {
     const body =
       structured.quoteExcerpt === undefined
         ? structured.text
-        : `${quoteFallback(quoted?.sender ?? message.senderName ?? 'QQ user', structured.quoteExcerpt)}\n\n${structured.text}`;
+        : `${quoteFallback(quoted?.sender ?? senderDisplayName, structured.quoteExcerpt)}\n\n${structured.text}`;
 
     let sent = false;
     let firstMatrixEventId: string | undefined;
@@ -777,7 +780,7 @@ export class QqMatrixBridge {
         {
           msgtype: 'm.text',
           body,
-          'org.al1s.qq.sender': message.senderName ?? 'QQ user',
+          'org.al1s.qq.sender': senderDisplayName,
           'org.al1s.qq.message_id': message.messageId,
           ...replyContent,
         },
@@ -816,7 +819,7 @@ export class QqMatrixBridge {
       await this.store.rememberReference({
         qqReference: message.msgIdx,
         matrixEventId: firstMatrixEventId,
-        sender: message.senderName ?? ghostUserId,
+        sender: senderDisplayName,
         excerpt: (structured.text.trim() || structured.quoteExcerpt || '').slice(0, 500),
       });
     }
@@ -859,7 +862,6 @@ export class QqMatrixBridge {
   private async ensureRoom(
     target: ConversationTarget,
     ghostUserId: string,
-    senderName: string | undefined,
   ): Promise<BridgeRoomRecord> {
     const existing = this.store.getRoom(target.key);
     if (existing !== undefined) {
@@ -871,7 +873,7 @@ export class QqMatrixBridge {
       return pending;
     }
 
-    const task = this.createRoom(target, ghostUserId, senderName);
+    const task = this.createRoom(target, ghostUserId);
     this.roomEnsuring.set(target.key, task);
     try {
       return await task;
@@ -885,18 +887,7 @@ export class QqMatrixBridge {
   private async createRoom(
     target: ConversationTarget,
     ghostUserId: string,
-    senderName: string | undefined,
   ): Promise<BridgeRoomRecord> {
-    if (senderName !== undefined && senderName.trim() !== '') {
-      try {
-        await this.matrix.setDisplayName(ghostUserId, senderName.trim(), ghostUserId);
-      } catch (error) {
-        this.logger.debug('设置 Matrix ghost 显示名失败', {
-          error: error instanceof Error ? error.message : String(error),
-        });
-      }
-    }
-
     const aliasLocalpart = `${this.config.aliasPrefix}${digest(this.config.identitySecret, target.key)}`;
     const alias = `#${aliasLocalpart}:${this.config.domain}`;
     let roomId: string;
@@ -913,7 +904,7 @@ export class QqMatrixBridge {
           roomAliasName: aliasLocalpart,
           preset: 'private_chat',
           visibility: 'private',
-          invite: [this.matrix.userId],
+          invite: [this.matrix.userId, ...this.explicitAllowedSenders()],
           isDirect: isDirectConversation(target.kind),
         },
         ghostUserId,
@@ -931,6 +922,66 @@ export class QqMatrixBridge {
     await this.store.setRoom(room);
     this.logger.info('已建立 QQ/Matrix 房间映射', { kind: target.kind, roomId });
     return room;
+  }
+
+  private qqSenderDisplayName(message: QQBotInboundMessage): string {
+    const senderName = nonEmptyString(message.senderName);
+    if (senderName !== undefined) {
+      return senderName.trim();
+    }
+    const raw = isRecord(message.raw) ? message.raw : undefined;
+    const author = raw === undefined ? undefined : raw['author'];
+    const authorRecord = isRecord(author) ? (author as Record<string, unknown>) : undefined;
+    const username =
+      authorRecord === undefined ? undefined : nonEmptyString(authorRecord['username']);
+    if (username !== undefined) {
+      return username.trim();
+    }
+    return `QQ 用户 ${digest(this.config.identitySecret, message.senderId, 8)}`;
+  }
+
+  private async refreshGhostDisplayName(
+    ghostUserId: string,
+    displayName: string,
+  ): Promise<void> {
+    try {
+      await this.matrix.setDisplayName(ghostUserId, displayName, ghostUserId);
+    } catch (error) {
+      this.logger.debug('设置 Matrix ghost 显示名失败', {
+        error: error instanceof Error ? error.message : String(error),
+      });
+    }
+  }
+
+  private explicitAllowedSenders(): string[] {
+    return this.config.allowedSenders.filter(
+      (userId) => userId !== '*' && !this.isBridgeUser(userId),
+    );
+  }
+
+  private async reconcileMappedRooms(): Promise<void> {
+    for (const room of this.store.listRooms()) {
+      await this.ensureAllowedUsersInvited(room.roomId);
+    }
+  }
+
+  private async ensureAllowedUsersInvited(roomId: string): Promise<void> {
+    for (const userId of this.explicitAllowedSenders()) {
+      try {
+        const member = await this.matrix.getRoomMember(roomId, userId);
+        if (member?.membership === 'join' || member?.membership === 'invite') {
+          continue;
+        }
+        await this.matrix.inviteUser(roomId, userId, this.matrix.userId);
+        this.logger.info('已邀请 Matrix 用户加入 QQ 映射房间', { roomId, userId });
+      } catch (error) {
+        this.logger.warn('邀请 Matrix 用户加入 QQ 映射房间失败', {
+          roomId,
+          userId,
+          error: error instanceof Error ? error.message : String(error),
+        });
+      }
+    }
   }
 
   private async ensureBotCanJoin(roomId: string, ghostUserId: string): Promise<void> {

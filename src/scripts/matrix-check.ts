@@ -301,6 +301,32 @@ function groupMessage(
   };
 }
 
+function c2cMessage(
+  messageId: string,
+  senderId: string,
+  content: string,
+  rawUsername?: string,
+): QQBotInboundMessage {
+  return {
+    rawEventType: 'C2C_MESSAGE_CREATE',
+    kind: 'c2c',
+    senderId,
+    content,
+    messageId,
+    timestamp: '2026-09-27T10:00:00+08:00',
+    replyTarget: { scope: 'c2c', targetId: senderId, msgId: messageId },
+    raw: {
+      id: messageId,
+      content,
+      timestamp: '2026-09-27T10:00:00+08:00',
+      author: {
+        user_openid: senderId,
+        ...(rawUsername === undefined ? {} : { username: rawUsername }),
+      },
+    } as unknown as QQBotInboundMessage['raw'],
+  };
+}
+
 function guildMessage(
   messageId: string,
   senderId: string,
@@ -765,6 +791,50 @@ const bridge = new QqMatrixBridge({
   },
 });
 
+const existingMappedRoomId = '!existing-mapped-room:matrix.test';
+await store.setRoom({
+  key: 'group:EXISTING-MAPPED-GROUP',
+  kind: 'group',
+  targetId: 'EXISTING-MAPPED-GROUP',
+  roomId: existingMappedRoomId,
+  alias: '#_qq_existing:matrix.test',
+  createdAt: new Date().toISOString(),
+});
+matrixState.roomMembers.set(
+  roomMemberKey(existingMappedRoomId, '@alice:matrix.test'),
+  'join',
+);
+matrixState.roomMembers.set(
+  roomMemberKey(existingMappedRoomId, '@bob:matrix.test'),
+  'invite',
+);
+const reconcileRequestStart = matrixState.requests.length;
+await bridge.start();
+await bridge.stop();
+const reconciledInvites = matrixState.requests
+  .slice(reconcileRequestStart)
+  .filter(
+    (request) =>
+      request.method === 'POST' &&
+      decodeURIComponent(request.url.pathname) ===
+        `/_matrix/client/v3/rooms/${existingMappedRoomId}/invite`,
+  );
+const reconciledInviteUsers = reconciledInvites.map((request) =>
+  typeof request.body === 'object' && request.body !== null
+    ? (request.body as Record<string, unknown>)['user_id']
+    : undefined,
+);
+check(
+  '启动时为已有映射房间邀请缺失的显式用户',
+  reconciledInviteUsers.includes('@carol:matrix.test') &&
+    reconciledInviteUsers.includes('@dave:matrix.test') &&
+    !reconciledInviteUsers.includes('@alice:matrix.test') &&
+    !reconciledInviteUsers.includes('@bob:matrix.test') &&
+    reconciledInvites.every(
+      (request) => request.url.searchParams.get('user_id') === bridgeConfig.userId,
+    ),
+);
+
 const firstMessage = {
   ...groupMessage('qq-message-1', 'QQ-SENDER-1', 'hello matrix'),
   msgIdx: 'REFIDX-qq-user-1',
@@ -779,10 +849,30 @@ const expectedGhost = `@${deriveGhostLocalpart(
 const firstSend = matrixState.sentEvents[0] as
   | { body?: { msgtype?: string; body?: string }; url?: URL }
   | undefined;
+const firstRoomBody = matrixState.createRooms[0] as { invite?: string[] } | undefined;
 check('QQ 群聊创建 Matrix room', matrixState.createRooms.length === 1);
+check(
+  '新 Matrix room 邀请 bridge 与显式允许的用户',
+  firstRoomBody?.invite?.includes(bridgeConfig.userId) === true &&
+    firstRoomBody.invite.includes('@alice:matrix.test') &&
+    firstRoomBody.invite.includes('@bob:matrix.test') &&
+    firstRoomBody.invite.includes('@carol:matrix.test') &&
+    firstRoomBody.invite.includes('@dave:matrix.test') &&
+    !firstRoomBody.invite.includes('*'),
+);
 check('QQ 文本发送为 m.text', firstSend?.body?.msgtype === 'm.text' && firstSend.body.body === 'hello matrix');
 check('Matrix ghost 身份不可逆', firstSend?.url?.searchParams.get('user_id') === expectedGhost);
 check('room alias 使用配置前缀', JSON.stringify(matrixState.createRooms[0]).includes('_qq_'));
+const firstDisplayNameRequest = matrixState.requests.find(
+  (request) =>
+    request.method === 'PUT' &&
+    request.url.pathname.includes('/profile/') &&
+    request.url.searchParams.get('user_id') === expectedGhost,
+);
+check(
+  'QQ 消息更新 Matrix ghost 显示名',
+  JSON.stringify(firstDisplayNameRequest?.body) === '{"displayname":"测试用户"}',
+);
 
 await bridge.handleQqMessage({
   ...groupMessage('qq-message-quote', 'QQ-SENDER-2', 'quoted reply'),
@@ -820,8 +910,29 @@ const sentBeforeDuplicate = matrixState.sentEvents.length;
 await bridge.handleQqMessage(firstMessage);
 check('重复 QQ message ID 不重复发送', matrixState.sentEvents.length === sentBeforeDuplicate);
 
+const expectedSecondGhost = `@${deriveGhostLocalpart(
+  bridgeConfig.identitySecret,
+  'QQ-SENDER-2',
+  bridgeConfig.userPrefix,
+)}:${bridgeConfig.domain}`;
+const displayNameRequestsBeforeSecond = matrixState.requests.filter(
+  (request) =>
+    request.method === 'PUT' &&
+    request.url.pathname.includes('/profile/') &&
+    request.url.searchParams.get('user_id') === expectedSecondGhost,
+).length;
 await bridge.handleQqMessage(groupMessage('qq-message-2', 'QQ-SENDER-2', 'second user'));
+const displayNameRequestsAfterSecond = matrixState.requests.filter(
+  (request) =>
+    request.method === 'PUT' &&
+    request.url.pathname.includes('/profile/') &&
+    request.url.searchParams.get('user_id') === expectedSecondGhost,
+).length;
 check('同群复用 Matrix room', matrixState.createRooms.length === 1);
+check(
+  '已有 room 的后续 QQ 消息继续刷新 ghost 显示名',
+  displayNameRequestsAfterSecond === displayNameRequestsBeforeSecond + 1,
+);
 check(
   '不同 QQ 用户使用不同 ghost',
   JSON.stringify(matrixState.sentEvents.at(-1)).includes('user_id') &&
@@ -910,6 +1021,62 @@ check(
 check(
   'DM room 标记为 direct',
   dmRoomBody?.name === 'QQ 频道私信' && dmRoomBody.is_direct === true,
+);
+
+const c2cNamedGhost = `@${deriveGhostLocalpart(
+  bridgeConfig.identitySecret,
+  'QQ-C2C-NAMED',
+  bridgeConfig.userPrefix,
+)}:${bridgeConfig.domain}`;
+await bridge.handleQqMessage(
+  c2cMessage('qq-c2c-named', 'QQ-C2C-NAMED', 'named c2c user', '单聊用户名'),
+);
+const c2cRoomBody = matrixState.createRooms.at(-1) as
+  | { invite?: string[]; is_direct?: boolean; name?: string }
+  | undefined;
+const c2cNamedDisplayNameRequest = [...matrixState.requests].reverse().find(
+  (request) =>
+    request.method === 'PUT' &&
+    request.url.pathname.includes('/profile/') &&
+    request.url.searchParams.get('user_id') === c2cNamedGhost,
+);
+check(
+  'C2C 新 room 邀请显式允许用户且不包含通配符',
+  c2cRoomBody?.is_direct === true &&
+    c2cRoomBody.invite?.includes('@alice:matrix.test') === true &&
+    c2cRoomBody.invite.includes('@dave:matrix.test') &&
+    !c2cRoomBody.invite.includes('*'),
+);
+check(
+  'C2C 缺少 senderName 时回退到 raw author.username',
+  JSON.stringify(c2cNamedDisplayNameRequest?.body) ===
+    '{"displayname":"单聊用户名"}',
+);
+
+const c2cFallbackGhost = `@${deriveGhostLocalpart(
+  bridgeConfig.identitySecret,
+  'QQ-C2C-FALLBACK',
+  bridgeConfig.userPrefix,
+)}:${bridgeConfig.domain}`;
+await bridge.handleQqMessage(
+  c2cMessage('qq-c2c-fallback', 'QQ-C2C-FALLBACK', 'anonymous c2c user'),
+);
+const c2cFallbackDisplayNameRequest = [...matrixState.requests].reverse().find(
+  (request) =>
+    request.method === 'PUT' &&
+    request.url.pathname.includes('/profile/') &&
+    request.url.searchParams.get('user_id') === c2cFallbackGhost,
+);
+const c2cFallbackDisplayName =
+  typeof c2cFallbackDisplayNameRequest?.body === 'object' &&
+  c2cFallbackDisplayNameRequest.body !== null
+    ? (c2cFallbackDisplayNameRequest.body as Record<string, unknown>)['displayname']
+    : undefined;
+check(
+  'C2C 无用户名时使用稳定短标识而不是 ghost localpart',
+  typeof c2cFallbackDisplayName === 'string' &&
+    /^QQ 用户 [0-9a-f]{8}$/.test(c2cFallbackDisplayName) &&
+    !c2cFallbackDisplayName.includes('QQ-C2C-FALLBACK'),
 );
 
 if (guildRoomA === undefined || guildRoomB === undefined || dmRoom === undefined) {

@@ -56,7 +56,7 @@ export interface MatrixBridgeConfig {
   aliasPrefix: string;
   /** 生成不可逆 QQ 用户标识的 HMAC 密钥。 */
   identitySecret: string;
-  /** 允许触发 Matrix 到 QQ 转发的用户；`*` 表示显式允许所有用户。 */
+  /** 允许触发 Matrix 到 QQ 转发的用户；显式用户会被邀请，`*` 仅放开权限。 */
   allowedSenders: string[];
   /** 房间内允许转发的最低 Matrix power level。 */
   minPowerLevel: number;

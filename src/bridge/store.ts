@@ -449,6 +449,17 @@ export class BridgeStore {
     return undefined;
   }
 
+  listRooms(): BridgeRoomRecord[] {
+    return Object.values(this.state.rooms).map((stored) => ({
+      key: this.decrypt(stored.key),
+      kind: stored.kind,
+      targetId: this.decrypt(stored.targetId),
+      roomId: stored.roomId,
+      alias: stored.alias,
+      createdAt: stored.createdAt,
+    }));
+  }
+
   async setRoom(room: BridgeRoomRecord): Promise<void> {
     this.state.rooms[this.indexKey('room', room.key)] = {
       key: this.encrypt(room.key),
