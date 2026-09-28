@@ -78,14 +78,41 @@ type QqAttachment = NonNullable<QQBotInboundMessage['attachments']>[number];
 interface StructuredMessageContent {
   /** 顶层正文与结构化元素合并后的文本。 */
   text: string;
+  /** 包含 Matrix 提及时的可选 HTML 正文。 */
+  formattedText?: string;
   /** 引用元素提取的摘录，用于回复 fallback 正文。 */
   quoteExcerpt?: string;
+  /** 引用摘录的 HTML 形式。 */
+  quoteFormattedExcerpt?: string;
   /** 引用元素携带的原发送者显示名。 */
   quoteSender?: string;
   /** 去重、限量后的可转发附件，不含引用元素附件。 */
   attachments: QqAttachment[];
+  /** Matrix `m.mentions.user_ids` 对应的 ghost 用户。 */
+  mentionUserIds: string[];
+  /** 是否包含 `@room`。 */
+  mentionsRoom: boolean;
+  /** 引用 fallback 中出现的 Matrix ghost 用户。 */
+  quoteMentionUserIds: string[];
+  /** 引用 fallback 是否包含 `@room`。 */
+  quoteMentionsRoom: boolean;
   /** 是否命中深度、元素、附件或长度限制。 */
   truncated: boolean;
+}
+
+interface RenderedQqContent {
+  text: string;
+  formattedText: string;
+  mentionUserIds: string[];
+  mentionsRoom: boolean;
+}
+
+interface QqMentionContext {
+  names: Map<string, string>;
+  mentionsRoom: boolean;
+  identitySecret: string;
+  domain: string;
+  userPrefix: string;
 }
 
 const DEFAULT_MAX_MEDIA_BYTES = 50 * 1024 * 1024;
@@ -104,6 +131,7 @@ const STRUCTURED_MAX_EXCERPT_LENGTH = 500;
 const MAX_QQ_FACE_EXT_BYTES = 64 * 1024;
 const STRUCTURED_TRUNCATION_MARKER = '\n[消息过长，已截断]';
 const QQ_TYPE_TAG_PATTERN = /<([A-Za-z][A-Za-z0-9_]*Type)=([^>]*)>/g;
+const QQ_MENTION_PATTERN = /<@!?([^>\s]+)>/g;
 const ARK_FIELD_KEYS = ['title', 'desc', 'tag', 'tags', 'source', 'nickname', 'address'] as const;
 
 function digest(secret: string, value: string, length = 64): string {
@@ -156,6 +184,21 @@ function nonEmptyString(value: unknown): string | undefined {
   return typeof value === 'string' && value.trim() !== '' ? value : undefined;
 }
 
+function cleanQqDisplayName(value: string): string {
+  const name = value.replace(/\s+/g, ' ').trim();
+  const wrapped = /^<([^<>]+)>$/.exec(name);
+  return wrapped?.[1]?.trim() || name;
+}
+
+function escapeHtml(value: string): string {
+  return value
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;')
+    .replace(/'/g, '&#39;');
+}
+
 function decodeQqFaceName(ext: string): string | undefined {
   const padding = ext.endsWith('==') ? 2 : ext.endsWith('=') ? 1 : 0;
   if (Math.ceil((ext.length * 3) / 4) - padding > MAX_QQ_FACE_EXT_BYTES) {
@@ -185,13 +228,13 @@ function quotedTagAttribute(attributes: string, name: string): string | undefine
 }
 
 /**
- * 将 QQ 结构化标签转换为可读文本。
+ * 将 QQ 结构化标签、提及标记转换为 Matrix 可读正文与 HTML。
  *
  * `faceType` 的 `ext.text` 是可读名称；`attachmentType` 等标签只描述
  * 随消息另行携带的附件，必须删除，避免原始调试标签和真实媒体重复发送。
  */
-function renderQqContent(value: string): string {
-  return value
+function renderQqContent(value: string, context: QqMentionContext): RenderedQqContent {
+  const readable = value
     .replace(QQ_TYPE_TAG_PATTERN, (_tag: string, tagName: string, attributes: string): string => {
       if (tagName !== 'faceType') {
         return '';
@@ -204,6 +247,100 @@ function renderQqContent(value: string): string {
       return name === undefined ? '' : `【表情: ${name}】`;
     })
     .trim();
+  const bodyParts: string[] = [];
+  const htmlParts: string[] = [];
+  const mentionUserIds = new Set<string>();
+  let mentionsRoom = false;
+  let cursor = 0;
+  const pushText = (text: string): void => {
+    bodyParts.push(text);
+    htmlParts.push(escapeHtml(text));
+  };
+
+  QQ_MENTION_PATTERN.lastIndex = 0;
+  for (const match of readable.matchAll(QQ_MENTION_PATTERN)) {
+    const index = match.index ?? 0;
+    const id = match[1];
+    if (id === undefined) {
+      continue;
+    }
+    pushText(readable.slice(cursor, index));
+    const normalizedId = id.toLowerCase();
+    if (
+      context.mentionsRoom ||
+      normalizedId === 'all' ||
+      normalizedId === 'everyone' ||
+      normalizedId === 'room'
+    ) {
+      bodyParts.push('@room');
+      htmlParts.push('@room');
+      mentionsRoom = true;
+    } else {
+      const matrixUserId = `@${deriveGhostLocalpart(
+        context.identitySecret,
+        id,
+        context.userPrefix,
+      )}:${context.domain}`;
+      const displayName =
+        context.names.get(id) ??
+        `QQ用户_${digest(context.identitySecret, id, 8)}`;
+      bodyParts.push(`@${displayName}`);
+      htmlParts.push(
+        `<a href="https://matrix.to/#/${encodeURIComponent(matrixUserId)}">${escapeHtml(
+          displayName,
+        )}</a>`,
+      );
+      mentionUserIds.add(matrixUserId);
+    }
+    cursor = index + match[0].length;
+  }
+  pushText(readable.slice(cursor));
+  return {
+    text: bodyParts.join('').trim(),
+    formattedText: htmlParts.join('').trim(),
+    mentionUserIds: [...mentionUserIds],
+    mentionsRoom,
+  };
+}
+
+function qqMentionContext(
+  message: QQBotInboundMessage,
+  config: MatrixBridgeConfig,
+): QqMentionContext {
+  const names = new Map<string, string>();
+  let mentionsRoom = false;
+  const raw: Record<string, unknown> = isRecord(message.raw) ? message.raw : {};
+  const mentions = Array.isArray(message.mentions)
+    ? message.mentions
+    : Array.isArray(raw['mentions'])
+      ? raw['mentions']
+      : [];
+  for (const item of mentions) {
+    if (!isRecord(item)) {
+      continue;
+    }
+    if (item['scope'] === 'all') {
+      mentionsRoom = true;
+    }
+    const displayName =
+      nonEmptyString(item['nickname']) ?? nonEmptyString(item['username']);
+    if (displayName === undefined) {
+      continue;
+    }
+    for (const key of ['id', 'user_openid', 'member_openid']) {
+      const id = nonEmptyString(item[key]);
+      if (id !== undefined) {
+        names.set(id, cleanQqDisplayName(displayName));
+      }
+    }
+  }
+  return {
+    names,
+    mentionsRoom,
+    identitySecret: config.identitySecret,
+    domain: config.domain,
+    userPrefix: config.userPrefix,
+  };
 }
 
 function truncateStructuredText(value: string, limit: number): string {
@@ -232,7 +369,8 @@ function structuredElementSender(node: Record<string, unknown>): string | undefi
   if (!isRecord(author)) {
     return undefined;
   }
-  return nonEmptyString(author['username']) ?? nonEmptyString(author['nickname']);
+  const name = nonEmptyString(author['username']) ?? nonEmptyString(author['nickname']);
+  return name === undefined ? undefined : cleanQqDisplayName(name);
 }
 
 /**
@@ -322,6 +460,114 @@ function structuredElements(message: QQBotInboundMessage): unknown[] {
   return Array.isArray(rawElements) ? rawElements : [];
 }
 
+function sceneExtValues(message: QQBotInboundMessage): string[] {
+  const values: string[] = [];
+  const normalized = message.messageScene?.ext;
+  if (Array.isArray(normalized)) {
+    values.push(...normalized.filter((value): value is string => typeof value === 'string'));
+  }
+  const raw: Record<string, unknown> = isRecord(message.raw) ? message.raw : {};
+  const rawScene = raw['message_scene'];
+  if (isRecord(rawScene) && Array.isArray(rawScene['ext'])) {
+    values.push(
+      ...rawScene['ext'].filter(
+        (value): value is string => typeof value === 'string',
+      ),
+    );
+  }
+  return values;
+}
+
+function normalizedIndexName(value: string): string {
+  return value.trim().toLowerCase().replace(/[_-]/g, '');
+}
+
+function sceneIndex(entry: string, names: Set<string>): string | undefined {
+  const separator = entry.search(/[=:]/);
+  if (separator <= 0) {
+    return undefined;
+  }
+  const name = entry.slice(0, separator);
+  if (!names.has(normalizedIndexName(name))) {
+    return undefined;
+  }
+  const value = entry.slice(separator + 1).trim();
+  return value === '' ? undefined : value;
+}
+
+function collectElementIndexes(
+  nodes: unknown,
+  indexes: string[],
+  depth = 0,
+): void {
+  if (!Array.isArray(nodes) || depth > STRUCTURED_MAX_DEPTH) {
+    return;
+  }
+  for (const node of nodes) {
+    if (!isRecord(node)) {
+      continue;
+    }
+    const index = nonEmptyString(node['msg_idx']);
+    if (index !== undefined) {
+      indexes.push(index);
+    }
+    collectElementIndexes(node['msg_elements'], indexes, depth + 1);
+  }
+}
+
+function uniqueIndexes(indexes: Array<string | undefined>): string[] {
+  const unique = new Set<string>();
+  for (const index of indexes) {
+    if (index !== undefined && index !== '') {
+      unique.add(index);
+    }
+  }
+  return [...unique];
+}
+
+/** 收集 QQ 引用消息可能使用的全部引用索引。 */
+function quoteReferenceCandidates(message: QQBotInboundMessage): string[] {
+  const indexes: Array<string | undefined> = [message.refMsgIdx];
+  const raw: Record<string, unknown> = isRecord(message.raw) ? message.raw : {};
+  for (const key of ['ref_msg_idx', 'refMsgIdx', 'ref_idx', 'reference_msg_idx']) {
+    indexes.push(nonEmptyString(raw[key]));
+  }
+  const referenceNames = new Set([
+    'refmsgidx',
+    'refidx',
+    'referencemsgidx',
+    'referenceidx',
+  ]);
+  for (const entry of sceneExtValues(message)) {
+    indexes.push(sceneIndex(entry, referenceNames));
+  }
+  const messageType =
+    typeof message.msgType === 'number'
+      ? message.msgType
+      : typeof raw['message_type'] === 'number'
+        ? raw['message_type']
+        : undefined;
+  if (messageType === 103 || uniqueIndexes(indexes).length > 0) {
+    const elements: string[] = [];
+    collectElementIndexes(structuredElements(message), elements);
+    indexes.push(...elements);
+  }
+  return uniqueIndexes(indexes);
+}
+
+/** 收集当前 QQ 消息可保存的索引别名，`message.msgIdx` 最后写入并作为规范值。 */
+function currentMessageReferenceAliases(message: QQBotInboundMessage): string[] {
+  const indexes: Array<string | undefined> = [];
+  const raw: Record<string, unknown> = isRecord(message.raw) ? message.raw : {};
+  indexes.push(nonEmptyString(raw['msg_idx']));
+  const messageIndexNames = new Set(['msgidx', 'messageidx']);
+  for (const entry of sceneExtValues(message)) {
+    indexes.push(sceneIndex(entry, messageIndexNames));
+  }
+  indexes.push(message.msgIdx);
+  return uniqueIndexes(indexes);
+}
+
 /**
  * 把 QQ 结构化消息（`message_type=3/101/102/103`）压缩为有界文本与附件。
  *
@@ -329,9 +575,13 @@ function structuredElements(message: QQBotInboundMessage): unknown[] {
  * 只进入引用 fallback，不重复写入正文；其余元素按文档顺序合并进正文。
  * 所有遍历都受深度、元素数、附件数和文本长度限制，超限时截断并标记。
  */
-function extractStructuredMessage(message: QQBotInboundMessage): StructuredMessageContent {
+function extractStructuredMessage(
+  message: QQBotInboundMessage,
+  mentionContext: QqMentionContext,
+): StructuredMessageContent {
   const elements = structuredElements(message);
-  const refIndex = message.refMsgIdx;
+  const quoteCandidates = quoteReferenceCandidates(message);
+  const refIndex = quoteCandidates[0];
   const raw: Record<string, unknown> = isRecord(message.raw) ? message.raw : {};
   const messageType =
     typeof message.msgType === 'number'
@@ -342,25 +592,49 @@ function extractStructuredMessage(message: QQBotInboundMessage): StructuredMessa
   const hasIndexedQuote =
     refIndex !== undefined &&
     elements.some(
-      (element) => isRecord(element) && nonEmptyString(element['msg_idx']) === refIndex,
+      (element) =>
+        isRecord(element) && quoteCandidates.includes(nonEmptyString(element['msg_idx']) ?? ''),
     );
   const quoteAsWhole = refIndex !== undefined && (messageType === 103 || !hasIndexedQuote);
 
   const bodyParts: string[] = [];
+  const bodyFormattedParts: string[] = [];
   const quoteParts: string[] = [];
+  const quoteFormattedParts: string[] = [];
   const attachments: QqAttachment[] = [];
   const seenAttachments = new Set<string>();
+  const mentionUserIds = new Set<string>();
+  const quoteMentionUserIds = new Set<string>();
   let quoteAttachment: QqAttachment | undefined;
   let quoteSender: string | undefined;
+  let mentionsRoom = false;
+  let quoteMentionsRoom = false;
   let visited = 0;
   let truncated = false;
 
-  const pushText = (parts: string[], value: string): void => {
-    const text = value.trim();
+  const pushText = (
+    parts: string[],
+    formattedParts: string[],
+    value: RenderedQqContent,
+    target: 'body' | 'quote',
+  ): void => {
+    const text = value.text.trim();
     if (text === '' || parts.includes(text)) {
       return;
     }
     parts.push(text);
+    formattedParts.push(value.formattedText);
+    if (target === 'body') {
+      for (const userId of value.mentionUserIds) {
+        mentionUserIds.add(userId);
+      }
+      mentionsRoom ||= value.mentionsRoom;
+    } else {
+      for (const userId of value.mentionUserIds) {
+        quoteMentionUserIds.add(userId);
+      }
+      quoteMentionsRoom ||= value.mentionsRoom;
+    }
   };
 
   const addAttachment = (attachment: QqAttachment): void => {
@@ -378,11 +652,11 @@ function extractStructuredMessage(message: QQBotInboundMessage): StructuredMessa
 
   const topContent = nonEmptyString(message.content);
   if (topContent !== undefined) {
-    pushText(bodyParts, renderQqContent(topContent));
+    pushText(bodyParts, bodyFormattedParts, renderQqContent(topContent, mentionContext), 'body');
   }
   const arkText = arkFallbackText(raw['ark_data']);
   if (arkText !== undefined) {
-    pushText(bodyParts, arkText);
+    pushText(bodyParts, bodyFormattedParts, renderQqContent(arkText, mentionContext), 'body');
   }
   for (const attachment of normalizeAttachments(message.attachments)) {
     addAttachment(attachment);
@@ -411,13 +685,25 @@ function extractStructuredMessage(message: QQBotInboundMessage): StructuredMessa
         (refIndex !== undefined && nonEmptyString(node['msg_idx']) === refIndex);
       const target = quoted ? 'quote' : 'body';
       const targetParts = target === 'quote' ? quoteParts : bodyParts;
+      const targetFormattedParts =
+        target === 'quote' ? quoteFormattedParts : bodyFormattedParts;
       const content = nonEmptyString(node['content']);
       if (content !== undefined) {
-        pushText(targetParts, renderQqContent(content));
+        pushText(
+          targetParts,
+          targetFormattedParts,
+          renderQqContent(content, mentionContext),
+          target,
+        );
       } else {
         const arkText = arkFallbackText(node['ark_data']);
         if (arkText !== undefined) {
-          pushText(targetParts, arkText);
+          pushText(
+            targetParts,
+            targetFormattedParts,
+            renderQqContent(arkText, mentionContext),
+            target,
+          );
         }
       }
       if (target === 'quote') {
@@ -449,13 +735,25 @@ function extractStructuredMessage(message: QQBotInboundMessage): StructuredMessa
       quoteAttachment.filename === undefined
         ? `[${quoteAttachment.content_type}]`
         : `[${quoteAttachment.content_type}: ${quoteAttachment.filename}]`;
+    quoteFormattedParts.push(escapeHtml(quoteExcerpt));
   }
+  const hasBodyMentions = mentionUserIds.size > 0 || mentionsRoom;
 
   return {
     text: truncateStructuredText(bodyText, STRUCTURED_MAX_TEXT_LENGTH),
+    ...(hasBodyMentions
+      ? { formattedText: bodyFormattedParts.join('<br/>') }
+      : {}),
     ...(quoteExcerpt === undefined ? {} : { quoteExcerpt }),
+    ...(quoteFormattedParts.length === 0
+      ? {}
+      : { quoteFormattedExcerpt: quoteFormattedParts.join('<br/>') }),
     ...(quoteSender === undefined ? {} : { quoteSender }),
     attachments,
+    mentionUserIds: [...mentionUserIds],
+    mentionsRoom,
+    quoteMentionUserIds: [...quoteMentionUserIds],
+    quoteMentionsRoom,
     truncated,
   };
 }
@@ -487,6 +785,10 @@ function quoteFallback(sender: string, excerpt: string): string {
     .split('\n')
     .map((line) => `> ${line}`);
   return [`> ${sender}`, ...lines].join('\n');
+}
+
+function quoteFallbackHtml(sender: string, formattedExcerpt: string): string {
+  return `<blockquote>${escapeHtml(sender)}<br/>${formattedExcerpt}</blockquote>`;
 }
 
 function isTerminalRecallError(error: unknown): boolean {
@@ -820,25 +1122,70 @@ export class QqMatrixBridge {
     // 发送前必须确保其 membership 为 join，否则 homeserver 会拒绝事件。
     await this.ensureGhostJoined(room.roomId, ghostUserId);
 
-    const structured = extractStructuredMessage(message);
+    const mentionContext = qqMentionContext(message, this.config);
+    const structured = extractStructuredMessage(message, mentionContext);
     if (structured.truncated) {
       this.logger.debug('QQ 结构化消息超出限制，已截断', {
         kind: message.kind,
         msgType: message.msgType ?? null,
       });
     }
-    const quoted = message.refMsgIdx === undefined
-      ? undefined
-      : this.store.getReference(message.refMsgIdx);
+    let quoted: ReturnType<BridgeStore['getReference']> = undefined;
+    for (const candidate of quoteReferenceCandidates(message)) {
+      quoted = this.store.getReference(candidate);
+      if (quoted !== undefined) {
+        break;
+      }
+    }
+    if (quoted === undefined && structured.quoteExcerpt !== undefined) {
+      quoted = this.store.findReferenceByQuote({
+        roomId: room.roomId,
+        ...(structured.quoteSender === undefined
+          ? {}
+          : { sender: structured.quoteSender }),
+        excerpt: structured.quoteExcerpt,
+      });
+    }
     const replyContent: JsonObject =
       quoted === undefined
         ? {}
         : { 'm.relates_to': { rel_type: 'm.in_reply_to', event_id: quoted.matrixEventId } };
-    const quotedSender = structured.quoteSender ?? senderDisplayName;
-    const body =
-      structured.quoteExcerpt === undefined || quoted !== undefined
-        ? structured.text
-        : `${quoteFallback(quotedSender, structured.quoteExcerpt)}\n\n${structured.text}`;
+    const hasQuoteFallback =
+      structured.quoteExcerpt !== undefined && quoted === undefined;
+    const quotedSender = cleanQqDisplayName(structured.quoteSender ?? senderDisplayName);
+    const body = hasQuoteFallback
+      ? `${quoteFallback(quotedSender, structured.quoteExcerpt ?? '')}\n\n${structured.text}`
+      : structured.text;
+    const mentionUserIds = new Set(structured.mentionUserIds);
+    let mentionsRoom = structured.mentionsRoom;
+    let formattedBody = structured.formattedText;
+    if (hasQuoteFallback) {
+      for (const userId of structured.quoteMentionUserIds) {
+        mentionUserIds.add(userId);
+      }
+      mentionsRoom ||= structured.quoteMentionsRoom;
+      const formattedExcerpt =
+        structured.quoteFormattedExcerpt ?? escapeHtml(structured.quoteExcerpt ?? '');
+      const fallbackHtml = quoteFallbackHtml(quotedSender, formattedExcerpt);
+      formattedBody =
+        formattedBody === undefined
+          ? fallbackHtml
+          : `${fallbackHtml}<br/><br/>${formattedBody}`;
+    }
+    const mentions: JsonObject = {
+      ...(mentionUserIds.size === 0
+        ? {}
+        : { user_ids: [...mentionUserIds] }),
+      ...(mentionsRoom ? { room: true } : {}),
+    };
+    const formattedContent: JsonObject =
+      formattedBody === undefined
+        ? {}
+        : {
+            format: 'org.matrix.custom.html',
+            formatted_body: formattedBody,
+            ...(Object.keys(mentions).length === 0 ? {} : { 'm.mentions': mentions }),
+          };
 
     let sent = false;
     let firstMatrixEventId: string | undefined;
@@ -849,6 +1196,7 @@ export class QqMatrixBridge {
         {
           msgtype: 'm.text',
           body,
+          ...formattedContent,
           'org.al1s.qq.sender': senderDisplayName,
           'org.al1s.qq.message_id': message.messageId,
           ...replyContent,
@@ -884,13 +1232,19 @@ export class QqMatrixBridge {
     if (!sent) {
       this.metrics?.recordQqMessage(message.kind, 'ignored');
       this.logger.debug('QQ 消息没有可转发内容', { kind: message.kind });
-    } else if (message.msgIdx !== undefined && firstMatrixEventId !== undefined) {
-      await this.store.rememberReference({
-        qqReference: message.msgIdx,
-        matrixEventId: firstMatrixEventId,
-        sender: senderDisplayName,
-        excerpt: (structured.text.trim() || structured.quoteExcerpt || '').slice(0, 500),
-      });
+    } else if (firstMatrixEventId !== undefined) {
+      const aliases = currentMessageReferenceAliases(message);
+      if (aliases.length > 0) {
+        await this.store.rememberReferences(
+          aliases.map((qqReference) => ({
+            qqReference,
+            matrixEventId: firstMatrixEventId,
+            sender: senderDisplayName,
+            excerpt: (structured.text.trim() || structured.quoteExcerpt || '').slice(0, 500),
+            roomId: room.roomId,
+          })),
+        );
+      }
     }
     if (sent) {
       this.metrics?.recordQqMessage(message.kind, 'forwarded');
@@ -996,7 +1350,7 @@ export class QqMatrixBridge {
   private qqSenderDisplayName(message: QQBotInboundMessage): string {
     const senderName = nonEmptyString(message.senderName);
     if (senderName !== undefined) {
-      return senderName.trim();
+      return cleanQqDisplayName(senderName);
     }
     const raw = isRecord(message.raw) ? message.raw : undefined;
     const author = raw === undefined ? undefined : raw['author'];
@@ -1004,7 +1358,7 @@ export class QqMatrixBridge {
     const username =
       authorRecord === undefined ? undefined : nonEmptyString(authorRecord['username']);
     if (username !== undefined) {
-      return username.trim();
+      return cleanQqDisplayName(username);
     }
     return `QQ 用户 ${digest(this.config.identitySecret, message.senderId, 8)}`;
   }

@@ -58,6 +58,10 @@ const GROUP_OPENID = 'TUWUNEL-CHECK-GROUP';
 const QQ_USER_ID = 'TUWUNEL-CHECK-QQ-USER';
 const QQ_MESSAGE_ID = 'tuwunel-check-qq-message';
 const QQ_BODY = 'QQ -> Matrix integration check';
+const MENTION_QQ_USER_ID = 'TUWUNEL-CHECK-MENTION-USER';
+const MENTION_QQ_MESSAGE_ID = 'tuwunel-check-mention-message';
+const MENTION_QQ_NICKNAME = 'Matrix 目标';
+const MENTION_QQ_BODY = `你好 <@${MENTION_QQ_USER_ID}>`;
 const STRUCTURED_QQ_MESSAGE_ID = 'tuwunel-check-structured-message';
 const STRUCTURED_QQ_BODY = '结构化首条\n结构化嵌套条';
 const QQ_MEDIA_MESSAGE_ID = 'tuwunel-check-media-message';
@@ -466,6 +470,45 @@ function groupMessage(): QQBotInboundMessage {
         bot: false,
       },
       group_openid: GROUP_OPENID,
+    },
+  };
+}
+
+function mentionGroupMessage(): QQBotInboundMessage {
+  const timestamp = new Date().toISOString();
+  const mentions = [
+    {
+      id: MENTION_QQ_USER_ID,
+      user_openid: MENTION_QQ_USER_ID,
+      nickname: MENTION_QQ_NICKNAME,
+    },
+  ];
+  return {
+    rawEventType: 'GROUP_AT_MESSAGE_CREATE',
+    kind: 'group',
+    senderId: QQ_USER_ID,
+    senderName: 'Tuwunel check user',
+    content: MENTION_QQ_BODY,
+    messageId: MENTION_QQ_MESSAGE_ID,
+    timestamp,
+    groupOpenid: GROUP_OPENID,
+    mentions,
+    replyTarget: {
+      scope: 'group',
+      targetId: GROUP_OPENID,
+      msgId: MENTION_QQ_MESSAGE_ID,
+    },
+    raw: {
+      id: MENTION_QQ_MESSAGE_ID,
+      content: MENTION_QQ_BODY,
+      timestamp,
+      author: {
+        member_openid: QQ_USER_ID,
+        username: 'Tuwunel check user',
+        bot: false,
+      },
+      group_openid: GROUP_OPENID,
+      mentions,
     },
   };
 }
@@ -991,6 +1034,42 @@ async function main(): Promise<void> {
       return event;
     });
     check('ghost 文本已写入 Tuwunel', ghostEvent.event_id !== '');
+
+    await bridge.handleQqMessage(mentionGroupMessage());
+    const mentionEvent = await waitFor('QQ @ 消息 transaction', async () => {
+      const event = transactionEvents(transactions).find(
+        (candidate) =>
+          candidate.sender === ghostUserId &&
+          candidate.room_id === room.roomId &&
+          candidate.type === 'm.room.message' &&
+          stringField(candidate.content, 'body') === `你好 @${MENTION_QQ_NICKNAME}`,
+      );
+      if (event === undefined) {
+        throw new Error('尚未收到对应事件');
+      }
+      return event;
+    });
+    const mentionGhostUserId = `@${deriveGhostLocalpart(
+      identitySecret,
+      MENTION_QQ_USER_ID,
+      userPrefix,
+    )}:${DOMAIN}`;
+    const mentionsValue = mentionEvent.content['m.mentions'];
+    const mentionUserIds =
+      mentionsValue !== null &&
+      typeof mentionsValue === 'object' &&
+      !Array.isArray(mentionsValue) &&
+      Array.isArray((mentionsValue as Record<string, unknown>)['user_ids'])
+        ? ((mentionsValue as Record<string, unknown>)['user_ids'] as unknown[])
+        : [];
+    check(
+      'QQ @ 消息写入 Tuwunel 的 Matrix HTML 与提及元数据',
+      stringField(mentionEvent.content, 'format') === 'org.matrix.custom.html' &&
+        (stringField(mentionEvent.content, 'formatted_body') ?? '').includes(
+          `href="https://matrix.to/#/${encodeURIComponent(mentionGhostUserId)}"`,
+        ) &&
+        mentionUserIds.includes(mentionGhostUserId),
+    );
 
     await bridge.handleQqMessage(referencedGroupMessage());
     const referenceEvent = await waitFor('QQ 引用目标 transaction', async () => {

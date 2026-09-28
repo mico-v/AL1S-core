@@ -1377,6 +1377,206 @@ check(
   `events=${String(attachmentTypeEvents.length)}`,
 );
 
+const mentionQqId = 'FA6F3D21B02696DB5DEAA657CEB222C1';
+const unknownMentionQqId = '49906B931042A92105EBA8B131F65247';
+const expectedMentionGhost = `@${deriveGhostLocalpart(
+  bridgeConfig.identitySecret,
+  mentionQqId,
+  bridgeConfig.userPrefix,
+)}:${bridgeConfig.domain}`;
+const expectedUnknownMentionGhost = `@${deriveGhostLocalpart(
+  bridgeConfig.identitySecret,
+  unknownMentionQqId,
+  bridgeConfig.userPrefix,
+)}:${bridgeConfig.domain}`;
+await bridge.handleQqMessage({
+  ...groupMessage(
+    'qq-mention-render',
+    'QQ-SENDER-1',
+    `你好 <@${mentionQqId}>，也请 <@${unknownMentionQqId}> 看看`,
+    undefined,
+    'GROUP-MENTION',
+  ),
+  mentions: [
+    {
+      id: mentionQqId,
+      member_openid: mentionQqId,
+      nickname: '目标<&用户>',
+    },
+  ],
+});
+const mentionEvent = lastSentBody();
+const mentionBody = bodyTextOf(mentionEvent);
+const mentionHtml =
+  typeof mentionEvent?.['formatted_body'] === 'string'
+    ? mentionEvent['formatted_body']
+    : '';
+const mentionUserIds =
+  typeof mentionEvent?.['m.mentions'] === 'object' &&
+  mentionEvent['m.mentions'] !== null &&
+  Array.isArray((mentionEvent['m.mentions'] as Record<string, unknown>)['user_ids'])
+    ? ((mentionEvent['m.mentions'] as Record<string, unknown>)['user_ids'] as unknown[])
+    : [];
+check(
+  'QQ @ 用户映射为可读 Matrix 提及时不泄漏 openid',
+  mentionBody.startsWith('你好 @目标<&用户>，也请 @QQ用户_') &&
+    !mentionBody.includes('<@') &&
+    !mentionBody.includes(mentionQqId) &&
+    !mentionBody.includes(unknownMentionQqId),
+  `body=${mentionBody}`,
+);
+check(
+  'QQ @ 用户生成 Matrix HTML 链接与 m.mentions',
+  mentionEvent?.['format'] === 'org.matrix.custom.html' &&
+    mentionHtml.includes(
+      `href="https://matrix.to/#/${encodeURIComponent(expectedMentionGhost)}"`,
+    ) &&
+    mentionHtml.includes('目标&lt;&amp;用户&gt;') &&
+    mentionHtml.includes(
+      `href="https://matrix.to/#/${encodeURIComponent(expectedUnknownMentionGhost)}"`,
+    ) &&
+    mentionUserIds.includes(expectedMentionGhost) &&
+    mentionUserIds.includes(expectedUnknownMentionGhost),
+  `html=${mentionHtml}`,
+);
+
+const rawSceneReference = 'REFIDX-raw-scene-reference';
+await bridge.handleQqMessage(
+  structuredGroupMessage(
+    'qq-raw-scene-reference-target',
+    'QQ-SENDER-2',
+    '原始场景索引引用目标',
+    {
+      message_type: 0,
+      message_scene: { source: 'default', ext: [`msg_idx=${rawSceneReference}`] },
+    },
+    'GROUP-RAW-REFERENCE',
+  ),
+);
+const rawSceneReferenceEventId =
+  store.getReference(rawSceneReference)?.matrixEventId;
+await bridge.handleQqMessage(
+  structuredGroupMessage(
+    'qq-raw-scene-reference-quote',
+    'QQ-SENDER-1',
+    '使用原始场景索引回复',
+    {
+      message_type: 103,
+      msg_elements: [{ message_type: 0, content: '原始场景索引引用目标' }],
+      message_scene: {
+        source: 'default',
+        ext: [`ref_msg_idx=${rawSceneReference}`],
+      },
+    },
+    'GROUP-RAW-REFERENCE',
+  ),
+);
+const rawSceneQuoteEvent = matrixState.sentEvents.at(-1) as
+  | { body?: { body?: string; 'm.relates_to'?: { event_id?: string } } }
+  | undefined;
+check(
+  '引用索引仅存在于原始 message_scene.ext 时仍映射到 Matrix',
+  rawSceneQuoteEvent?.body?.['m.relates_to']?.event_id === rawSceneReferenceEventId &&
+    rawSceneQuoteEvent?.body?.body === '使用原始场景索引回复',
+);
+
+const nestedReference = 'REFIDX-nested-element-reference';
+await bridge.handleQqMessage(
+  structuredGroupMessage(
+    'qq-nested-reference-target',
+    'QQ-SENDER-2',
+    '嵌套索引引用目标',
+    {
+      message_type: 0,
+      message_scene: { source: 'default', ext: [`msg_idx=${nestedReference}`] },
+    },
+    'GROUP-NESTED-REFERENCE',
+  ),
+);
+const nestedReferenceEventId = store.getReference(nestedReference)?.matrixEventId;
+await bridge.handleQqMessage({
+  ...structuredGroupMessage(
+    'qq-nested-reference-quote',
+    'QQ-SENDER-1',
+    '从嵌套元素读取索引',
+    {
+      message_type: 103,
+      msg_elements: [
+        {
+          msg_idx: nestedReference,
+          message_type: 0,
+          content: '嵌套索引引用目标',
+        },
+      ],
+      message_scene: {
+        source: 'default',
+        ext: ['ref_msg_idx=TMP_nested-reference'],
+      },
+    },
+    'GROUP-NESTED-REFERENCE',
+  ),
+  refMsgIdx: 'TMP_nested-reference',
+});
+const nestedQuoteEvent = matrixState.sentEvents.at(-1) as
+  | { body?: { body?: string; 'm.relates_to'?: { event_id?: string } } }
+  | undefined;
+check(
+  'QQ 引用索引仅存在于 msg_elements 时仍映射到 Matrix',
+  nestedQuoteEvent?.body?.['m.relates_to']?.event_id === nestedReferenceEventId &&
+    nestedQuoteEvent?.body?.body === '从嵌套元素读取索引',
+);
+
+const fallbackReference = 'REFIDX-tmp-fallback-reference';
+const fallbackTargetText = '需要精确回退匹配的引用正文';
+await bridge.handleQqMessage(
+  structuredGroupMessage(
+    'qq-tmp-fallback-target',
+    'QQ-SENDER-2',
+    fallbackTargetText,
+    {
+      message_type: 0,
+      message_scene: { source: 'default', ext: [`msg_idx=${fallbackReference}`] },
+    },
+    'GROUP-TMP-FALLBACK',
+  ),
+);
+const fallbackTargetEventId = store.getReference(fallbackReference)?.matrixEventId;
+await bridge.handleQqMessage({
+  ...structuredGroupMessage(
+    'qq-tmp-fallback-quote',
+    'QQ-SENDER-1',
+    'TMP 引用也应正确回复',
+    {
+      message_type: 103,
+      msg_elements: [
+        {
+          message_type: 0,
+          author: { username: '<测试用户>' },
+          content: fallbackTargetText,
+        },
+      ],
+      message_scene: {
+        source: 'default',
+        ext: ['ref_msg_idx=TMP_xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx'],
+      },
+    },
+    'GROUP-TMP-FALLBACK',
+  ),
+  refMsgIdx: 'TMP_xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx',
+});
+const fallbackQuoteEvent = matrixState.sentEvents.at(-1) as
+  | { body?: { body?: string; 'm.relates_to'?: { event_id?: string } } }
+  | undefined;
+check(
+  'QQ TMP 引用索引通过同房间发送者与正文回退映射',
+  fallbackTargetEventId !== undefined &&
+    fallbackQuoteEvent?.body?.['m.relates_to']?.event_id === fallbackTargetEventId &&
+    fallbackQuoteEvent.body?.body === 'TMP 引用也应正确回复' &&
+    !(fallbackQuoteEvent.body?.body ?? '').includes('>') &&
+    !(fallbackQuoteEvent.body?.body ?? '').includes('TMP_'),
+  `body=${fallbackQuoteEvent?.body?.body ?? ''}`,
+);
+
 await bridge.handleQqMessage({
   ...groupMessage(
     'qq-structured-target',
@@ -2360,6 +2560,47 @@ check(
   '重启后持久化清理过期引用映射',
   Object.keys(historyState.references).length === 0 &&
     Object.keys(historyState.matrixReferences).length === 0,
+);
+
+const legacyReferenceFile = join(dataDir, 'legacy-reference-state.json');
+const legacyReferenceNow = Date.parse('2026-09-27T00:00:00.000Z');
+const legacyReferenceWriter = new BridgeStore({
+  file: legacyReferenceFile,
+  secret: bridgeConfig.identitySecret,
+  logger: silentLogger,
+  now: () => legacyReferenceNow,
+});
+await legacyReferenceWriter.rememberReference({
+  qqReference: 'REF-LEGACY-FALLBACK',
+  matrixEventId: '$legacy-fallback',
+  sender: '旧状态用户',
+  excerpt: '旧状态仍可回退匹配的引用正文',
+  roomId: '!legacy:matrix.test',
+});
+await legacyReferenceWriter.flush();
+const legacyReferenceState = JSON.parse(readFileSync(legacyReferenceFile, 'utf8')) as {
+  references: Record<string, Record<string, unknown>>;
+};
+for (const stored of Object.values(legacyReferenceState.references)) {
+  delete stored.qqReference;
+  delete stored.roomId;
+}
+writeFileSync(legacyReferenceFile, `${JSON.stringify(legacyReferenceState, null, 2)}\n`);
+const legacyReferenceReader = new BridgeStore({
+  file: legacyReferenceFile,
+  secret: bridgeConfig.identitySecret,
+  logger: silentLogger,
+  now: () => legacyReferenceNow,
+});
+const legacyReferenceMatch = legacyReferenceReader.findReferenceByQuote({
+  roomId: '!legacy:matrix.test',
+  sender: '旧状态用户',
+  excerpt: '旧状态仍可回退匹配的引用正文',
+});
+check(
+  '旧引用记录缺少索引字段时仍可回退匹配',
+  legacyReferenceMatch?.matrixEventId === '$legacy-fallback' &&
+    legacyReferenceMatch.qqReference === '',
 );
 
 // ---------------------------------------------------------------------------

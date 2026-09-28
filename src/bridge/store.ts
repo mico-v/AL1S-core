@@ -82,6 +82,8 @@ interface StoredReference {
   matrixEventId: string;
   sender: string;
   excerpt: string;
+  qqReference?: string;
+  roomId?: string;
   createdAt: string;
 }
 
@@ -152,6 +154,8 @@ export interface BridgeReference {
   matrixEventId: string;
   sender: string;
   excerpt: string;
+  /** 新引用会记录来源房间；旧状态没有该字段时仍可通过精确索引查询。 */
+  roomId?: string;
 }
 
 export interface PendingQqMessage {
@@ -260,8 +264,24 @@ function isStoredReference(value: unknown): value is StoredReference {
     typeof value.matrixEventId === 'string' &&
     typeof value.sender === 'string' &&
     typeof value.excerpt === 'string' &&
+    (value.qqReference === undefined || typeof value.qqReference === 'string') &&
+    (value.roomId === undefined || typeof value.roomId === 'string') &&
     typeof value.createdAt === 'string'
   );
+}
+
+function normalizeReferenceText(value: string): string {
+  return value
+    .replace(/\r\n?/g, '\n')
+    .split('\n')
+    .map((line) => line.replace(/^>\s?/, '').trim())
+    .filter((line) => line !== '')
+    .join('\n')
+    .replace(/[ \t]+/g, ' ');
+}
+
+function normalizeReferenceSender(value: string): string {
+  return value.replace(/[<>]/g, '').replace(/\s+/g, ' ').trim();
 }
 
 function isStoredPendingQqMessage(value: unknown): value is StoredPendingQqMessage {
@@ -758,7 +778,76 @@ export class BridgeStore {
       matrixEventId: this.decrypt(stored.matrixEventId),
       sender: this.decrypt(stored.sender),
       excerpt: this.decrypt(stored.excerpt),
+      ...(stored.roomId === undefined ? {} : { roomId: this.decrypt(stored.roomId) }),
     };
+  }
+
+  /**
+   * 按同房间发送者与引用摘录回退匹配。
+   *
+   * QQ 有时只提供 `TMP_*` 引用索引，而消息正文与引用元素仍包含可信内容。
+   * 仅返回唯一匹配，避免短文本或同房间重复内容造成错误关联。
+   */
+  findReferenceByQuote(options: {
+    roomId: string;
+    sender?: string;
+    excerpt: string;
+  }): BridgeReference | undefined {
+    const excerpt = normalizeReferenceText(options.excerpt);
+    if (excerpt === '') {
+      return undefined;
+    }
+    const sender =
+      options.sender === undefined ? undefined : normalizeReferenceSender(options.sender);
+    const references = Object.values(this.state.references)
+      .filter((stored) => !this.isReferenceExpired(stored))
+      .map((stored) => ({
+        reference: {
+          // 旧状态未持久化原索引；回退调用只需要 Matrix event ID。
+          qqReference:
+            stored.qqReference === undefined ? '' : this.decrypt(stored.qqReference),
+          matrixEventId: this.decrypt(stored.matrixEventId),
+          sender: this.decrypt(stored.sender),
+          excerpt: this.decrypt(stored.excerpt),
+          ...(stored.roomId === undefined ? {} : { roomId: this.decrypt(stored.roomId) }),
+        },
+        createdAt: this.referenceCreatedAt(stored),
+      }))
+      .sort((left, right) => right.createdAt - left.createdAt)
+      .map(({ reference }) => reference)
+      .filter(
+        (reference) => reference.roomId === undefined || reference.roomId === options.roomId,
+      );
+
+    const withMatchingSender = (candidates: BridgeReference[]): BridgeReference[] =>
+      sender === undefined
+        ? candidates
+        : candidates.filter(
+            (reference) => normalizeReferenceSender(reference.sender) === sender,
+          );
+    const exact = withMatchingSender(
+      references.filter(
+        (reference) => normalizeReferenceText(reference.excerpt) === excerpt,
+      ),
+    );
+    if (exact.length === 1) {
+      return exact[0];
+    }
+    if (exact.length > 1) {
+      return undefined;
+    }
+
+    const contained = withMatchingSender(
+      references.filter((reference) => {
+        const candidate = normalizeReferenceText(reference.excerpt);
+        return (
+          candidate.length >= 4 &&
+          excerpt.length >= 4 &&
+          (candidate.includes(excerpt) || excerpt.includes(candidate))
+        );
+      }),
+    );
+    return contained.length === 1 ? contained[0] : undefined;
   }
 
   getQqReference(matrixEventId: string): string | undefined {
@@ -783,16 +872,41 @@ export class BridgeStore {
   }
 
   async rememberReference(reference: BridgeReference): Promise<void> {
-    this.trimReferencesToCapacity(1);
-    const referenceKey = this.indexKey('qq-reference', reference.qqReference);
-    this.state.references[referenceKey] = {
-      matrixEventId: this.encrypt(reference.matrixEventId),
-      sender: this.encrypt(reference.sender),
-      excerpt: this.encrypt(reference.excerpt),
-      createdAt: new Date(this.now()).toISOString(),
-    };
-    this.state.matrixReferences[this.indexKey('matrix-reference', reference.matrixEventId)] =
-      this.encrypt(reference.qqReference);
+    await this.rememberReferences([reference]);
+  }
+
+  /**
+   * 同时保存一条 QQ 消息的全部可查询索引；最后一个索引作为 Matrix 回推时
+   * 使用的规范引用。
+   */
+  async rememberReferences(references: BridgeReference[]): Promise<void> {
+    const unique = new Map<string, BridgeReference>();
+    for (const reference of references) {
+      if (reference.qqReference !== '') {
+        unique.set(reference.qqReference, reference);
+      }
+    }
+    if (unique.size === 0) {
+      return;
+    }
+    this.trimReferencesToCapacity(unique.size);
+    const createdAt = new Date(this.now()).toISOString();
+    for (const reference of unique.values()) {
+      const referenceKey = this.indexKey('qq-reference', reference.qqReference);
+      this.state.references[referenceKey] = {
+        matrixEventId: this.encrypt(reference.matrixEventId),
+        sender: this.encrypt(reference.sender),
+        excerpt: this.encrypt(reference.excerpt),
+        qqReference: this.encrypt(reference.qqReference),
+        ...(reference.roomId === undefined ? {} : { roomId: this.encrypt(reference.roomId) }),
+        createdAt,
+      };
+    }
+    const canonical = [...unique.values()].at(-1);
+    if (canonical !== undefined) {
+      this.state.matrixReferences[this.indexKey('matrix-reference', canonical.matrixEventId)] =
+        this.encrypt(canonical.qqReference);
+    }
     trimRecord(this.state.references, this.maxHistory);
     trimRecord(this.state.matrixReferences, this.maxHistory);
     await this.save();
@@ -854,9 +968,13 @@ export class BridgeStore {
 
   private deleteReference(referenceKey: string, reference: StoredReference): void {
     delete this.state.references[referenceKey];
-    delete this.state.matrixReferences[
-      this.indexKey('matrix-reference', this.decrypt(reference.matrixEventId))
-    ];
+    const matrixEventId = this.decrypt(reference.matrixEventId);
+    const retained = Object.values(this.state.references).some(
+      (candidate) => this.decrypt(candidate.matrixEventId) === matrixEventId,
+    );
+    if (!retained) {
+      delete this.state.matrixReferences[this.indexKey('matrix-reference', matrixEventId)];
+    }
     this.pendingSave = true;
   }
 
