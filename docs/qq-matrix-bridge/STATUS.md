@@ -25,7 +25,7 @@
 | Appservice transaction 服务 | DONE | `matrix:check` 覆盖鉴权、ACK、并发与幂等 |
 | Matrix API client | DONE | 创建、加入、发送、上传、下载通过 mock 检查；下载改用已鉴权媒体端点并通过真实 Tuwunel 验证 |
 | QQ 到 Matrix 文本 | DONE | 群聊、单聊、guild、DM 进入隔离 room，ghost 身份与会话键正确 |
-| Matrix 到 QQ 文本 | DONE | 发送者标签、被动回复窗口、回环防护及 guild/DM 出站目标正确 |
+| Matrix 到 QQ 文本 | DONE | 原正文转发、被动回复窗口、回环防护及 guild/DM 出站目标正确 |
 | 会话级并发控制 | DONE | 同一 QQ 会话并发首条消息只创建一个 Matrix room，且两条消息均投递成功 |
 | QQ 到 Matrix 媒体 | DONE | 离线检查覆盖图片上传与事件内容；真实 Tuwunel 验证上传、mxc 下载及字节一致性 |
 | Matrix 到 QQ 媒体 | DONE | 群聊/单聊覆盖 mxc 下载、类型和发送参数，真实 Tuwunel 验证回推后字节到达 QQ 端口；guild/DM 明确忽略并 ACK |

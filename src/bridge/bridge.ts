@@ -1140,7 +1140,6 @@ export class QqMatrixBridge {
 
     const msgtype = stringField(event.content, 'msgtype');
     const body = stringField(event.content, 'body') ?? '';
-    const senderLabel = `【Matrix: ${event.sender}】`;
 
     if (msgtype === 'm.text' || msgtype === 'm.notice') {
       if (body === '') {
@@ -1153,7 +1152,7 @@ export class QqMatrixBridge {
       const response = await this.sendQqWithRecovery(room, target, (currentTarget) =>
         this.bot.replyText(
           currentTarget,
-          `${senderLabel}${body}`,
+          body,
           messageReference === undefined ? undefined : { messageReference },
         ),
       );
@@ -1190,7 +1189,6 @@ export class QqMatrixBridge {
           fileType: mediaKind(downloaded.contentType, msgtype),
           buffer: downloaded.data,
           fileName: body || 'matrix-media',
-          content: senderLabel,
         }),
       );
       if (response.message !== undefined) {

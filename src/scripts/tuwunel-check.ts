@@ -1174,7 +1174,7 @@ async function main(): Promise<void> {
     });
     check(
       'bridge 已将 Matrix 消息交给 QQ 端口',
-      reply.content.startsWith(`【Matrix: ${ALLOWED_USER}】`),
+      reply.content === MATRIX_BODY,
     );
 
     section('房间成员管理');
@@ -1284,7 +1284,7 @@ async function main(): Promise<void> {
     });
     check(
       '重新邀请并加入后恢复 Matrix 到 QQ 转发',
-      rejoinedReply.content.startsWith(`【Matrix: ${ALLOWED_USER}】`),
+      rejoinedReply.content === MATRIX_REJOIN_BODY,
     );
 
     const matrixReplyEvent = await matrix.sendEvent(
@@ -1393,7 +1393,7 @@ async function main(): Promise<void> {
     check(
       'Matrix 媒体经 Tuwunel 下载后交给 QQ 端口',
       forwardedMedia.fileType === MediaFileType.IMAGE &&
-        forwardedMedia.content === `【Matrix: ${ALLOWED_USER}】`,
+        forwardedMedia.content === undefined,
     );
 
     section('Guild / DM');

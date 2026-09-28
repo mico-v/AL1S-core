@@ -1652,7 +1652,7 @@ await bridge.handleTransaction('txn-1', { events: [matrixTextEvent] });
 check(
   'Matrix 文本发送到 QQ',
   replies.length === matrixToQqReplyBase + 1 &&
-    replies[matrixToQqReplyBase]?.content === '【Matrix: @alice:matrix.test】hello QQ',
+    replies[matrixToQqReplyBase]?.content === 'hello QQ',
 );
 check(
   'Matrix 消息使用 QQ 被动回复窗口',
@@ -1770,8 +1770,8 @@ await bridge.handleTransaction('txn-4', {
 });
 check('Matrix 图片下载并发送到 QQ', media.length === 1);
 check(
-  'Matrix 媒体类型与发送者标签正确',
-  media[0]?.fileType === MediaFileType.IMAGE && media[0].content === '【Matrix: @bob:matrix.test】',
+  'Matrix 媒体类型正确且不附加发送者标签',
+  media[0]?.fileType === MediaFileType.IMAGE && media[0].content === undefined,
 );
 
 matrixState.powerLevels.users['@carol:matrix.test'] = 10;
@@ -1788,7 +1788,7 @@ await bridge.handleTransaction('txn-approved-member', {
 });
 check(
   '房间提升 power level 后批准成员可转发',
-  replies.at(-1)?.content === '【Matrix: @carol:matrix.test】approved member',
+  replies.at(-1)?.content === 'approved member',
 );
 
 const originalSendEvent = matrix.sendEvent;

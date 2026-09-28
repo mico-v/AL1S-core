@@ -181,8 +181,8 @@ curl -i -X POST \
   写入正文。元素附件按顺序转发，按 URL 去重，引用元素附件不重复转发。
 - 结构化解析全部有界：递归深度 4 层、最多 64 个元素、16 个附件、正文
   4096 字符、引用摘录 500 字符；超限时截断并追加 `[消息过长，已截断]`。
-- Matrix 文本发送到 QQ 时增加发送者标签；群聊使用
-  `【Matrix: @user:domain】正文`。
+- Matrix 文本按原正文发送到 QQ，不额外增加发送者标签；媒体消息也不把
+  发送者标签作为 caption。
 - Matrix 出站优先使用最近 QQ 入站消息的被动回复窗口，无窗口时转为主动消息。
 - 每条 QQ 入站消息拥有独立配额；收到新消息时，后续 Matrix 出站切换到
   该消息的被动回复窗口。
@@ -227,7 +227,7 @@ curl -i -X POST \
 - 实现 appservice transaction 服务、`hs_token` 校验和 transaction 幂等。
 - 实现 Matrix room 创建、alias 解析、ghost 加入和文本发送。
 - 实现 QQ 群聊/单聊/guild/DM 文本入站到 Matrix。
-- 实现 Matrix 文本出站到 QQ，包含发送者标签、guild/DM 路由和被动回复窗口。
+- 实现 Matrix 文本原样出站到 QQ，包含 guild/DM 路由和被动回复窗口。
 - 提供离线检查和 Tuwunel registration 示例。
 
 ### 阶段 2：媒体与消息语义
