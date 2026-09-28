@@ -1260,6 +1260,60 @@ check(
   `body=${historyBody}`,
 );
 
+const namedFaceTag = '<faceType=3,faceId="495",ext="eyJ0ZXh0Ijoi5YWU5p2lIn0=">';
+await bridge.handleQqMessage(
+  structuredGroupMessage('qq-face-name', 'QQ-SENDER-2', namedFaceTag, { message_type: 0 }),
+);
+check(
+  'QQ face 标签解码为可读表情名',
+  bodyTextOf(lastSentBody()) === '【表情: 兔来】',
+  `body=${bodyTextOf(lastSentBody())}`,
+);
+
+await bridge.handleQqMessage(
+  structuredGroupMessage(
+    'qq-face-malformed',
+    'QQ-SENDER-2',
+    '前 <faceType=1,faceId="1",ext="not-base64"> 后',
+    { message_type: 0 },
+  ),
+);
+const malformedFaceBody = bodyTextOf(lastSentBody());
+check(
+  '无效或过大 face 标签不会泄漏原始 base64',
+  malformedFaceBody === '前  后' && !malformedFaceBody.includes('faceType='),
+  `body=${malformedFaceBody}`,
+);
+
+const imagePlaceholderFaceTag = '<faceType=6,faceId="0",ext="eyJ0ZXh0IjoiIn0=">';
+const faceImageEventsBefore = matrixState.sentEvents.length;
+await bridge.handleQqMessage({
+  ...structuredGroupMessage(
+    'qq-face-image',
+    'QQ-SENDER-2',
+    imagePlaceholderFaceTag,
+    { message_type: 0 },
+    'GROUP-FACE',
+  ),
+  attachments: [
+    {
+      content_type: 'image/jpeg',
+      url: 'http://qq.test/face-image.jpg',
+      filename: 'face-image.jpg',
+    },
+  ],
+  msgIdx: 'REFIDX-face-image',
+});
+const faceImageEvents = matrixState.sentEvents.slice(faceImageEventsBefore);
+const faceImageEventId = store.getReference('REFIDX-face-image')?.matrixEventId;
+check(
+  '空 face 占位符加图片时只发送 Matrix 图片事件',
+  faceImageEvents.length === 1 &&
+    JSON.stringify(faceImageEvents[0]).includes('"msgtype":"m.image"') &&
+    faceImageEventId === `$event-${String(faceImageEventsBefore + 1)}`,
+  `events=${String(faceImageEvents.length)}`,
+);
+
 await bridge.handleQqMessage({
   ...groupMessage(
     'qq-structured-target',
@@ -1294,16 +1348,63 @@ check(
 await bridge.handleQqMessage({
   ...structuredGroupMessage('qq-quote-unknown', 'QQ-SENDER-1', '未知引用回复', {
     message_type: 103,
-    msg_elements: [{ message_type: 0, content: '没有映射的引用内容' }],
+    msg_elements: [
+      {
+        message_type: 0,
+        author: { username: '引用原作者' },
+        content: '没有映射的引用内容',
+      },
+    ],
   }),
   refMsgIdx: 'REFIDX-unknown-quote',
 });
 const unknownQuoteBody = bodyTextOf(lastSentBody());
 check(
-  '未知 QQ 引用保留文本 fallback 且无 relates_to',
-  unknownQuoteBody === '> <测试用户>\n> 没有映射的引用内容\n\n未知引用回复' &&
+  '未知 QQ 引用保留原作者文本 fallback 且无 relates_to',
+  unknownQuoteBody === '> <引用原作者>\n> 没有映射的引用内容\n\n未知引用回复' &&
     !JSON.stringify(matrixState.sentEvents.at(-1)).includes('m.relates_to'),
   `body=${unknownQuoteBody}`,
+);
+
+const quoteFaceUploadsBefore = matrixState.uploads.length;
+const quoteFaceEventsBefore = matrixState.sentEvents.length;
+await bridge.handleQqMessage({
+  ...structuredGroupMessage(
+    'qq-quote-face-image',
+    'QQ-SENDER-1',
+    '引用这个表情',
+    {
+      message_type: 103,
+      msg_elements: [
+        {
+          msg_idx: 'REFIDX-face-image',
+          message_type: 0,
+          content: imagePlaceholderFaceTag,
+          attachments: [
+            {
+              content_type: 'image/jpeg',
+              url: 'http://qq.test/quoted-face.jpg',
+              filename: 'quoted-face.jpg',
+            },
+          ],
+        },
+      ],
+    },
+    'GROUP-FACE',
+  ),
+  refMsgIdx: 'REFIDX-face-image',
+});
+const faceQuoteEvent = matrixState.sentEvents.at(-1) as
+  | { body?: { 'm.relates_to'?: { event_id?: string } } }
+  | undefined;
+const faceQuoteBody = bodyTextOf(lastSentBody());
+check(
+  '引用 QQ 表情图片时指向原 Matrix 图片事件',
+  matrixState.uploads.length === quoteFaceUploadsBefore &&
+    matrixState.sentEvents.length === quoteFaceEventsBefore + 1 &&
+    faceQuoteEvent?.body?.['m.relates_to']?.event_id === faceImageEventId &&
+    faceQuoteBody === '> <测试用户>\n> [image/jpeg: quoted-face.jpg]\n\n引用这个表情',
+  `body=${faceQuoteBody}`,
 );
 
 const quoteMediaUploads = matrixState.uploads.length;

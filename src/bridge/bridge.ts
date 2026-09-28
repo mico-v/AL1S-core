@@ -80,6 +80,8 @@ interface StructuredMessageContent {
   text: string;
   /** 引用元素提取的摘录，用于回复 fallback 正文。 */
   quoteExcerpt?: string;
+  /** 引用元素携带的原发送者显示名。 */
+  quoteSender?: string;
   /** 去重、限量后的可转发附件，不含引用元素附件。 */
   attachments: QqAttachment[];
   /** 是否命中深度、元素、附件或长度限制。 */
@@ -99,7 +101,9 @@ const STRUCTURED_MAX_ELEMENTS = 64;
 const STRUCTURED_MAX_ATTACHMENTS = 16;
 const STRUCTURED_MAX_TEXT_LENGTH = 4096;
 const STRUCTURED_MAX_EXCERPT_LENGTH = 500;
+const MAX_QQ_FACE_EXT_BYTES = 64 * 1024;
 const STRUCTURED_TRUNCATION_MARKER = '\n[消息过长，已截断]';
+const QQ_FACE_TAG_PATTERN = /<faceType=\d+,faceId="[^"]*",ext="([^"]*)">/g;
 const ARK_FIELD_KEYS = ['title', 'desc', 'tag', 'tags', 'source', 'nickname', 'address'] as const;
 
 function digest(secret: string, value: string, length = 64): string {
@@ -152,6 +156,34 @@ function nonEmptyString(value: unknown): string | undefined {
   return typeof value === 'string' && value.trim() !== '' ? value : undefined;
 }
 
+function decodeQqFaceName(ext: string): string | undefined {
+  const padding = ext.endsWith('==') ? 2 : ext.endsWith('=') ? 1 : 0;
+  if (Math.ceil((ext.length * 3) / 4) - padding > MAX_QQ_FACE_EXT_BYTES) {
+    return undefined;
+  }
+  try {
+    const parsed: unknown = JSON.parse(Buffer.from(ext, 'base64').toString('utf8'));
+    return isRecord(parsed) ? nonEmptyString(parsed['text'])?.trim() : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+/**
+ * 将 QQ face 标签转换为可读文本。
+ *
+ * 图片消息常携带 `faceType=6,faceId="0",ext={"text":""}` 占位符；
+ * 空名称必须渲染为空，避免在真实图片前多发一条无意义文本。
+ */
+function renderQqContent(value: string): string {
+  return value
+    .replace(QQ_FACE_TAG_PATTERN, (_tag: string, ext: string): string => {
+      const name = decodeQqFaceName(ext);
+      return name === undefined ? '' : `【表情: ${name}】`;
+    })
+    .trim();
+}
+
 function truncateStructuredText(value: string, limit: number): string {
   if (value.length <= limit) {
     return value;
@@ -171,6 +203,14 @@ function arkFieldText(value: unknown): string | undefined {
     return parts.length === 0 ? undefined : parts.join(' ');
   }
   return undefined;
+}
+
+function structuredElementSender(node: Record<string, unknown>): string | undefined {
+  const author = node['author'];
+  if (!isRecord(author)) {
+    return undefined;
+  }
+  return nonEmptyString(author['username']) ?? nonEmptyString(author['nickname']);
 }
 
 /**
@@ -289,6 +329,7 @@ function extractStructuredMessage(message: QQBotInboundMessage): StructuredMessa
   const attachments: QqAttachment[] = [];
   const seenAttachments = new Set<string>();
   let quoteAttachment: QqAttachment | undefined;
+  let quoteSender: string | undefined;
   let visited = 0;
   let truncated = false;
 
@@ -315,7 +356,7 @@ function extractStructuredMessage(message: QQBotInboundMessage): StructuredMessa
 
   const topContent = nonEmptyString(message.content);
   if (topContent !== undefined) {
-    pushText(bodyParts, topContent);
+    pushText(bodyParts, renderQqContent(topContent));
   }
   const arkText = arkFallbackText(raw['ark_data']);
   if (arkText !== undefined) {
@@ -350,12 +391,15 @@ function extractStructuredMessage(message: QQBotInboundMessage): StructuredMessa
       const targetParts = target === 'quote' ? quoteParts : bodyParts;
       const content = nonEmptyString(node['content']);
       if (content !== undefined) {
-        pushText(targetParts, content);
+        pushText(targetParts, renderQqContent(content));
       } else {
         const arkText = arkFallbackText(node['ark_data']);
         if (arkText !== undefined) {
           pushText(targetParts, arkText);
         }
+      }
+      if (target === 'quote') {
+        quoteSender ??= structuredElementSender(node);
       }
       for (const attachment of normalizeAttachments(node['attachments'])) {
         if (target === 'quote') {
@@ -388,6 +432,7 @@ function extractStructuredMessage(message: QQBotInboundMessage): StructuredMessa
   return {
     text: truncateStructuredText(bodyText, STRUCTURED_MAX_TEXT_LENGTH),
     ...(quoteExcerpt === undefined ? {} : { quoteExcerpt }),
+    ...(quoteSender === undefined ? {} : { quoteSender }),
     attachments,
     truncated,
   };
@@ -766,10 +811,11 @@ export class QqMatrixBridge {
       quoted === undefined
         ? {}
         : { 'm.relates_to': { rel_type: 'm.in_reply_to', event_id: quoted.matrixEventId } };
+    const quotedSender = quoted?.sender ?? structured.quoteSender ?? senderDisplayName;
     const body =
       structured.quoteExcerpt === undefined
         ? structured.text
-        : `${quoteFallback(quoted?.sender ?? senderDisplayName, structured.quoteExcerpt)}\n\n${structured.text}`;
+        : `${quoteFallback(quotedSender, structured.quoteExcerpt)}\n\n${structured.text}`;
 
     let sent = false;
     let firstMatrixEventId: string | undefined;
