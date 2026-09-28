@@ -9,12 +9,13 @@
 
 ## 当前迭代
 
-- 目标：让真实 Tuwunel 联调不依赖容器运行时，直接使用本机二进制完成同一套
-  端到端检查。
-- 状态：DONE。
-- 验收：`TUWUNEL_CHECK_MODE=host` 能通过 `TUWUNEL_BIN` 或
-  `TUWUNEL_SOURCE_DIR` 启动 Tuwunel，并完成重启持久化、双向 transaction、
-  生产入口生命周期及临时目录清理。
+- 目标：完善 QQ 到 Matrix 的提及、引用、表情/附件语义，对媒体做内容级去重，
+  并在 `as:/opt/al1s` 的原生 systemd 环境持续做真实 QQ 联调。
+- 状态：DOING。
+- 已完成：提及与引用映射、`TMP_*` 唯一回退、结构化标签清理、媒体 SHA-256
+  去重与 Matrix 上传复用均通过离线检查和真实 Tuwunel 检查。
+- 剩余：在生产环境逐项确认 QQ 单聊、群聊提及、引用、表情包和图片，并记录
+  真实 QQ 平台与本地假端口之间的行为差异。
 
 ## 当前状态
 
@@ -32,13 +33,15 @@
 | Matrix 全局发送者基线 | DONE | 默认拒绝、精确用户名单、显式通配符及非法配置均通过检查 |
 | 房间级成员授权 | DONE | 全局名单 + 目标房间成员 + 最低 power level；离线覆盖未入房、跨房间隔离和批准后放行，真实 Tuwunel 验证权限不足不调用 QQ、升级后放行 |
 | 房间成员运维工具 | DONE | `matrix:admin` 提供 `status`/`invite`/`kick`；离线覆盖请求路径、body 与无效参数零请求，真实 Tuwunel 验证踢出撤权及重新加入恢复 |
-| 持久化与恢复 | DONE | schema v6、v2/v3/v4/v5 平滑迁移、重启恢复和加密检查通过 |
+| 持久化与恢复 | DONE | schema v7、v2-v6 平滑迁移、重启恢复和加密检查通过；v7 增加内容哈希到 Matrix 上传的映射 |
 | QQ 入站可靠重放 | DONE | 入站消息加密入队；启动/定时重放、指数退避、成功去重、重启恢复和容量上限均有 `matrix:check` 覆盖 |
 | 状态文件原子持久化 | DONE | 同目录临时文件、文件/目录 `fsync`、原子替换和失败重试通过；新建目录/文件权限分别为 `0700`/`0600` |
 | Matrix 撤回映射 | DONE | 离线检查覆盖清理映射；真实 Tuwunel 验证 redaction 回推后映射为 QQ recall |
 | Matrix 编辑处理 | DONE | 当前策略为忽略 `m.replace`，避免重复发送 QQ 消息 |
-| QQ/Matrix 引用映射 | DONE | 已知 QQ 引用只发送 `m.in_reply_to` 与回复正文，未知引用保留清理后的文本 fallback；双向引用、重启恢复及真实 Tuwunel 引用链检查通过 |
+| QQ 提及映射 | DONE | `<@OPENID>` 转为可读 `@昵称`、Matrix HTML、`m.mentions` 和 `matrix.to` 链接；`@room`、未知昵称稳定摘要及 openid 不泄漏均有离线与真实 Tuwunel 断言 |
+| QQ/Matrix 引用映射 | DONE | 从 `refMsgIdx`、原始字段、`message_scene.ext` 和嵌套 `msg_elements` 收集索引；`TMP_*` 仅按同房间/发送者/摘录唯一回退；已知引用只发送 `m.in_reply_to` 与回复正文，旧引用记录仍兼容 |
 | QQ 结构化消息 | DONE | `message_type=3/101/102/103` 卡片、并行、聊天记录与引用消息转为有界文本；嵌套附件去重转发，`faceType` 解码、`attachmentType` 等 `*Type=` 标签过滤，深度/元素/附件/长度上限均覆盖检查 |
+| QQ 媒体内容去重 | DONE | 聊天记录按 SHA-256 写入 `media-cache/<sha256>`，bridge 持久化内容哈希到 `mxc://` 映射并合并并发上传；重复图片、表情包和引用附件不重复落盘/上传，真实 Tuwunel 验证重复事件复用同一 mxc URI |
 | QQ 出站频控与重试 | DONE | `40034005`/`40034128` 降级主动消息，`40034100` 指数退避后交由 transaction 重试 |
 | QQ 反向撤回映射 | BLOCKED | 官方群聊/单聊事件清单未提供撤回事件，需平台新增推送或实测发现等价事件 |
 | 引用映射历史清理 | DONE | 默认 30 天 TTL、10,000 条上限、正反索引联动清理及重启持久化检查通过 |
@@ -48,21 +51,45 @@
 | Guild/DM 文本场景 | DONE | 精确版本 `qqbot-nodejs@1.0.4` 加受控 patch 后，guild/DM 文本、撤回、direct room 与出站目标通过离线及真实 Tuwunel 检查 |
 | Guild/DM 媒体出站 | BLOCKED | QQ channel/DM API 无对应媒体上传/发送能力；解除条件为官方提供接口，当前 bridge 记录警告、忽略媒体并 ACK |
 | typing/receipt/presence | DONE | 明确不桥接，registration 设置 `receive_ephemeral: false`，避免无对称语义的噪声 |
-| Tuwunel 协议联调 | DONE | Tuwunel 1.9.3 固定 digest 实际加载 registration、ping、创建 room、ghost 发事件并回推 transaction |
-| 可重复 Tuwunel 集成检查 | DONE | `pnpm tuwunel:check` 使用固定 1.9.3 digest 和版本断言，通过假 QQ 端口验证群聊/单聊/guild/DM 文本、引用、撤回、结构化消息、媒体限制、房间授权、transaction 与重启持久化 |
+| Tuwunel 协议联调 | DONE | Tuwunel 1.9.3 原生宿主二进制实际加载 registration、ping、创建 room、ghost 发事件并回推 transaction |
+| 可重复 Tuwunel 集成检查 | DONE | `pnpm tuwunel:check` 通过 `TUWUNEL_BIN` 或 `TUWUNEL_SOURCE_DIR` 启动本机二进制并断言 1.9.3；假 QQ 端口覆盖群聊/单聊/guild/DM 文本、提及、引用、撤回、结构化消息、媒体去重、房间授权、transaction 与重启持久化 |
 | 原生宿主联调 | DONE | Tuwunel 1.9.3 本机 release 二进制完整通过 `pnpm tuwunel:check`，覆盖双向 transaction、媒体、重启持久化和生产入口生命周期 |
 | 生产部署资产 | DONE | `deploy/systemd/*.service`、`deploy/tuwunel.toml.example` 与 `deploy/deploy-server.sh`；服务器只运行 Node 与 Tuwunel 二进制，本地构建后同步运行包 |
 | 部署前配置检查 | DONE | `pnpm deploy:check` 校验 registration/.env token、ID、namespace、URL 与文件权限；离线检查覆盖接受和拒绝路径 |
 | 生产入口生命周期 | DONE | `pnpm tuwunel:check` 编译并启动 `dist/matrix-bridge.js`，用假 QQ Webhook 验证 health、registration ping、QQ 入站写入 Tuwunel；滞留 appservice 请求存在时 `SIGTERM` 仍按关闭预算退出并释放端口 |
 | 故障关闭与 HTTP 错误分类 | DONE | `matrix:check` 覆盖非法 JSON `400`、超限请求体 `413`、脱敏 `500`、指标分类、bridge 在途任务等待、状态写入失败重试和 appservice 滞留连接超时关闭；`tuwunel:check` 直接注入未捕获异常/未处理拒绝，验证统一优雅关闭、非零退出码和端口释放 |
 | 持续集成门禁 | DONE | `pnpm ci:check` 已完整通过；`.github/workflows/ci.yml` 在 push/PR 上复用同一命令，首次远端运行需推送后确认 |
-| 真实 QQ 联调 | BLOCKED | 需有效 QQ 凭据、平台网关/Webhook 可达和可接消息的机器人环境；生产入口本身已由假 QQ Webhook 覆盖 |
-| 生产环境验证 | BLOCKED | 需确定实际反向代理、持久卷、监控和运行环境 |
+| 真实 QQ 联调 | DOING | 生产 QQ bot 已连接并出现群聊映射；单聊、提及、引用、表情包和媒体仍需按生产日志逐项验收，不能以离线检查代替 |
+| 生产环境验证 | DONE | `as:/opt/al1s` 原生 systemd 部署已上线，`al1s-bridge.service` 与 `tuwunel.service` 均为 active，`/health` 返回 `{}`；当前运行包对应 `ed28674` |
 
 ## 实施日志
 
 ### 2026-09-28
 
+- 完成 QQ 提及到 Matrix 的完整映射：`<@OPENID>` 输出可读 `@昵称`、
+  `org.matrix.custom.html` 与 `https://matrix.to/#/...` 链接，并写入
+  `m.mentions.user_ids`；`@room` 写入 room 提及。未知昵称使用稳定的
+  `QQ用户_<8 位 HMAC>`，不暴露原始 openid。真实 Tuwunel 检查已断言 HTML
+  链接和提及元数据。
+- 扩展 QQ 引用候选索引：兼容 `refMsgIdx`、`ref_msg_idx`/`refMsgIdx`/
+  `ref_idx` 等原始字段、`message_scene.ext` 和嵌套 `msg_elements[].msg_idx`；
+  当前消息保存全部可用索引别名。`TMP_*` 无法直接命中时，只在同房间、
+  同发送者和引用摘录唯一匹配时回退，旧持久化引用记录仍可匹配。
+- 引用命中后不再把引用正文或 `> <...>` 调试标签重复写入 Matrix 正文；
+  未知引用使用清理后的可读文本 fallback。`faceType.ext.text` 保留表情名，
+  `attachmentType` 等内部 `*Type=` 标签移除，真实附件只发送媒体事件。
+- 媒体改为内容寻址去重：下载后计算 SHA-256，聊天记录共用
+  `data/media-cache/<sha256>`；bridge 在 schema v7 状态中保存内容哈希到
+  Matrix `mxc://` 的映射，并用同哈希在途 Promise 合并并发上传。重复图片、
+  表情包及引用附件复用同一本地文件和 Matrix 上传。
+- 离线与真实 Tuwunel 检查已覆盖提及 HTML/`m.mentions`、引用索引变体、
+  `TMP_*` 唯一回退、旧引用兼容、重复媒体上传复用和结构化标签清理。
+- 生产 `as:/opt/al1s` 已同步到 `ed28674`，`al1s-bridge.service` 与
+  `tuwunel.service` 均为 active；`curl http://127.0.0.1:29328/health`
+  返回 `{}`。真实 QQ 单聊、提及、引用和媒体仍需在生产日志中逐项确认。
+- 本轮验证：`pnpm integration:check`、`pnpm matrix:check`、
+  `TUWUNEL_BIN=/home/x/github.com/matrix-construct/tuwunel/target/release/tuwunel pnpm tuwunel:check`
+  和 `git diff --check` 通过。
 - 修正 QQ 结构化标签与引用正文：`faceType.ext.text` 保留可读表情名，
   `attachmentType` 及未知 `*Type=` 标签统一移除，真实附件只发送对应 Matrix
   媒体事件；已有 Matrix event 映射的 QQ 引用不再重复写入 `> <...>` fallback
@@ -70,7 +97,8 @@
 - 本轮验证：`pnpm integration:check`、
   `TUWUNEL_BIN=/home/x/github.com/matrix-construct/tuwunel/target/release/tuwunel pnpm tuwunel:check`
   与 `git diff --check` 通过。
-- 增加 `pnpm tuwunel:check:host`，支持通过 `TUWUNEL_BIN` 或
+- 增加 `pnpm tuwunel:check:host`（历史命令，现统一为 `pnpm tuwunel:check`），
+  支持通过 `TUWUNEL_BIN` 或
   `TUWUNEL_SOURCE_DIR` 启动本机 Tuwunel，并继续使用临时数据库、
   registration 和随机端口；检查结束会停止进程并清理临时目录。
 - 从源码 `7801b8ec6` 构建 Tuwunel 1.9.3 release 二进制，并执行

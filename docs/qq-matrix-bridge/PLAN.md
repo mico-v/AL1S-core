@@ -166,9 +166,17 @@ curl -i -X POST \
   guild 必须包含 `PUBLIC_GUILD_MESSAGES`（`1 << 30`），DM 必须包含
   `DIRECT_MESSAGE`（`1 << 12`）；QQ 平台未授权对应 intent 时网关会拒绝连接。
 - QQ openid 通过 `HMAC-SHA256` 生成 `@_qq_<digest>:<domain>`，不直接暴露。
+- QQ 正文与 `mentions` 中的 `<@OPENID>` 转为可读 `@昵称`，并生成
+  `formatted_body`、`https://matrix.to/#/...` 链接和 `m.mentions.user_ids`。
+  `@room` 写入 `m.mentions.room`。无法取得 QQ 昵称时使用稳定的
+  `QQ用户_<8 位 HMAC>`，不能回退为原始 openid 或 `<@...>` 调试文本。
 - QQ 文本转换为 `m.room.message`/`m.text`。
 - QQ 媒体先下载并上传 Matrix，再转换为对应的 `m.image`、`m.audio`、
   `m.video` 或 `m.file`。
+- QQ 媒体按下载字节的 SHA-256 内容寻址：聊天记录复用
+  `data/media-cache/<sha256>`，bridge 在 schema v7 状态中保存内容哈希到
+  Matrix `mxc://` 的映射，并合并同哈希并发上传。相同图片、表情包或文件不
+  重复落盘和上传；引用元素附件也走同一去重路径。
 - Matrix 媒体下载使用已鉴权端点
   `/_matrix/client/v1/media/download/{serverName}/{mediaId}`。Tuwunel
   1.9.3 默认关闭旧版 `/_matrix/media/v3/download` 未鉴权访问，不能依赖
@@ -192,8 +200,12 @@ curl -i -X POST \
 - QQ 出站命中 `40034005` 或 `40034128` 时清除失效的被动窗口并降级为主动
   消息；命中 `40034100` 时按 2/4/8 秒退避重试，耗尽后交由 Appservice
   transaction 重试。仅对平台明确拒绝的错误重试，网络超时不自动重发。
-- QQ 引用通过 `msg_idx`/`ref_msg_idx` 映射为 Matrix `m.in_reply_to`；确认
-  映射时正文只包含回复内容，未知引用才保留不含尖括号的纯文本 fallback。
+- QQ 引用从 `refMsgIdx`、原始 `ref_msg_idx`/`refMsgIdx`/`ref_idx` 等字段、
+  `message_scene.ext` 和嵌套 `msg_elements[].msg_idx` 收集候选索引；当前
+  消息的全部可用索引别名都会持久化，已有历史记录继续兼容。
+- `TMP_*` 索引无法直接命中时，只在目标房间、发送者和引用摘录唯一匹配时
+  回退；重复或短摘录不建立错误关联。命中后发送 Matrix `m.in_reply_to`，
+  正文只包含回复内容；未知引用使用不含尖括号的可读文本 fallback。
 - Matrix 引用在存在 QQ `ref_idx` 映射时转换为 `message_reference`。
 - Matrix `m.replace` 编辑当前忽略，避免把编辑后的正文重复发送到 QQ；
   Matrix redaction 会映射为 QQ 撤回并删除出站映射。
@@ -219,8 +231,9 @@ curl -i -X POST \
   message ID 去重键。
 - 入站队列默认最多 10,000 条，可通过
   `MATRIX_BRIDGE_QQ_QUEUE_MAX_ENTRIES` 调整。达到上限后新消息记录错误并
-  丢弃，避免无界占用磁盘；媒体重放可能产生重复临时上传对象，但确定性
-  Matrix transaction ID 会避免重复事件。
+  丢弃，避免无界占用磁盘。媒体重放优先复用内容哈希映射；仅当 Matrix 已
+  接收上传但 bridge 尚未来得及持久化映射时崩溃，才可能留下孤立上传对象，
+  确定性 Matrix transaction ID 仍会避免重复事件。
 
 ## 开发阶段
 
@@ -237,6 +250,8 @@ curl -i -X POST \
 
 - QQ 图片、语音、视频、文件上传到 Matrix；已由 `tuwunel:check` 在真实
   Tuwunel 上验证上传、mxc URI 和下载内容一致性。
+- 相同媒体字节按 SHA-256 去重并复用 Matrix 上传，`matrix:check` 与
+  `tuwunel:check` 均覆盖重复图片不增加上传次数、事件复用同一 mxc URI。
 - Matrix 图片、语音、视频、文件下载并发送到 QQ；已由 `tuwunel:check`
   验证媒体事件经 Tuwunel 回推后，下载字节和类型正确到达 QQ 端口。
 - 支持 QQ/Matrix 引用映射和 Matrix redaction 到 QQ 撤回。`tuwunel:check`
@@ -246,6 +261,8 @@ curl -i -X POST \
 - Matrix 编辑明确忽略；QQ 官方仅提供撤回能力，不提供编辑消息接口。
 - QQ 结构化消息已完成：`message_type=3/101/102/103` 的卡片、并行消息、
   聊天记录与引用消息转换为有界文本，并递归转发元素内附件。
+- QQ 提及已完成：群聊/单聊正文中的 `<@OPENID>` 转为 Matrix 可读提及、
+  HTML 链接和 `m.mentions`，支持 `@room`；未知昵称使用稳定摘要身份。
 - 对 QQ 限流、重试和不可恢复错误建立明确状态，已覆盖被动窗口失效、
   主动消息频控退避和 transaction 最终重试。
 - QQ 群聊/单聊反向撤回暂不可实现：官方 `GROUP_AND_C2C_EVENT` 清单没有
@@ -310,13 +327,16 @@ curl -i -X POST \
 3. QQ 群聊、单聊、guild 和 DM 文本可双向往返，重复 transaction 不产生
    重复 QQ 消息；guild 出站目标为 channel ID，DM 出站目标为 guild ID。
 4. ghost 用户、房间 alias 和 QQ 会话映射在 bridge 重启后保持。
-5. 群聊/单聊媒体可以上传到 Matrix 并发送到 QQ；`tuwunel:check` 使用真实
-   Tuwunel 验证媒体上传、已鉴权下载和双向投递。Matrix 到 guild/DM 的媒体
-   明确忽略并正常 ACK transaction。
+5. 群聊/单聊媒体可以上传到 Matrix 并发送到 QQ；相同内容按 SHA-256 只保存
+   一份本地文件并复用 Matrix 上传，`tuwunel:check` 使用真实 Tuwunel 验证
+   媒体上传、已鉴权下载和双向投递。Matrix 到 guild/DM 的媒体明确忽略并
+   正常 ACK transaction。
 6. 日志、状态文件和文档中不出现 token、AppSecret 或完整 openid。
 7. 文档记录每阶段实现、验证命令、已知限制和剩余工作。
-8. QQ 引用与 Matrix 引用可在对应事件已知时双向关联；未知引用使用
-   fallback，不阻断正文转发。
+8. QQ 引用与 Matrix 引用可在对应事件已知时双向关联；候选索引覆盖
+   `refMsgIdx`、原始字段、`message_scene.ext` 和嵌套 `msg_elements`，
+   `TMP_*` 只能通过同房间/发送者/摘录唯一匹配回退；未知引用使用可读
+   fallback，不阻断正文转发，也不输出 `> <...>` 调试文本。
 9. 全局名单用户只有在目标房间成员资格有效且 power level 达标时才能触发
    QQ 发送；未加入、已离开或权限不足时均默认拒绝。`tuwunel:check` 在真实
    Tuwunel 上验证权限不足不触发 QQ、更新房间 power level 后放行。
@@ -366,6 +386,11 @@ curl -i -X POST \
 25. `TUWUNEL_BIN` 或 `TUWUNEL_SOURCE_DIR` 能启动本机 Tuwunel，不依赖
     容器运行时；临时数据库、registration、重启持久化、双向 transaction
     和清理行为保持一致。
+26. QQ 正文中的 `<@OPENID>` 转为可读 Matrix 提及、`matrix.to` HTML 链接和
+    `m.mentions`，`@room` 正确映射；未知用户使用稳定摘要身份，正文、HTML、
+    状态和日志均不泄漏原始 openid。
+27. 媒体以 SHA-256 内容地址去重，重复图片、表情包、文件和引用附件复用
+    本地文件及 Matrix `mxc://`；并发上传合并为一次，重启后仍可复用映射。
 
 ## 风险评估
 
@@ -378,9 +403,10 @@ curl -i -X POST \
   同时成立。全局名单只是部署基线，不替代房间级批准；生产环境应限制谁有权
   执行 `matrix:admin`、邀请成员和修改 room state。`--actor` 会被
   appservice token 冒充，必须使用最小权限且妥善保护 `.env`。
-- bridge 状态当前为 schema v6，字段使用 AES-256-GCM 加密，索引使用
-  HMAC；支持 v2/v3/v4/v5 平滑迁移到 v6。v1 或未知版本仍会被拒绝。若已有
-  状态文件，升级前必须停止 bridge 并单独备份。
+- bridge 状态当前为 schema v7，字段使用 AES-256-GCM 加密，索引使用
+  HMAC；支持 v2-v6 平滑迁移到 v7。v7 增加内容哈希到 Matrix 上传的映射。
+  v1 或未知版本仍会被拒绝；若已有状态文件，升级前必须停止 bridge 并单独
+  备份。
 - Webhook transport 在校验签名后立即向 QQ 平台返回 ACK，再异步处理事件。
   “平台 ACK 后、bridge 持久化入队前”的极小崩溃窗口无法由 bridge 消除；
   平台重投和上层可用性要求必须覆盖该窗口。

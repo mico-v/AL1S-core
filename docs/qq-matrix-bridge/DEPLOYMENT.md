@@ -22,6 +22,15 @@ Tuwunel（systemd: tuwunel）
 Caddy → Matrix 客户端
 ```
 
+当前生产实例：
+
+- SSH 别名为 `as`，源码检出位于 `/opt/al1s`，运行包位于 `/opt/al1s/app`；
+  状态和 Tuwunel 数据位于 `/opt/al1s/data`。
+- systemd 单元为 `al1s-bridge.service` 与 `tuwunel.service`；运行包目前对应
+  `ed28674`，两者均为 active，`http://127.0.0.1:29328/health` 返回 `{}`。
+- `git push as main` 只更新 `/opt/al1s` 源码检出，不会替换正在运行的
+  `/opt/al1s/app` 或重启服务。让新代码生效必须在本地运行 `pnpm deploy:server`。
+
 Appservice transaction 地址只需让 Tuwunel 访问，禁止直接暴露公网；同一
 宿主机部署时监听 `127.0.0.1:29328`，Tuwunel 反向访问 `127.0.0.1:8008`。
 
@@ -39,6 +48,11 @@ chmod 600 .env deploy/appservice.yaml
 pnpm deploy:check
 pnpm deploy:server            # 本地 pnpm build → 打包 dist/ 与生产依赖 → ssh 同步 → 重启服务
 ```
+
+`git push as main` 可同步源码检出，但部署运行版本以 `pnpm deploy:server`
+为准。脚本会重新编译、安装生产依赖、覆盖 `/opt/al1s/app`，若本地存在
+`deploy/appservice.yaml` 还会原子替换 registration 并重启 Tuwunel，最后
+重启 bridge。
 
 `deploy/deploy-server.sh` 使用 `AL1S_REMOTE`（默认 `as`）、
 `AL1S_REMOTE_DIR`（默认 `/opt/al1s`）和 `AL1S_SERVICE`（默认
@@ -214,6 +228,12 @@ TUWUNEL_BIN=/path/to/tuwunel pnpm tuwunel:check   # 本机 Tuwunel 双向集成�
 `pnpm tuwunel:check` 直接启动本机 Tuwunel 二进制，不依赖任何容器运行时，
 也不连接 QQ 开放平台。
 
+QQ 到 Matrix 的消息语义当前包括：`<@OPENID>` 转可读提及、HTML 链接和
+`m.mentions`，引用索引变体与 `TMP_*` 唯一匹配回退，`faceType` 表情名解码，
+内部 `attachmentType`/`*Type=` 标签清理，以及 SHA-256 媒体去重和 Matrix
+上传复用。部署后应分别用群聊、单聊、提及、引用、表情包和图片各发一条测试
+消息，确认 Matrix 事件正文和媒体 URI。
+
 `MATRIX_BRIDGE_SHUTDOWN_TIMEOUT_MS` 默认 30 秒，控制关闭时等待 appservice
 活跃请求的上限；超时后会强制关闭滞留连接，由 Tuwunel 重试未确认的
 transaction。该值应覆盖在途 Matrix 请求时间，并小于 systemd 的
@@ -243,6 +263,12 @@ curl -fsS http://127.0.0.1:29328/metrics | head
 journalctl -u tuwunel --no-pager -n 100
 journalctl -u al1s-bridge --no-pager -n 100
 ```
+
+QQ 到 Matrix 的入站不经过 `MATRIX_BRIDGE_ALLOWED_SENDERS`；该名单只限制
+Matrix 到 QQ。若群聊有消息但单聊没有，先确认 QQ 平台已给机器人开放单聊
+消息权限，并检查自定义 `QQBOT_INTENTS` 是否包含 `GROUP_AND_C2C`（`1<<25`）
+或等价的单聊 intent。随后查看 bridge 日志中是否收到对应 QQ 事件；只有
+Matrix 房间缺少成员并不代表 QQ 消息没有到达。
 
 确认 Tuwunel 能加载 appservice、ping 返回 200、appservice bot 仍为每个映射
 房间的 `join` 成员。bot 被踢出或房间状态查询失败时，bridge 会按失败关闭

@@ -86,8 +86,9 @@ pnpm tuwunel:check  # 用 TUWUNEL_BIN 的本机 Tuwunel 检查双向桥接与生
 pnpm deploy:check   # 校验生产 registration、.env、权限与部署 URL
 pnpm deploy:server  # 本地构建运行包并同步到服务器重启服务
 pnpm bridge       # 启动独立 QQ / Tuwunel bridge
+pnpm bridge:dev   # 以 watch 模式启动 bridge
 pnpm webhook:check  # 本地起 webhook 服务，端到端验证收消息
-pnpm integration:check  # typecheck + 全部离线检查
+pnpm integration:check  # typecheck + build + qq:check + matrix:check + webhook:check
 pnpm ci:check      # 与 GitHub Actions 相同的完整门禁
 ```
 
@@ -129,9 +130,22 @@ pnpm ci:check      # 与 GitHub Actions 相同的完整门禁
 QQ 侧已支持文本、媒体、引用与结构化消息（`message_type=3/101/102/103`
 卡片、并行消息、聊天记录、引用），结构化内容合并为有界文本并递归转发
 元素内附件，超限时截断标记。
+消息正文中的 `<@OPENID>` 会映射为可读的 `@昵称`，并生成
+`formatted_body`、`https://matrix.to/#/...` 链接和 `m.mentions`；无法取得
+昵称时使用稳定的 `QQ用户_<8 位摘要>`，不会暴露 openid。`@room` 也会映射为
+Matrix room 提及。
+QQ 引用会从 `refMsgIdx`、原始字段、`message_scene.ext` 和嵌套
+`msg_elements` 中收集索引；`TMP_*` 索引无法直接命中时，仅在目标房间、
+发送者和引用正文唯一匹配时回退关联。命中后只保留 Matrix `m.in_reply_to`
+和回复正文，不再输出 `> <...>` 调试文本。
+媒体按 SHA-256 内容哈希去重：聊天记录共用 `data/media-cache/<sha256>`，
+bridge 复用已上传的 Matrix `mxc://`，同一图片、表情包或文件不会重复落盘，
+也不会因同一批消息并发上传多次。
 消息桥接覆盖 QQ 群聊、单聊、频道和频道私信。guild/DM 已支持双向文本与
 撤回；受 QQ channel/DM API 限制，Matrix 到 guild/DM 的媒体发送当前会
 记录警告并忽略，但不会阻塞 transaction ACK。
+bridge 不枚举 QQ 群成员名单，ghost 在收到该用户消息后创建；QQ 未提供昵称时
+才会显示 `QQ用户_<8 位摘要>`，这不是硬编码用户列表。
 QQ 入站消息会先加密写入持久化队列，bridge 重启后自动重放；失败按指数
 退避，队列容量和重试间隔可通过 `MATRIX_BRIDGE_QQ_*` 调整。
 

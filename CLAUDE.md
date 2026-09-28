@@ -4,17 +4,20 @@
 
 ## 项目定位
 
-这是一个基于 **QQ 开放平台官方协议** 的 QQ 机器人框架，TypeScript / ESM，
-通过 `@tencent-connect/qqbot-nodejs` 连接器接入 QQ。
+这是一个基于 **QQ 开放平台官方协议** 的 TypeScript / ESM 项目，通过
+`@tencent-connect/qqbot-nodejs` 接入 QQ。仓库同时包含独立机器人入口和
+QQ/Tuwunel Matrix Application Service bridge。
 
-当前阶段只做**协议框架**：配置、连接生命周期、事件分发与回复。
-项目已从旧的 OneBot / SnowLuma + MSP 沙箱架构**推倒重做**，
-不要再引入插件注册表、命令 broker、会话沙箱、管理后台等旧设计。
+当前主线是完善 QQ/Matrix 消息语义与生产运行：QQ ghost 映射、提及、引用、
+媒体、双向路由、持久化与运维。项目已从旧的 OneBot / SnowLuma + MSP
+沙箱架构**推倒重做**，不要再引入插件注册表、命令 broker、会话沙箱、
+管理后台等旧设计。
 
-入口是：
+两个入口是：
 
 ```text
-src/index.ts → loadConfig() → new Bot(config) → bot.start()
+src/index.ts         → loadConfig() → new Bot(config) → bot.start()
+src/matrix-bridge.ts → loadConfig() → QqMatrixBridge + appservice HTTP 服务
 ```
 
 代码与用户可见文本以中文为主，新注释和消息保持中文。
@@ -29,10 +32,19 @@ cp .env.example .env
 pnpm qq:login           # 扫码绑定机器人，自动把 AppID / AppSecret 写入 .env
 pnpm dev                # tsx watch，加载 .env
 pnpm start              # 正常运行
+pnpm bridge             # 启动 QQ/Tuwunel bridge
+pnpm bridge:dev         # bridge watch 模式
 pnpm typecheck          # TypeScript 检查
+pnpm build              # 编译到 dist/
 pnpm qq:check           # 离线协议自检：配置 / 日志 / Ed25519 / 事件解码 / Bot 组装
+pnpm matrix:check       # Matrix bridge 离线检查
+pnpm matrix:admin       # Matrix 房间成员状态、邀请与踢出 CLI
+pnpm tuwunel:check      # 本机 Tuwunel 双向集成检查
 pnpm webhook:check      # 本地起 webhook 服务，端到端验证收消息
-pnpm integration:check  # typecheck + qq:check + webhook:check
+pnpm integration:check  # typecheck + build + qq:check + matrix:check + webhook:check
+pnpm ci:check           # 与 GitHub Actions 相同的完整门禁
+pnpm deploy:check       # 生产 registration / .env / 权限预检
+pnpm deploy:server      # 本地构建运行包并同步到服务器重启服务
 ```
 
 `qq:check` 不联网、不需要凭据，改协议相关代码后必须运行。
@@ -57,8 +69,18 @@ pnpm integration:check  # typecheck + qq:check + webhook:check
 | `src/logger.ts` | 分级日志：控制台 + 自动落盘（按大小轮转）、密钥脱敏、Error 展开 |
 | `src/bot.ts` | 连接器薄封装：`start`/`stop`、事件分发、聊天记录落盘、回复转发 |
 | `src/chat-log.ts` | 聊天记录持久化：按目标分目录 JSONL + 媒体异步下载 |
+| `src/matrix-bridge.ts` | QQ/Tuwunel bridge 生产入口与生命周期 |
+| `src/matrix/client.ts` | Matrix Client-Server API、媒体上传与下载 |
+| `src/matrix/appservice.ts` | Appservice transaction HTTP 服务与鉴权 |
+| `src/bridge/bridge.ts` | 双向消息转换、路由、提及/引用/媒体与回放 |
+| `src/bridge/store.ts` | schema v7 加密状态、引用、入站队列与媒体映射 |
+| `src/matrix/admin.ts` | 房间成员状态、邀请与踢出的管理逻辑 |
 | `src/scripts/qq-login.ts` | 扫码换取 AppID / AppSecret 并写入 `.env` |
 | `src/scripts/qq-check.ts` | 离线自检 |
+| `src/scripts/matrix-check.ts` | 不依赖 QQ/Tuwunel 的 bridge 离线自检 |
+| `src/scripts/matrix-admin.ts` | Matrix 房间成员管理 CLI |
+| `src/scripts/tuwunel-check.ts` | 本机 Tuwunel 双向集成检查 |
+| `src/scripts/deploy-check.ts` | 生产部署配置预检 |
 | `src/scripts/webhook-check.ts` | 本地 webhook 端到端自检 |
 
 ### 两个官方包的职责
@@ -95,6 +117,19 @@ QQ 平台
 `src/bot.ts` 只应做转发与错误隔离。新增能力时优先看连接器是否已提供，
 再从 `@tencent-connect/qqbot-nodejs` 或 `/protocol` 子导出引入。
 
+### QQ/Tuwunel bridge 约定
+
+- 修改 bridge 前先阅读 `docs/qq-matrix-bridge/PLAN.md`、`STATUS.md` 和
+  `DEPLOYMENT.md`；代码行为变化必须同步三者中受影响的部分。
+- QQ `<@OPENID>` 必须转成可读 `body`、Matrix HTML、`m.mentions` 和稳定的
+  ghost 用户，不得把原始 openid 或 `<@...>` 直接暴露给 Matrix。
+- 引用索引要兼容 `refMsgIdx`、原始 snake_case 字段、`message_scene.ext` 和
+  嵌套 `msg_elements`。`TMP_*` 只能在房间、发送者与摘录唯一匹配时回退。
+- 媒体按 SHA-256 内容寻址；相同字节必须复用本地文件和 Matrix `mxc://`，
+  并合并同哈希并发上传。修改时在 `matrix-check.ts` 增加重复内容断言。
+- 状态文件当前为 schema v7，必须保留 v2-v6 迁移；敏感字段加密、索引
+  使用 HMAC。不要直接改状态 JSON，也不要提交 `data/`、`.env` 或 registration。
+
 ### 事件处理器约定
 
 `Bot.onMessage` / `onInteraction` / `onRawEvent` 按注册顺序串行执行，
@@ -129,11 +164,15 @@ QQ 平台
 
 ## 检查分层
 
-- 只改 `src/` 普通逻辑：`pnpm typecheck` + `pnpm qq:check`。
+- 只改 QQ 机器人普通逻辑：`pnpm typecheck` + `pnpm qq:check`。
+- 改 bridge、Matrix 转换或状态：补 `matrix-check.ts` 断言并运行
+  `pnpm matrix:check`；涉及真实 homeserver 行为时再运行 `pnpm tuwunel:check`。
 - 改配置解析：在 `qq-check.ts` 补充对应断言。
 - 改协议相关行为（事件解码、验签、发送）：同样补充离线断言，避免依赖真实网络。
 - 需要真实凭据的联调（实际收发消息）不属于离线检查，需在配置了 `.env` 后 `pnpm dev` 手动验证，
   不能宣称已在 CI 中验证。
+- 提交前至少运行 `pnpm integration:check` 和 `git diff --check`；协议或部署改动
+  还应运行 `pnpm tuwunel:check`。
 
 ## TypeScript 约束
 
@@ -146,5 +185,6 @@ QQ 平台
 
 ## 规则文件
 
-除本文件外没有额外的 Cursor / Copilot 指令文件。
-`package.json`、`tsconfig.json`、`docs/qq-api/` 是项目操作依据。
+`AGENTS.md` 是通用贡献指南；本文件补充 AI 助手的仓库约定。
+`package.json`、`tsconfig.json`、`docs/qq-matrix-bridge/` 是项目操作依据，
+`docs/qq-api/` 是只读的 QQ 官方协议快照；不要修改上游快照来记录本项目进度。
