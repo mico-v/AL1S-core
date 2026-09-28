@@ -4,6 +4,7 @@
  * 运行：pnpm matrix:check
  */
 
+import { createHash } from 'node:crypto';
 import {
   mkdirSync,
   mkdtempSync,
@@ -196,7 +197,13 @@ function createMockMatrixFetch(state: MockMatrixState): typeof fetch {
     state.requests.push({ method, url, body });
 
     if (url.hostname === 'qq.test') {
-      return new Response(Uint8Array.from([1, 2, 3, 4]), {
+      const body =
+        url.pathname === '/image.png' || url.pathname === '/same-image.png'
+          ? Uint8Array.from([1, 2, 3, 4])
+          : Uint8Array.from(
+              createHash('sha256').update(url.pathname).digest().subarray(0, 8),
+            );
+      return new Response(body, {
         status: 200,
         headers: { 'content-type': 'image/png' },
       });
@@ -261,7 +268,9 @@ function createMockMatrixFetch(state: MockMatrixState): typeof fetch {
     }
     if (method === 'POST' && url.pathname === '/_matrix/media/v3/upload') {
       state.uploads.push({ url });
-      return jsonResponse({ content_uri: 'mxc://matrix.test/uploaded' });
+      return jsonResponse({
+        content_uri: `mxc://matrix.test/uploaded-${String(state.uploads.length)}`,
+      });
     }
     if (method === 'GET' && url.pathname.startsWith('/_matrix/client/v1/media/download/')) {
       return new Response(Uint8Array.from([9, 8, 7]), {
@@ -894,9 +903,10 @@ check(
 const persistedState = JSON.parse(readFileSync(storeFile, 'utf8')) as Record<string, unknown>;
 const persistedText = JSON.stringify(persistedState);
 check(
-  '状态 schema 为 v6 且不含旧 users 映射',
-  persistedState.version === 6 &&
+  '状态 schema 为 v7 且不含旧 users 映射',
+  persistedState.version === 7 &&
     typeof persistedState.pendingQqMessages === 'object' &&
+    typeof persistedState.matrixMedia === 'object' &&
     !('users' in persistedState),
 );
 check(
@@ -939,28 +949,49 @@ check(
     !JSON.stringify(matrixState.sentEvents.at(-1)).includes(expectedGhost),
 );
 
-await bridge.handleQqMessage(
-  groupMessage('qq-message-3', 'QQ-SENDER-1', '', [
-    { content_type: 'image/png', url: 'http://qq.test/image.png', filename: 'image.png' },
-  ]),
-);
+await Promise.all([
+  bridge.handleQqMessage(
+    groupMessage('qq-message-3', 'QQ-SENDER-1', '', [
+      { content_type: 'image/png', url: 'http://qq.test/image.png', filename: 'image.png' },
+    ]),
+  ),
+  bridge.handleQqMessage(
+    groupMessage('qq-message-4', 'QQ-SENDER-1', '', [
+      { content_type: 'image/png', url: 'http://qq.test/same-image.png', filename: 'same-image.png' },
+    ]),
+  ),
+]);
 check('QQ 图片上传到 Matrix', matrixState.uploads.length === 1);
+const imageEventUrls = matrixState.sentEvents
+  .map((event) =>
+    event !== null && typeof event === 'object'
+      ? (event as { body?: { msgtype?: string; url?: string } }).body
+      : undefined,
+  )
+  .filter((body) => body?.msgtype === 'm.image')
+  .map((body) => body?.url);
 check(
-  'QQ 图片事件内容正确',
+  '相同 QQ 图片的两个事件复用 mxc URI',
+  imageEventUrls.length === 2 &&
+    imageEventUrls[0] === 'mxc://matrix.test/uploaded-1' &&
+    imageEventUrls[1] === imageEventUrls[0],
+);
+check(
+  '相同 QQ 图片并发转发只上传一次',
   JSON.stringify(matrixState.sentEvents.at(-1)).includes('"msgtype":"m.image"') &&
-    JSON.stringify(matrixState.sentEvents.at(-1)).includes('mxc://matrix.test/uploaded'),
+    JSON.stringify(matrixState.sentEvents.at(-1)).includes('mxc://matrix.test/uploaded-1'),
 );
 const bridgeMetrics = metrics.render();
 check(
   '指标导出 QQ 消息与媒体计数',
   bridgeMetrics.includes(
-    'al1s_matrix_bridge_qq_messages_total{kind="group",result="forwarded"} 4',
+    'al1s_matrix_bridge_qq_messages_total{kind="group",result="forwarded"} 5',
   ) &&
     bridgeMetrics.includes(
       'al1s_matrix_bridge_qq_messages_total{kind="group",result="duplicate"} 1',
     ) &&
     bridgeMetrics.includes(
-      'al1s_matrix_bridge_media_bytes_total{direction="qq_to_matrix"} 4',
+      'al1s_matrix_bridge_media_bytes_total{direction="qq_to_matrix"} 8',
     ),
 );
 check(
@@ -975,6 +1006,9 @@ check(
     /al1s_matrix_bridge_last_successful_state_write_timestamp_seconds [1-9]\d*(?:\.\d+)?\n/.test(
       bridgeMetrics,
   ),
+);
+await bridge.handleQqMessage(
+  groupMessage('qq-passive-window', 'QQ-SENDER-1', 'refresh passive reply window'),
 );
 
 // ---------------------------------------------------------------------------
@@ -1684,7 +1718,7 @@ check(
 );
 check(
   'Matrix 消息使用 QQ 被动回复窗口',
-  replies[matrixToQqReplyBase]?.target.msgId === 'qq-message-3',
+  replies[matrixToQqReplyBase]?.target.msgId === 'qq-passive-window',
   `actual=${replies[matrixToQqReplyBase]?.target.msgId ?? 'none'}`,
 );
 check('记录 Matrix 事件到 QQ 消息的映射', store.getOutboundMessage('$matrix-text')?.qqMessageId === 'qq-reply');
@@ -1973,6 +2007,12 @@ check('重启后恢复 room 映射', reloaded.getRoomByRoomId('!qq-room:matrix.t
 check('重启后保留 QQ message 去重记录', reloaded.hasQqMessage('qq-message-1'));
 check('重启后保留 Matrix event 去重记录', reloaded.hasMatrixEvent('$matrix-text'));
 check('重启后保留 transaction 去重记录', reloaded.hasTransaction('txn-1'));
+check(
+  '重启后保留 Matrix 媒体映射',
+  reloaded
+    .getMatrixMedia(createHash('sha256').update(Uint8Array.from([1, 2, 3, 4])).digest('hex'))
+    ?.contentUri === 'mxc://matrix.test/uploaded-1',
+);
 check('重启后保留 QQ 出站消息映射', reloaded.getOutboundMessage('$matrix-image')?.qqMessageId === 'qq-reply');
 check(
   '重启后保留 QQ/Matrix 引用映射',
@@ -2056,12 +2096,13 @@ const migratedStore = new BridgeStore({
 await migratedStore.rememberTransaction('v2-migrated');
 const migratedState = JSON.parse(readFileSync(v2File, 'utf8')) as Record<string, unknown>;
 check(
-  'v2 状态平滑迁移为 v6',
-  migratedState.version === 6 &&
+  'v2 状态平滑迁移为 v7',
+  migratedState.version === 7 &&
     typeof migratedState.outboundMessages === 'object' &&
     typeof migratedState.references === 'object' &&
     typeof migratedState.matrixReferences === 'object' &&
     typeof migratedState.pendingQqMessages === 'object' &&
+    typeof migratedState.matrixMedia === 'object' &&
     Array.isArray(migratedState.transactions),
 );
 
@@ -2087,11 +2128,12 @@ const v3MigratedStore = new BridgeStore({
 await v3MigratedStore.rememberTransaction('v3-migrated');
 const v3MigratedState = JSON.parse(readFileSync(v3File, 'utf8')) as Record<string, unknown>;
 check(
-  'v3 状态平滑迁移为 v6',
-  v3MigratedState.version === 6 &&
+  'v3 状态平滑迁移为 v7',
+  v3MigratedState.version === 7 &&
     typeof v3MigratedState.references === 'object' &&
     typeof v3MigratedState.matrixReferences === 'object' &&
-    typeof v3MigratedState.pendingQqMessages === 'object',
+    typeof v3MigratedState.pendingQqMessages === 'object' &&
+    typeof v3MigratedState.matrixMedia === 'object',
 );
 
 const v4File = join(dataDir, 'v4-state.json');
@@ -2118,11 +2160,12 @@ const v4MigratedStore = new BridgeStore({
 await v4MigratedStore.rememberTransaction('v4-migrated');
 const v4MigratedState = JSON.parse(readFileSync(v4File, 'utf8')) as Record<string, unknown>;
 check(
-  'v4 状态平滑迁移为 v6',
-  v4MigratedState.version === 6 &&
+  'v4 状态平滑迁移为 v7',
+  v4MigratedState.version === 7 &&
     Array.isArray(v4MigratedState.transactions) &&
     typeof v4MigratedState.references === 'object' &&
-    typeof v4MigratedState.pendingQqMessages === 'object',
+    typeof v4MigratedState.pendingQqMessages === 'object' &&
+    typeof v4MigratedState.matrixMedia === 'object',
 );
 
 const v5File = join(dataDir, 'v5-state.json');
@@ -2149,10 +2192,42 @@ const v5MigratedStore = new BridgeStore({
 await v5MigratedStore.rememberTransaction('v5-migrated');
 const v5MigratedState = JSON.parse(readFileSync(v5File, 'utf8')) as Record<string, unknown>;
 check(
-  'v5 状态平滑迁移为 v6',
-  v5MigratedState.version === 6 &&
+  'v5 状态平滑迁移为 v7',
+  v5MigratedState.version === 7 &&
     typeof v5MigratedState.pendingQqMessages === 'object' &&
+    typeof v5MigratedState.matrixMedia === 'object' &&
     Array.isArray(v5MigratedState.transactions),
+);
+
+const v6File = join(dataDir, 'v6-state.json');
+writeFileSync(
+  v6File,
+  JSON.stringify({
+    version: 6,
+    rooms: {},
+    transactions: [],
+    matrixEvents: [],
+    qqMessages: [],
+    passiveReplies: {},
+    outboundMessages: {},
+    references: {},
+    matrixReferences: {},
+    pendingQqMessages: {},
+  }),
+  'utf8',
+);
+const v6MigratedStore = new BridgeStore({
+  file: v6File,
+  secret: bridgeConfig.identitySecret,
+  logger: silentLogger,
+});
+await v6MigratedStore.rememberTransaction('v6-migrated');
+const v6MigratedState = JSON.parse(readFileSync(v6File, 'utf8')) as Record<string, unknown>;
+check(
+  'v6 状态平滑迁移为 v7',
+  v6MigratedState.version === 7 &&
+    typeof v6MigratedState.matrixMedia === 'object' &&
+    Array.isArray(v6MigratedState.transactions),
 );
 
 const limitStore = new BridgeStore({

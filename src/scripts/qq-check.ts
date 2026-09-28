@@ -11,6 +11,7 @@
  * 运行：pnpm qq:check
  */
 
+import { createHash } from 'node:crypto';
 import { existsSync, mkdtempSync, readFileSync, readdirSync, rmSync, statSync } from 'node:fs';
 import { createServer } from 'node:http';
 import { tmpdir } from 'node:os';
@@ -342,22 +343,45 @@ try {
   await store.flush();
 
   const groupJsonl = join(dataDir, 'chats/group/GROUP1/messages.jsonl');
-  const groupMedia = join(dataDir, 'chats/group/GROUP1/media/MSG-1-0.png');
+  const pngHash = createHash('sha256').update(pngBytes).digest('hex');
+  const groupMedia = join(dataDir, 'media-cache', pngHash);
   check('按群目标分目录', existsSync(groupJsonl));
   check('媒体文件已下载', existsSync(groupMedia));
   check('媒体内容一致', existsSync(groupMedia) && statSync(groupMedia).size === pngBytes.length);
 
   const lines = readFileSync(groupJsonl, 'utf8').trim().split('\n');
   check('JSONL 仅一行', lines.length === 1);
-  const record = JSON.parse(lines[0] ?? '{}') as { messageId?: string; content?: string; attachments?: Array<{ localPath?: string }> };
+  const record = JSON.parse(lines[0] ?? '{}') as {
+    messageId?: string;
+    content?: string;
+    attachments?: Array<{ localPath?: string; sha256?: string }>;
+  };
   check('记录包含 messageId', record.messageId === 'MSG-1');
   check('记录包含正文', record.content === 'hello');
-  check('记录包含本地媒体路径', record.attachments?.[0]?.localPath === 'chats/group/GROUP1/media/MSG-1-0.png');
+  check(
+    '记录包含内容寻址媒体路径',
+    record.attachments?.[0]?.localPath === `media-cache/${pngHash}` &&
+      record.attachments[0]?.sha256 === pngHash,
+  );
 
   // 重复推送同一 messageId 应去重。
   await store.record(groupMessage);
   await store.flush();
   check('重复 messageId 去重', readFileSync(groupJsonl, 'utf8').trim().split('\n').length === 1);
+
+  // 不同 messageId 携带相同内容时只保留一份媒体。
+  await store.record({ ...groupMessage, messageId: 'MSG-1-DUPLICATE' });
+  await store.flush();
+  const duplicateLines = readFileSync(groupJsonl, 'utf8').trim().split('\n');
+  const duplicateRecord = JSON.parse(duplicateLines[1] ?? '{}') as {
+    attachments?: Array<{ localPath?: string }>;
+  };
+  check(
+    '不同消息的相同媒体指向同一文件',
+    duplicateLines.length === 2 &&
+      duplicateRecord.attachments?.[0]?.localPath === `media-cache/${pngHash}`,
+  );
+  check('媒体缓存只有一个内容文件', readdirSync(join(dataDir, 'media-cache')).length === 1);
 
   // 单聊目标分目录。
   const c2cMessage: QQBotInboundMessage = {
@@ -388,7 +412,7 @@ try {
   };
   await tinyStore.record(bigMessage);
   await tinyStore.flush();
-  check('超限媒体不落盘', !existsSync(join(dataDir, 'chats/group/GROUP1/media/MSG-3-0.png')));
+  check('超限媒体不写内容缓存', readdirSync(join(dataDir, 'media-cache')).length === 1);
   check('超限媒体写错误日志', existsSync(join(dataDir, 'chats/group/GROUP1/media/download-errors.log')));
 } finally {
   rmSync(dataDir, { recursive: true, force: true });

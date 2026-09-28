@@ -6,25 +6,25 @@
  * ```text
  * data/chats/
  *   group/<group_openid>/messages.jsonl
- *   group/<group_openid>/media/<messageId>-<index>.<ext>
  *   c2c/<user_openid>/messages.jsonl
- *   c2c/<user_openid>/media/...
  *   guild/<guildId>/<channelId>/messages.jsonl
  *   dm/<user_openid>/messages.jsonl
+ * data/media-cache/<sha256>
  * ```
  *
  * 设计要点：
  *   - 每行一条 JSON（JSONL），追加写，便于 grep / tail / 逐行解析；
  *   - 同一 messageId 重复推送会去重，不重复记录、不重复下载；
- *   - 媒体在记录写入后异步下载，不阻塞消息回复；
- *   - 文件名由 messageId + 序号推导，天然幂等；已存在则跳过；
+ *   - 媒体异步下载，不阻塞消息回复；
+ *   - 媒体按 SHA-256 全局去重，文件路径只取决于内容；
  *   - 下载失败写 `<dir>/media/download-errors.log`，不影响主流程；
  *   - 路径段与文件名做净化，防止目录穿越。
  */
 
+import { createHash } from 'node:crypto';
 import { appendFileSync, existsSync, mkdirSync } from 'node:fs';
 import { writeFile } from 'node:fs/promises';
-import { extname, join, relative } from 'node:path';
+import { join, relative } from 'node:path';
 import type { QQBotInboundMessage } from '@tencent-connect/qqbot-nodejs';
 import type { InboundAttachment } from '@tencent-connect/qqbot-nodejs/protocol';
 import type { AppLogger } from './logger.js';
@@ -50,8 +50,10 @@ export interface ChatAttachmentRecord {
   height?: number;
   voiceWavUrl?: string;
   asrReferText?: string;
-  /** 相对 data 根目录的本地路径（图片/视频/语音/文件）。 */
+  /** 相对 data 根目录的内容寻址路径（图片/视频/语音/文件）。 */
   localPath?: string;
+  /** 本地媒体文件的 SHA-256。 */
+  sha256?: string;
   /** 语音转码后的 WAV 本地路径（如有）。 */
   localWavPath?: string;
 }
@@ -79,22 +81,19 @@ export interface ChatRecord {
   attachments: ChatAttachmentRecord[];
 }
 
+interface StoredMedia {
+  absolutePath: string;
+  sha256: string;
+}
+
+interface DownloadTask {
+  url: string;
+  label: string;
+  apply: (media: StoredMedia) => void;
+}
+
 const DEFAULT_MAX_MEDIA_BYTES = 50 * 1024 * 1024;
 const SEEN_LIMIT = 20_000;
-
-const MIME_EXTENSION: Record<string, string> = {
-  'image/jpeg': '.jpg',
-  'image/jpg': '.jpg',
-  'image/png': '.png',
-  'image/gif': '.gif',
-  'image/webp': '.webp',
-  'image/bmp': '.bmp',
-  'video/mp4': '.mp4',
-  'audio/mpeg': '.mp3',
-  'audio/mp4': '.m4a',
-  'audio/amr': '.amr',
-  voice: '.silk',
-};
 
 /** 净化单个路径段，防止目录穿越。 */
 function safeSegment(value: string): string {
@@ -105,41 +104,6 @@ function safeSegment(value: string): string {
   return cleaned;
 }
 
-function safeId(value: string): string {
-  const cleaned = value.replace(/[^A-Za-z0-9._-]/g, '_').slice(0, 48);
-  return cleaned === '' ? String(Date.now()) : cleaned;
-}
-
-function guessExtension(contentType: string, filename?: string): string {
-  if (filename !== undefined) {
-    const ext = extname(filename).toLowerCase();
-    if (/^\.[a-z0-9]{1,8}$/.test(ext)) {
-      return ext;
-    }
-  }
-  const mapped = MIME_EXTENSION[contentType.toLowerCase()];
-  if (mapped !== undefined) {
-    return mapped;
-  }
-  const slash = contentType.indexOf('/');
-  if (slash >= 0) {
-    const subtype = contentType
-      .slice(slash + 1)
-      .toLowerCase()
-      .replace(/[^a-z0-9]/g, '');
-    if (subtype !== '') {
-      return `.${subtype.slice(0, 8)}`;
-    }
-  }
-  return '.bin';
-}
-
-interface DownloadTask {
-  url: string;
-  absolutePath: string;
-  label: string;
-}
-
 export class ChatStore {
   private readonly root: string;
   private readonly saveMedia: boolean;
@@ -147,7 +111,9 @@ export class ChatStore {
   private readonly fetchImpl: typeof fetch;
   private readonly logger?: AppLogger;
   private readonly seen = new Set<string>();
-  private pending = new Set<Promise<void>>();
+  private readonly pending = new Set<Promise<void>>();
+  private readonly downloadsByUrl = new Map<string, Promise<StoredMedia | undefined>>();
+  private readonly writesByHash = new Map<string, Promise<StoredMedia>>();
   private disabled = false;
 
   constructor(options: ChatStoreOptions) {
@@ -158,6 +124,7 @@ export class ChatStore {
     this.logger = options.logger;
     try {
       mkdirSync(join(this.root, 'chats'), { recursive: true });
+      mkdirSync(join(this.root, 'media-cache'), { recursive: true });
     } catch (error) {
       // 目录不可写（如权限问题）时禁用落盘，不影响机器人运行。
       this.disabled = true;
@@ -186,9 +153,8 @@ export class ChatStore {
       return;
     }
 
-    const mediaDir = join(dir, 'media');
     const tasks: DownloadTask[] = [];
-    const attachments = this.buildAttachments(message, mediaDir, tasks);
+    const attachments = this.buildAttachments(message, tasks);
     const record: ChatRecord = {
       recordedAt: new Date().toISOString(),
       timestamp: message.timestamp,
@@ -209,15 +175,13 @@ export class ChatStore {
       messageScene: message.messageScene,
       attachments,
     };
-
-    appendFileSync(join(dir, 'messages.jsonl'), `${JSON.stringify(record)}\n`, 'utf8');
+    const jsonlPath = join(dir, 'messages.jsonl');
 
     if (this.saveMedia && tasks.length > 0) {
-      mkdirSync(mediaDir, { recursive: true });
-      for (const task of tasks) {
-        this.track(this.download(task, mediaDir));
-      }
+      this.track(this.persistWithMedia(record, jsonlPath, join(dir, 'media'), tasks));
+      return;
     }
+    this.appendRecord(jsonlPath, record);
   }
 
   /** 等待所有进行中的媒体下载完成（用于优雅退出 / 测试）。 */
@@ -258,24 +222,10 @@ export class ChatStore {
 
   private buildAttachments(
     message: QQBotInboundMessage,
-    mediaDir: string,
     tasks: DownloadTask[],
   ): ChatAttachmentRecord[] {
-    const list = message.attachments ?? [];
-    const id = safeId(message.messageId);
-    return list.map((attachment, index) => {
-      const extension = guessExtension(attachment.content_type, attachment.filename);
-      const absolutePath = join(mediaDir, `${id}-${index}${extension}`);
-      tasks.push({ url: attachment.url, absolutePath, label: `attachment#${index}` });
-
-      let localWavPath: string | undefined;
-      if (attachment.voice_wav_url !== undefined && attachment.voice_wav_url !== '') {
-        const wavAbsolute = join(mediaDir, `${id}-${index}-wav.wav`);
-        tasks.push({ url: attachment.voice_wav_url, absolutePath: wavAbsolute, label: `attachment#${index}-wav` });
-        localWavPath = relative(this.root, wavAbsolute);
-      }
-
-      return {
+    return (message.attachments ?? []).map((attachment, index) => {
+      const record: ChatAttachmentRecord = {
         contentType: attachment.content_type,
         url: attachment.url,
         filename: attachment.filename,
@@ -284,9 +234,26 @@ export class ChatStore {
         height: attachment.height,
         voiceWavUrl: attachment.voice_wav_url,
         asrReferText: attachment.asr_refer_text,
-        localPath: relative(this.root, absolutePath),
-        localWavPath,
       };
+      tasks.push({
+        url: attachment.url,
+        label: `attachment#${index}`,
+        apply: (media) => {
+          record.localPath = relative(this.root, media.absolutePath);
+          record.sha256 = media.sha256;
+        },
+      });
+
+      if (attachment.voice_wav_url !== undefined && attachment.voice_wav_url !== '') {
+        tasks.push({
+          url: attachment.voice_wav_url,
+          label: `attachment#${index}-wav`,
+          apply: (media) => {
+            record.localWavPath = relative(this.root, media.absolutePath);
+          },
+        });
+      }
+      return record;
     });
   }
 
@@ -297,12 +264,50 @@ export class ChatStore {
     });
   }
 
-  private async download(task: DownloadTask, mediaDir: string): Promise<void> {
-    if (existsSync(task.absolutePath)) {
-      return;
-    }
+  private async persistWithMedia(
+    record: ChatRecord,
+    jsonlPath: string,
+    mediaDir: string,
+    tasks: DownloadTask[],
+  ): Promise<void> {
+    await Promise.all(tasks.map((task) => this.download(task, mediaDir)));
+    this.appendRecord(jsonlPath, record);
+  }
+
+  private appendRecord(jsonlPath: string, record: ChatRecord): void {
     try {
-      const response = await this.fetchImpl(task.url, { redirect: 'follow' });
+      appendFileSync(jsonlPath, `${JSON.stringify(record)}\n`, 'utf8');
+    } catch (error) {
+      this.logger?.error('写入聊天记录失败', {
+        file: relative(this.root, jsonlPath),
+        error: error instanceof Error ? error.message : String(error),
+      });
+    }
+  }
+
+  private async download(task: DownloadTask, mediaDir: string): Promise<void> {
+    let pending = this.downloadsByUrl.get(task.url);
+    if (pending === undefined) {
+      pending = this.downloadUncached(task.url, mediaDir);
+      this.downloadsByUrl.set(task.url, pending);
+      void pending.finally(() => {
+        if (this.downloadsByUrl.get(task.url) === pending) {
+          this.downloadsByUrl.delete(task.url);
+        }
+      });
+    }
+    const media = await pending;
+    if (media !== undefined) {
+      task.apply(media);
+    }
+  }
+
+  private async downloadUncached(
+    url: string,
+    mediaDir: string,
+  ): Promise<StoredMedia | undefined> {
+    try {
+      const response = await this.fetchImpl(url, { redirect: 'follow' });
       if (!response.ok) {
         throw new Error(`HTTP ${response.status}`);
       }
@@ -314,19 +319,56 @@ export class ChatStore {
       if (buffer.byteLength > this.maxMediaBytes) {
         throw new Error(`文件 ${buffer.byteLength} 字节，超过上限 ${this.maxMediaBytes}`);
       }
-      await writeFile(task.absolutePath, buffer);
-      this.logger?.debug('媒体已保存', { file: relative(this.root, task.absolutePath), bytes: buffer.byteLength });
+      return await this.storeBuffer(buffer);
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);
-      this.logger?.warn('媒体下载失败', { label: task.label, url: task.url, error: message });
+      this.logger?.warn('媒体下载失败', { url, error: message });
       try {
+        mkdirSync(mediaDir, { recursive: true });
         appendFileSync(
           join(mediaDir, 'download-errors.log'),
-          `${JSON.stringify({ at: new Date().toISOString(), label: task.label, url: task.url, error: message })}\n`,
+          `${JSON.stringify({ at: new Date().toISOString(), url, error: message })}\n`,
           'utf8',
         );
       } catch {
         // 忽略错误日志本身的写入失败。
+      }
+      return undefined;
+    }
+  }
+
+  private async storeBuffer(buffer: Buffer): Promise<StoredMedia> {
+    const sha256 = createHash('sha256').update(buffer).digest('hex');
+    const absolutePath = join(this.root, 'media-cache', sha256);
+    const existing = this.writesByHash.get(sha256);
+    if (existing !== undefined) {
+      return existing;
+    }
+
+    const write = (async (): Promise<StoredMedia> => {
+      if (!existsSync(absolutePath)) {
+        try {
+          await writeFile(absolutePath, buffer, { flag: 'wx' });
+        } catch (error) {
+          if ((error as NodeJS.ErrnoException).code !== 'EEXIST') {
+            throw error;
+          }
+        }
+      }
+      this.logger?.debug('媒体已保存', {
+        file: relative(this.root, absolutePath),
+        bytes: buffer.byteLength,
+        sha256,
+      });
+      return { absolutePath, sha256 };
+    })();
+
+    this.writesByHash.set(sha256, write);
+    try {
+      return await write;
+    } finally {
+      if (this.writesByHash.get(sha256) === write) {
+        this.writesByHash.delete(sha256);
       }
     }
   }

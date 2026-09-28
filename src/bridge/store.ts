@@ -92,6 +92,13 @@ interface StoredPendingQqMessage {
   nextAttemptAt: number;
 }
 
+interface StoredMatrixMediaUpload {
+  contentUri: string;
+  contentType: string;
+  size: number;
+  createdAt: string;
+}
+
 interface PersistedStateV4 {
   version: 4;
   rooms: Record<string, StoredRoomRecord>;
@@ -104,7 +111,7 @@ interface PersistedStateV4 {
   matrixReferences: Record<string, string>;
 }
 
-interface PersistedState {
+interface PersistedStateV6 {
   version: 6;
   rooms: Record<string, StoredRoomRecord>;
   transactions: string[];
@@ -115,6 +122,11 @@ interface PersistedState {
   references: Record<string, StoredReference>;
   matrixReferences: Record<string, string>;
   pendingQqMessages: Record<string, StoredPendingQqMessage>;
+}
+
+interface PersistedState extends Omit<PersistedStateV6, 'version'> {
+  version: 7;
+  matrixMedia: Record<string, StoredMatrixMediaUpload>;
 }
 
 interface PersistedStateV5 {
@@ -149,6 +161,13 @@ export interface PendingQqMessage {
   nextAttemptAt: number;
 }
 
+export interface MatrixMediaUpload {
+  contentUri: string;
+  contentType: string;
+  size: number;
+  createdAt: string;
+}
+
 export interface BridgeStoreOptions {
   file: string;
   /** 与 QQ openid HMAC 使用相同的长期密钥，用于加密状态字段。 */
@@ -162,6 +181,8 @@ export interface BridgeStoreOptions {
   maxReferences?: number;
   /** 待处理 QQ 入站消息最大条数。 */
   maxPendingQqMessages?: number;
+  /** Matrix 媒体映射最大条数。 */
+  maxMediaMappings?: number;
   now?: () => number;
 }
 
@@ -172,10 +193,11 @@ interface PassiveLimit {
   windowMs: number;
 }
 
-const STATE_VERSION = 6;
+const STATE_VERSION = 7;
 const DEFAULT_REFERENCE_TTL_MS = 30 * 24 * 60 * 60 * 1000;
 const DEFAULT_MAX_REFERENCES = 10_000;
 const DEFAULT_MAX_PENDING_QQ_MESSAGES = 10_000;
+const DEFAULT_MAX_MEDIA_MAPPINGS = 20_000;
 const PASSIVE_LIMITS: Record<ConversationKind, PassiveLimit> = {
   group: { limit: 5, windowMs: 5 * 60 * 1000 },
   c2c: { limit: 4, windowMs: 60 * 60 * 1000 },
@@ -252,6 +274,17 @@ function isStoredPendingQqMessage(value: unknown): value is StoredPendingQqMessa
     Number.isFinite(value.createdAt) &&
     typeof value.nextAttemptAt === 'number' &&
     Number.isFinite(value.nextAttemptAt)
+  );
+}
+
+function isStoredMatrixMediaUpload(value: unknown): value is StoredMatrixMediaUpload {
+  return (
+    isObject(value) &&
+    typeof value.contentUri === 'string' &&
+    typeof value.contentType === 'string' &&
+    typeof value.size === 'number' &&
+    Number.isFinite(value.size) &&
+    typeof value.createdAt === 'string'
   );
 }
 
@@ -334,6 +367,22 @@ function isPersistedStateV5(value: unknown): value is PersistedStateV5 {
   );
 }
 
+function isPersistedStateV6(value: unknown): value is PersistedStateV6 {
+  return (
+    isObject(value) &&
+    value.version === 6 &&
+    hasPersistedBaseFields(value) &&
+    isObject(value.outboundMessages) &&
+    Object.values(value.outboundMessages).every(isStoredOutboundMessage) &&
+    isObject(value.references) &&
+    Object.values(value.references).every(isStoredReference) &&
+    isObject(value.matrixReferences) &&
+    Object.values(value.matrixReferences).every((item) => typeof item === 'string') &&
+    isObject(value.pendingQqMessages) &&
+    Object.values(value.pendingQqMessages).every(isStoredPendingQqMessage)
+  );
+}
+
 function isPersistedState(value: unknown): value is PersistedState {
   return (
     isObject(value) &&
@@ -346,7 +395,9 @@ function isPersistedState(value: unknown): value is PersistedState {
     isObject(value.matrixReferences) &&
     Object.values(value.matrixReferences).every((item) => typeof item === 'string') &&
     isObject(value.pendingQqMessages) &&
-    Object.values(value.pendingQqMessages).every(isStoredPendingQqMessage)
+    Object.values(value.pendingQqMessages).every(isStoredPendingQqMessage) &&
+    isObject(value.matrixMedia) &&
+    Object.values(value.matrixMedia).every(isStoredMatrixMediaUpload)
   );
 }
 
@@ -389,6 +440,7 @@ export class BridgeStore {
   private readonly referenceTtlMs: number;
   private readonly maxReferences: number;
   private readonly maxPendingQqMessages: number;
+  private readonly maxMediaMappings: number;
   private readonly now: () => number;
   private readonly encryptionKey: Buffer;
   private state: PersistedState;
@@ -408,6 +460,10 @@ export class BridgeStore {
     this.maxPendingQqMessages = Math.max(
       1,
       options.maxPendingQqMessages ?? DEFAULT_MAX_PENDING_QQ_MESSAGES,
+    );
+    this.maxMediaMappings = Math.max(
+      1,
+      options.maxMediaMappings ?? DEFAULT_MAX_MEDIA_MAPPINGS,
     );
     this.now = options.now ?? Date.now;
     this.encryptionKey = createHash('sha256')
@@ -663,6 +719,30 @@ export class BridgeStore {
     }
   }
 
+  getMatrixMedia(sha256: string): MatrixMediaUpload | undefined {
+    const stored = this.state.matrixMedia[this.indexKey('matrix-media', sha256)];
+    if (stored === undefined) {
+      return undefined;
+    }
+    return {
+      contentUri: this.decrypt(stored.contentUri),
+      contentType: stored.contentType,
+      size: stored.size,
+      createdAt: stored.createdAt,
+    };
+  }
+
+  async rememberMatrixMedia(sha256: string, upload: Omit<MatrixMediaUpload, 'createdAt'>): Promise<void> {
+    this.state.matrixMedia[this.indexKey('matrix-media', sha256)] = {
+      contentUri: this.encrypt(upload.contentUri),
+      contentType: upload.contentType,
+      size: upload.size,
+      createdAt: new Date(this.now()).toISOString(),
+    };
+    trimRecord(this.state.matrixMedia, this.maxMediaMappings);
+    await this.save();
+  }
+
   getReference(qqReference: string): BridgeReference | undefined {
     const referenceKey = this.indexKey('qq-reference', qqReference);
     const stored = this.state.references[referenceKey];
@@ -789,34 +869,45 @@ export class BridgeStore {
       if (isPersistedState(parsed)) {
         return parsed;
       }
+      if (isPersistedStateV6(parsed)) {
+        this.logger?.info('Matrix bridge 状态已从 v6 升级为 v7');
+        return {
+          ...parsed,
+          version: STATE_VERSION,
+          matrixMedia: {},
+        };
+      }
       if (isPersistedStateV5(parsed)) {
-        this.logger?.info('Matrix bridge 状态已从 v5 升级为 v6');
+        this.logger?.info('Matrix bridge 状态已从 v5 升级为 v7');
         return {
           ...parsed,
           version: STATE_VERSION,
           pendingQqMessages: {},
+          matrixMedia: {},
         };
       }
       if (isPersistedStateV4(parsed)) {
-        this.logger?.info('Matrix bridge 状态已从 v4 升级为 v6');
+        this.logger?.info('Matrix bridge 状态已从 v4 升级为 v7');
         return {
           ...parsed,
           version: STATE_VERSION,
           pendingQqMessages: {},
+          matrixMedia: {},
         };
       }
       if (isPersistedStateV3(parsed)) {
-        this.logger?.info('Matrix bridge 状态已从 v3 升级为 v6');
+        this.logger?.info('Matrix bridge 状态已从 v3 升级为 v7');
         return {
           ...parsed,
           version: STATE_VERSION,
           references: {},
           matrixReferences: {},
           pendingQqMessages: {},
+          matrixMedia: {},
         };
       }
       if (isPersistedStateV2(parsed)) {
-        this.logger?.info('Matrix bridge 状态已从 v2 升级为 v6');
+        this.logger?.info('Matrix bridge 状态已从 v2 升级为 v7');
         return {
           ...parsed,
           version: STATE_VERSION,
@@ -824,6 +915,7 @@ export class BridgeStore {
           references: {},
           matrixReferences: {},
           pendingQqMessages: {},
+          matrixMedia: {},
         };
       }
       throw new Error(`状态文件版本或字段无效，需要 version ${String(STATE_VERSION)}`);
@@ -931,5 +1023,6 @@ function emptyState(): PersistedState {
     references: {},
     matrixReferences: {},
     pendingQqMessages: {},
+    matrixMedia: {},
   };
 }

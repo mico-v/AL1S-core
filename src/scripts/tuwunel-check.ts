@@ -61,6 +61,7 @@ const QQ_BODY = 'QQ -> Matrix integration check';
 const STRUCTURED_QQ_MESSAGE_ID = 'tuwunel-check-structured-message';
 const STRUCTURED_QQ_BODY = '结构化首条\n结构化嵌套条';
 const QQ_MEDIA_MESSAGE_ID = 'tuwunel-check-media-message';
+const QQ_MEDIA_REPEAT_MESSAGE_ID = 'tuwunel-check-media-repeat-message';
 const QQ_MEDIA_BODY = 'QQ media -> Matrix integration check';
 const QQ_MEDIA_FILENAME = 'qq-image.png';
 const REFERENCE_QQ_MESSAGE_ID = 'tuwunel-check-reference-message';
@@ -469,7 +470,10 @@ function groupMessage(): QQBotInboundMessage {
   };
 }
 
-function mediaGroupMessage(url: string): QQBotInboundMessage {
+function mediaGroupMessage(
+  url: string,
+  messageId = QQ_MEDIA_MESSAGE_ID,
+): QQBotInboundMessage {
   const timestamp = new Date().toISOString();
   const attachment = {
     content_type: MEDIA_CONTENT_TYPE,
@@ -482,17 +486,17 @@ function mediaGroupMessage(url: string): QQBotInboundMessage {
     senderId: QQ_USER_ID,
     senderName: 'Tuwunel check user',
     content: QQ_MEDIA_BODY,
-    messageId: QQ_MEDIA_MESSAGE_ID,
+    messageId,
     timestamp,
     groupOpenid: GROUP_OPENID,
     attachments: [attachment],
     replyTarget: {
       scope: 'group',
       targetId: GROUP_OPENID,
-      msgId: QQ_MEDIA_MESSAGE_ID,
+      msgId: messageId,
     },
     raw: {
-      id: QQ_MEDIA_MESSAGE_ID,
+      id: messageId,
       content: QQ_MEDIA_BODY,
       timestamp,
       author: {
@@ -1073,6 +1077,30 @@ async function main(): Promise<void> {
       downloadedQqMedia.data.equals(MEDIA_BYTES) &&
         downloadedQqMedia.contentType.startsWith(MEDIA_CONTENT_TYPE),
       `${String(downloadedQqMedia.data.byteLength)} bytes, ${downloadedQqMedia.contentType}`,
+    );
+
+    await bridge.handleQqMessage(
+      mediaGroupMessage(mediaFixture.url, QQ_MEDIA_REPEAT_MESSAGE_ID),
+    );
+    const repeatedMediaEvents = await waitFor('重复 QQ 媒体 transaction', async () => {
+      const events = transactionEvents(transactions).filter(
+        (candidate) =>
+          candidate.sender === ghostUserId &&
+          candidate.room_id === room.roomId &&
+          candidate.type === 'm.room.message' &&
+          stringField(candidate.content, 'msgtype') === 'm.image' &&
+          stringField(candidate.content, 'body') === QQ_MEDIA_FILENAME,
+      );
+      if (events.length < 2) {
+        throw new Error('尚未收到两条对应事件');
+      }
+      return events;
+    });
+    check(
+      '相同 QQ 媒体始终复用同一 mxc URI',
+      stringField(repeatedMediaEvents[0]?.content ?? {}, 'url') ===
+        stringField(repeatedMediaEvents[1]?.content ?? {}, 'url') &&
+        stringField(repeatedMediaEvents[0]?.content ?? {}, 'url') === qqMediaUri,
     );
 
     const bridgeMember = await matrix.getRoomMember(room.roomId, bridgeConfig.userId);

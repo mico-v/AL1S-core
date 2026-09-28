@@ -5,7 +5,7 @@
  * 因为 QQ 官方平台不允许第三方机器人冒充普通 QQ 用户。
  */
 
-import { createHmac } from 'node:crypto';
+import { createHash, createHmac } from 'node:crypto';
 import { setTimeout as sleep } from 'node:timers/promises';
 import {
   ApiError,
@@ -584,6 +584,7 @@ export class QqMatrixBridge {
   private readonly sleepImpl: (delayMs: number) => Promise<void>;
   private readonly qqMessagesInFlight = new Set<string>();
   private readonly qqMessageTasks = new Set<Promise<void>>();
+  private readonly matrixUploadsInFlight = new Map<string, Promise<string>>();
   private readonly roomEnsuring = new Map<string, Promise<BridgeRoomRecord>>();
   private replayTimer?: NodeJS.Timeout;
   private replayTask?: Promise<void>;
@@ -1104,7 +1105,9 @@ export class QqMatrixBridge {
     this.metrics?.addMediaBytes('qq_to_matrix', downloaded.data.byteLength);
     const contentType = downloaded.contentType;
     const filename = attachment.filename ?? `qq-${String(index + 1)}`;
-    const contentUri = await this.matrix.uploadMedia(
+    const sha256 = createHash('sha256').update(downloaded.data).digest('hex');
+    const contentUri = await this.uploadMatrixMedia(
+      sha256,
       downloaded.data,
       contentType,
       filename,
@@ -1129,6 +1132,42 @@ export class QqMatrixBridge {
       ghostUserId,
     );
     return response.event_id;
+  }
+
+  private async uploadMatrixMedia(
+    sha256: string,
+    data: Buffer,
+    contentType: string,
+    filename: string,
+    asUser: string,
+  ): Promise<string> {
+    const cached = this.store.getMatrixMedia(sha256);
+    if (cached !== undefined) {
+      return cached.contentUri;
+    }
+
+    const pending = this.matrixUploadsInFlight.get(sha256);
+    if (pending !== undefined) {
+      return pending;
+    }
+
+    const upload = (async (): Promise<string> => {
+      const contentUri = await this.matrix.uploadMedia(data, contentType, filename, asUser);
+      await this.store.rememberMatrixMedia(sha256, {
+        contentUri,
+        contentType,
+        size: data.byteLength,
+      });
+      return contentUri;
+    })();
+    this.matrixUploadsInFlight.set(sha256, upload);
+    const clear = (): void => {
+      if (this.matrixUploadsInFlight.get(sha256) === upload) {
+        this.matrixUploadsInFlight.delete(sha256);
+      }
+    };
+    upload.then(clear, clear);
+    return upload;
   }
 
   private async handleMatrixEvent(event: MatrixEvent): Promise<void> {
@@ -1205,6 +1244,7 @@ export class QqMatrixBridge {
       const downloaded = await this.matrix.downloadMedia(mediaUrl, this.maxMediaBytes);
       this.metrics?.addMediaBytes('matrix_to_qq', downloaded.data.byteLength);
       const target = await this.qqTarget(room);
+      // QQ SDK 按内容哈希缓存 file_info，并只在其 ttl 有效期内复用。
       const response = await this.sendQqWithRecovery(room, target, (currentTarget) =>
         this.bot.sendMedia({
           target: currentTarget,
