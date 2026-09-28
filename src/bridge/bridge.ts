@@ -103,7 +103,7 @@ const STRUCTURED_MAX_TEXT_LENGTH = 4096;
 const STRUCTURED_MAX_EXCERPT_LENGTH = 500;
 const MAX_QQ_FACE_EXT_BYTES = 64 * 1024;
 const STRUCTURED_TRUNCATION_MARKER = '\n[消息过长，已截断]';
-const QQ_FACE_TAG_PATTERN = /<faceType=\d+,faceId="[^"]*",ext="([^"]*)">/g;
+const QQ_TYPE_TAG_PATTERN = /<([A-Za-z][A-Za-z0-9_]*Type)=([^>]*)>/g;
 const ARK_FIELD_KEYS = ['title', 'desc', 'tag', 'tags', 'source', 'nickname', 'address'] as const;
 
 function digest(secret: string, value: string, length = 64): string {
@@ -169,15 +169,37 @@ function decodeQqFaceName(ext: string): string | undefined {
   }
 }
 
+function quotedTagAttribute(attributes: string, name: string): string | undefined {
+  const prefix = `${name}=`;
+  for (const part of attributes.split(',')) {
+    const field = part.trim();
+    if (!field.startsWith(prefix)) {
+      continue;
+    }
+    const value = field.slice(prefix.length).trim();
+    if (value.startsWith('"') && value.endsWith('"')) {
+      return value.slice(1, -1);
+    }
+  }
+  return undefined;
+}
+
 /**
- * 将 QQ face 标签转换为可读文本。
+ * 将 QQ 结构化标签转换为可读文本。
  *
- * 图片消息常携带 `faceType=6,faceId="0",ext={"text":""}` 占位符；
- * 空名称必须渲染为空，避免在真实图片前多发一条无意义文本。
+ * `faceType` 的 `ext.text` 是可读名称；`attachmentType` 等标签只描述
+ * 随消息另行携带的附件，必须删除，避免原始调试标签和真实媒体重复发送。
  */
 function renderQqContent(value: string): string {
   return value
-    .replace(QQ_FACE_TAG_PATTERN, (_tag: string, ext: string): string => {
+    .replace(QQ_TYPE_TAG_PATTERN, (_tag: string, tagName: string, attributes: string): string => {
+      if (tagName !== 'faceType') {
+        return '';
+      }
+      const ext = quotedTagAttribute(attributes, 'ext');
+      if (ext === undefined) {
+        return '';
+      }
       const name = decodeQqFaceName(ext);
       return name === undefined ? '' : `【表情: ${name}】`;
     })
@@ -464,7 +486,7 @@ function quoteFallback(sender: string, excerpt: string): string {
     .replace(/\r\n?/g, '\n')
     .split('\n')
     .map((line) => `> ${line}`);
-  return [`> <${sender}>`, ...lines].join('\n');
+  return [`> ${sender}`, ...lines].join('\n');
 }
 
 function isTerminalRecallError(error: unknown): boolean {
@@ -811,9 +833,9 @@ export class QqMatrixBridge {
       quoted === undefined
         ? {}
         : { 'm.relates_to': { rel_type: 'm.in_reply_to', event_id: quoted.matrixEventId } };
-    const quotedSender = quoted?.sender ?? structured.quoteSender ?? senderDisplayName;
+    const quotedSender = structured.quoteSender ?? senderDisplayName;
     const body =
-      structured.quoteExcerpt === undefined
+      structured.quoteExcerpt === undefined || quoted !== undefined
         ? structured.text
         : `${quoteFallback(quotedSender, structured.quoteExcerpt)}\n\n${structured.text}`;
 

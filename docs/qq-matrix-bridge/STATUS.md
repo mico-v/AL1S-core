@@ -37,8 +37,8 @@
 | 状态文件原子持久化 | DONE | 同目录临时文件、文件/目录 `fsync`、原子替换和失败重试通过；新建目录/文件权限分别为 `0700`/`0600` |
 | Matrix 撤回映射 | DONE | 离线检查覆盖清理映射；真实 Tuwunel 验证 redaction 回推后映射为 QQ recall |
 | Matrix 编辑处理 | DONE | 当前策略为忽略 `m.replace`，避免重复发送 QQ 消息 |
-| QQ/Matrix 引用映射 | DONE | 双向引用、fallback 正文、重启恢复及真实 Tuwunel 引用链检查通过 |
-| QQ 结构化消息 | DONE | `message_type=3/101/102/103` 卡片、并行、聊天记录与引用消息转为有界文本；嵌套附件去重转发，深度/元素/附件/长度上限均覆盖离线检查 |
+| QQ/Matrix 引用映射 | DONE | 已知 QQ 引用只发送 `m.in_reply_to` 与回复正文，未知引用保留清理后的文本 fallback；双向引用、重启恢复及真实 Tuwunel 引用链检查通过 |
+| QQ 结构化消息 | DONE | `message_type=3/101/102/103` 卡片、并行、聊天记录与引用消息转为有界文本；嵌套附件去重转发，`faceType` 解码、`attachmentType` 等 `*Type=` 标签过滤，深度/元素/附件/长度上限均覆盖检查 |
 | QQ 出站频控与重试 | DONE | `40034005`/`40034128` 降级主动消息，`40034100` 指数退避后交由 transaction 重试 |
 | QQ 反向撤回映射 | BLOCKED | 官方群聊/单聊事件清单未提供撤回事件，需平台新增推送或实测发现等价事件 |
 | 引用映射历史清理 | DONE | 默认 30 天 TTL、10,000 条上限、正反索引联动清理及重启持久化检查通过 |
@@ -63,6 +63,13 @@
 
 ### 2026-09-28
 
+- 修正 QQ 结构化标签与引用正文：`faceType.ext.text` 保留可读表情名，
+  `attachmentType` 及未知 `*Type=` 标签统一移除，真实附件只发送对应 Matrix
+  媒体事件；已有 Matrix event 映射的 QQ 引用不再重复写入 `> <...>` fallback
+  正文，未知引用改为不含尖括号的可读文本回退。
+- 本轮验证：`pnpm integration:check`、
+  `TUWUNEL_BIN=/home/x/github.com/matrix-construct/tuwunel/target/release/tuwunel pnpm tuwunel:check`
+  与 `git diff --check` 通过。
 - 增加 `pnpm tuwunel:check:host`，支持通过 `TUWUNEL_BIN` 或
   `TUWUNEL_SOURCE_DIR` 启动本机 Tuwunel，并继续使用临时数据库、
   registration 和随机端口；检查结束会停止进程并清理临时目录。

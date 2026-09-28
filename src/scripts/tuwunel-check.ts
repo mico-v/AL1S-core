@@ -540,6 +540,13 @@ function referencedGroupMessage(): QQBotInboundMessage {
 
 function quotedGroupMessage(): QQBotInboundMessage {
   const timestamp = new Date().toISOString();
+  const elements = [
+    {
+      message_type: 0,
+      author: { username: 'Tuwunel check user' },
+      content: REFERENCE_QQ_BODY,
+    },
+  ];
   return {
     rawEventType: 'GROUP_AT_MESSAGE_CREATE',
     kind: 'group',
@@ -550,6 +557,8 @@ function quotedGroupMessage(): QQBotInboundMessage {
     timestamp,
     groupOpenid: GROUP_OPENID,
     refMsgIdx: REFERENCE_INDEX,
+    msgType: 103,
+    msgElements: elements as unknown as NonNullable<QQBotInboundMessage['msgElements']>,
     replyTarget: {
       scope: 'group',
       targetId: GROUP_OPENID,
@@ -565,8 +574,10 @@ function quotedGroupMessage(): QQBotInboundMessage {
         bot: false,
       },
       group_openid: GROUP_OPENID,
+      message_type: 103,
+      msg_elements: elements,
       message_scene: { ext: [`ref_msg_idx=${REFERENCE_INDEX}`] },
-    },
+    } as unknown as QQBotInboundMessage['raw'],
   };
 }
 
@@ -1008,8 +1019,9 @@ async function main(): Promise<void> {
       return event;
     });
     check(
-      'QQ 引用映射为 Matrix m.in_reply_to',
-      relationEventId(quotedEvent.content) === referenceEvent.event_id,
+      'QQ 引用映射为 Matrix m.in_reply_to 且不重复 fallback 正文',
+      relationEventId(quotedEvent.content) === referenceEvent.event_id &&
+        stringField(quotedEvent.content, 'body') === QUOTED_QQ_BODY,
     );
 
     await bridge.handleQqMessage(structuredGroupMessage());

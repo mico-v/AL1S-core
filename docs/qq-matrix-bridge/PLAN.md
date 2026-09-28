@@ -179,6 +179,9 @@ curl -i -X POST \
 - QQ `message_type=101/102/103` 的 `msg_elements` 按文档顺序递归合并进正文；
   `message_type=103` 的顶层元素是被引用内容，只进入引用 fallback，不重复
   写入正文。元素附件按顺序转发，按 URL 去重，引用元素附件不重复转发。
+- QQ 结构化文本标签统一清洗：`faceType.ext.text` 解码为可读表情名，
+  `attachmentType` 及未知 `*Type=` 调试标签直接移除，避免同一媒体被文本
+  标签和附件事件重复发送。
 - 结构化解析全部有界：递归深度 4 层、最多 64 个元素、16 个附件、正文
   4096 字符、引用摘录 500 字符；超限时截断并追加 `[消息过长，已截断]`。
 - Matrix 文本按原正文发送到 QQ，不额外增加发送者标签；媒体消息也不把
@@ -189,8 +192,8 @@ curl -i -X POST \
 - QQ 出站命中 `40034005` 或 `40034128` 时清除失效的被动窗口并降级为主动
   消息；命中 `40034100` 时按 2/4/8 秒退避重试，耗尽后交由 Appservice
   transaction 重试。仅对平台明确拒绝的错误重试，网络超时不自动重发。
-- QQ 引用通过 `msg_idx`/`ref_msg_idx` 映射为 Matrix `m.in_reply_to`；未知
-  引用仍保留纯文本 fallback。
+- QQ 引用通过 `msg_idx`/`ref_msg_idx` 映射为 Matrix `m.in_reply_to`；确认
+  映射时正文只包含回复内容，未知引用才保留不含尖括号的纯文本 fallback。
 - Matrix 引用在存在 QQ `ref_idx` 映射时转换为 `message_reference`。
 - Matrix `m.replace` 编辑当前忽略，避免把编辑后的正文重复发送到 QQ；
   Matrix redaction 会映射为 QQ 撤回并删除出站映射。

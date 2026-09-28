@@ -887,8 +887,8 @@ check(
   quotedSend?.body?.['m.relates_to']?.event_id === '$event-1',
 );
 check(
-  'QQ 引用包含 Matrix fallback 正文',
-  quotedSend?.body?.body === '> <测试用户>\n> hello matrix\n\nquoted reply',
+  '已知 QQ 引用不再重复写入 Matrix fallback 正文',
+  quotedSend?.body?.body === 'quoted reply',
 );
 
 const persistedState = JSON.parse(readFileSync(storeFile, 'utf8')) as Record<string, unknown>;
@@ -1274,14 +1274,14 @@ await bridge.handleQqMessage(
   structuredGroupMessage(
     'qq-face-malformed',
     'QQ-SENDER-2',
-    '前 <faceType=1,faceId="1",ext="not-base64"> 后',
+    '前 <faceType=1,faceId="1",ext="not-base64"> 中 <unknownType="debug"> 后',
     { message_type: 0 },
   ),
 );
 const malformedFaceBody = bodyTextOf(lastSentBody());
 check(
-  '无效或过大 face 标签不会泄漏原始 base64',
-  malformedFaceBody === '前  后' && !malformedFaceBody.includes('faceType='),
+  '无效 face 与未知结构化标签不会泄漏原始参数',
+  malformedFaceBody === '前  中  后' && !malformedFaceBody.includes('Type='),
   `body=${malformedFaceBody}`,
 );
 
@@ -1314,6 +1314,35 @@ check(
   `events=${String(faceImageEvents.length)}`,
 );
 
+const attachmentTypeTag =
+  '<attachmentType="image/jpeg",attachmentIndex=0,description="eyJ0ZXh0Ijoi5Y+R6YCB5LqG5LiA5byg5Zu-54mHIn0=">';
+const attachmentTypeEventsBefore = matrixState.sentEvents.length;
+await bridge.handleQqMessage({
+  ...structuredGroupMessage(
+    'qq-attachment-type',
+    'QQ-SENDER-2',
+    attachmentTypeTag,
+    { message_type: 0 },
+    'GROUP-ATTACHMENT',
+  ),
+  attachments: [
+    {
+      content_type: 'image/jpeg',
+      url: 'http://qq.test/attachment-type.jpg',
+      filename: 'attachment-type.jpg',
+    },
+  ],
+  msgIdx: 'REFIDX-attachment-type',
+});
+const attachmentTypeEvents = matrixState.sentEvents.slice(attachmentTypeEventsBefore);
+check(
+  'QQ attachmentType 标签与真实附件合并为单条图片事件',
+  attachmentTypeEvents.length === 1 &&
+    JSON.stringify(attachmentTypeEvents[0]).includes('"msgtype":"m.image"') &&
+    !JSON.stringify(attachmentTypeEvents).includes('attachmentType='),
+  `events=${String(attachmentTypeEvents.length)}`,
+);
+
 await bridge.handleQqMessage({
   ...groupMessage(
     'qq-structured-target',
@@ -1338,10 +1367,9 @@ const quote103Event = matrixState.sentEvents.at(-1) as
   | { body?: { 'm.relates_to'?: { event_id?: string } } }
   | undefined;
 check(
-  'QQ 103 引用映射到 Matrix 事件且不重复正文',
+  'QQ 103 引用映射到 Matrix 事件且正文不重复引用内容',
   quote103Event?.body?.['m.relates_to']?.event_id === structuredTargetEventId &&
-    quote103Body === '> <测试用户>\n> 被引用的原文\n\n这是新的回复' &&
-    quote103Body.split('被引用的原文').length === 2,
+    quote103Body === '这是新的回复',
   `body=${quote103Body}`,
 );
 
@@ -1361,7 +1389,7 @@ await bridge.handleQqMessage({
 const unknownQuoteBody = bodyTextOf(lastSentBody());
 check(
   '未知 QQ 引用保留原作者文本 fallback 且无 relates_to',
-  unknownQuoteBody === '> <引用原作者>\n> 没有映射的引用内容\n\n未知引用回复' &&
+  unknownQuoteBody === '> 引用原作者\n> 没有映射的引用内容\n\n未知引用回复' &&
     !JSON.stringify(matrixState.sentEvents.at(-1)).includes('m.relates_to'),
   `body=${unknownQuoteBody}`,
 );
@@ -1403,7 +1431,7 @@ check(
   matrixState.uploads.length === quoteFaceUploadsBefore &&
     matrixState.sentEvents.length === quoteFaceEventsBefore + 1 &&
     faceQuoteEvent?.body?.['m.relates_to']?.event_id === faceImageEventId &&
-    faceQuoteBody === '> <测试用户>\n> [image/jpeg: quoted-face.jpg]\n\n引用这个表情',
+    faceQuoteBody === '引用这个表情',
   `body=${faceQuoteBody}`,
 );
 
