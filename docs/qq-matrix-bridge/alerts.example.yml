@@ -1,0 +1,47 @@
+groups:
+  - name: al1s-matrix-bridge
+    rules:
+      - alert: Al1sMatrixBridgeDown
+        expr: 'up{job="al1s-matrix-bridge"} == 0'
+        for: 2m
+        labels:
+          severity: critical
+        annotations:
+          summary: AL1S Matrix bridge 无法抓取指标
+          description: bridge 进程可能已退出，或 /metrics 在内网不可达。
+
+      - alert: Al1sMatrixBridgeTransactionErrors
+        expr: 'increase(al1s_matrix_bridge_appservice_transactions_total{result="error"}[5m]) > 0'
+        for: 2m
+        labels:
+          severity: critical
+        annotations:
+          summary: Matrix appservice transaction 处理失败
+          description: Tuwunel 将在 transaction 失败后重试；请检查 bridge 日志和上游错误。
+
+      - alert: Al1sMatrixBridgeStateWriteFailures
+        expr: 'increase(al1s_matrix_bridge_state_writes_total{result="error"}[5m]) > 0'
+        for: 1m
+        labels:
+          severity: critical
+        annotations:
+          summary: Bridge 状态写入失败
+          description: 持久卷可能已满、只读或权限异常；映射和幂等状态可能无法保存。
+
+      - alert: Al1sMatrixBridgeQqRecoveryRepeated
+        expr: 'sum by (kind, reason) (increase(al1s_matrix_bridge_qq_recovery_total[10m])) > 5'
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: QQ 出站恢复动作持续发生
+          description: 被动回复窗口或主动消息频控持续触发，请检查 QQ 平台配额和消息频率。
+
+      - alert: Al1sMatrixBridgeNoSuccessfulTransaction
+        expr: '(increase(al1s_matrix_bridge_appservice_transactions_total[1h]) > 0) and (al1s_matrix_bridge_last_successful_transaction_timestamp_seconds > 0) and (time() - al1s_matrix_bridge_last_successful_transaction_timestamp_seconds > 3600)'
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: Matrix transaction 已超过一小时无成功 ACK
+          description: bridge 曾处理成功，但当前 transaction 链路可能已停滞。

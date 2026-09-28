@@ -4,6 +4,11 @@ settings:
   autoInstallPeers: true
   excludeLinksFromLockfile: false
 
+patchedDependencies:
+  '@tencent-connect/qqbot-nodejs@1.0.4':
+    hash: faaa8780fc31a14fb47d23012a0aa8766ef3f3c7cac4c9eaaf3258f46142d80a
+    path: patches/@tencent-connect__qqbot-nodejs@1.0.4.patch
+
 importers:
 
   .:
@@ -12,8 +17,8 @@ importers:
         specifier: ^1.2.0
         version: 1.2.0
       '@tencent-connect/qqbot-nodejs':
-        specifier: ^1.0.4
-        version: 1.0.4
+        specifier: 1.0.4
+        version: 1.0.4(patch_hash=faaa8780fc31a14fb47d23012a0aa8766ef3f3c7cac4c9eaaf3258f46142d80a)
     devDependencies:
       '@types/node':
         specifier: ^24.13.3
@@ -325,7 +330,7 @@ snapshots:
     dependencies:
       qrcode-terminal: 0.12.0
 
-  '@tencent-connect/qqbot-nodejs@1.0.4':
+  '@tencent-connect/qqbot-nodejs@1.0.4(patch_hash=faaa8780fc31a14fb47d23012a0aa8766ef3f3c7cac4c9eaaf3258f46142d80a)':
     dependencies:
       ws: 8.22.0
     transitivePeerDependencies:

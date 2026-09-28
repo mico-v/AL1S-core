@@ -12,6 +12,7 @@
  */
 
 import {
+  MsgType,
   QQBot,
   type InlineKeyboard,
   type InteractionContext,
@@ -23,6 +24,7 @@ import {
   type SendMessageOptions,
   type UploadMediaResponse,
 } from '@tencent-connect/qqbot-nodejs';
+import { createHash } from 'node:crypto';
 import { ChatStore } from './chat-log.js';
 import type { BotConfig } from './config.js';
 import { createLogger, type AppLogger } from './logger.js';
@@ -35,6 +37,18 @@ export type InteractionHandler = (
 ) => unknown | Promise<unknown>;
 export type RawEventHandler = (ctx: RawEventContext, bot: Bot) => unknown | Promise<unknown>;
 
+export interface BotRuntimeOptions {
+  /** 覆盖聊天记录配置；bridge 模式会关闭额外的明文聊天落盘。 */
+  chatLogEnabled?: boolean;
+  /** 调试日志仅记录身份字段的稳定短摘要。 */
+  redactMessageIdentifiers?: boolean;
+}
+
+export interface QqReplyOptions {
+  /** QQ 消息索引，存在时以引用消息形式回复。 */
+  messageReference?: string;
+}
+
 export class Bot {
   readonly client: QQBot;
   readonly config: BotConfig;
@@ -43,13 +57,15 @@ export class Bot {
   private readonly interactionHandlers: InteractionHandler[] = [];
   private readonly rawEventHandlers: RawEventHandler[] = [];
   private readonly chatStore?: ChatStore;
+  private readonly redactMessageIdentifiers: boolean;
   private started = false;
 
-  constructor(config: BotConfig, log?: AppLogger) {
+  constructor(config: BotConfig, log?: AppLogger, options: BotRuntimeOptions = {}) {
     this.config = config;
     this.log = log ?? createLogger(config.logging);
+    this.redactMessageIdentifiers = options.redactMessageIdentifiers ?? false;
 
-    if (config.chatLog.enabled) {
+    if (options.chatLogEnabled ?? config.chatLog.enabled) {
       this.chatStore = new ChatStore({
         root: config.chatLog.root,
         saveMedia: config.chatLog.saveMedia,
@@ -142,7 +158,19 @@ export class Bot {
   }
 
   /** 回复文本（有 msgId 时为被动回复，否则为主动推送）。 */
-  replyText(target: ReplyTarget, content: string): Promise<MessageResponse> {
+  replyText(
+    target: ReplyTarget,
+    content: string,
+    options: QqReplyOptions = {},
+  ): Promise<MessageResponse> {
+    if (options.messageReference !== undefined) {
+      return this.client.send({
+        target,
+        msgType: MsgType.TEXT,
+        content,
+        messageReference: { message_id: options.messageReference },
+      });
+    }
     return this.client.sendText(target, content);
   }
 
@@ -175,12 +203,22 @@ export class Bot {
   }
 
   private async dispatchMessage(message: QQBotInboundMessage, _signal: AbortSignal): Promise<void> {
-    this.log.debug('收到消息事件', {
-      kind: message.kind,
-      senderId: message.senderId,
-      groupOpenid: message.groupOpenid,
-      messageId: message.messageId,
-    });
+    this.log.debug(
+      '收到消息事件',
+      this.redactMessageIdentifiers
+        ? {
+            kind: message.kind,
+            senderRef: identifierRef(message.senderId),
+            groupRef: identifierRef(message.groupOpenid),
+            messageRef: identifierRef(message.messageId),
+          }
+        : {
+            kind: message.kind,
+            senderId: message.senderId,
+            groupOpenid: message.groupOpenid,
+            messageId: message.messageId,
+          },
+    );
 
     if (this.chatStore !== undefined) {
       try {
@@ -223,4 +261,10 @@ export class Bot {
 
 function describeError(error: unknown): string {
   return error instanceof Error ? `${error.name}: ${error.message}` : String(error);
+}
+
+function identifierRef(value: string | undefined): string | undefined {
+  return value === undefined
+    ? undefined
+    : createHash('sha256').update(value, 'utf8').digest('hex').slice(0, 12);
 }

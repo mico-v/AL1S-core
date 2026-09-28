@@ -1,0 +1,18 @@
+id: al1s-qq-bridge
+# Compose 中 Tuwunel 通过服务名访问 bridge；宿主机进程部署时改为
+# http://127.0.0.1:29328。
+# 复制为 deploy/appservice.yaml 后设置为 600；该文件已被 .gitignore 排除。
+url: http://bridge:29328
+as_token: replace-with-a-random-as-token
+hs_token: replace-with-a-different-random-hs-token
+sender_localpart: _al1s_qq
+receive_ephemeral: false
+
+namespaces:
+  users:
+    - exclusive: true
+      regex: '^@_qq_[0-9a-f]{64}:matrix\.example$'
+  aliases:
+    - exclusive: true
+      regex: '^#_qq_[0-9a-f]{64}:matrix\.example$'
+  rooms: []

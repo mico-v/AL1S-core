@@ -1,0 +1,2 @@
+patchedDependencies:
+  '@tencent-connect/qqbot-nodejs@1.0.4': patches/@tencent-connect__qqbot-nodejs@1.0.4.patch

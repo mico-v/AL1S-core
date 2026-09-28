@@ -208,6 +208,39 @@ if (c2cResult.action === 'message') {
   check('单聊发送者 OpenID', c2cResult.msg.senderId === 'USER');
 }
 
+const guildMessage = {
+  id: 'ROBOT1.0_GUILD_MSG',
+  author: { id: 'GUILD-USER', username: '频道用户', bot: false },
+  content: 'guild hello',
+  channel_id: 'CHANNEL',
+  guild_id: 'GUILD',
+  timestamp: '2026-07-21T10:02:00+08:00',
+};
+const guildResult = dispatchEvent('AT_MESSAGE_CREATE', guildMessage, 'acct');
+check('解析频道消息事件', guildResult.action === 'message');
+if (guildResult.action === 'message') {
+  check('kind = guild', guildResult.msg.kind === 'guild');
+  check(
+    '频道消息保留 guild/channel ID',
+    guildResult.msg.guildId === 'GUILD' && guildResult.msg.channelId === 'CHANNEL',
+  );
+}
+
+const dmMessage = {
+  id: 'ROBOT1.0_DM_MSG',
+  author: { id: 'DM-USER', username: '私信用户', bot: false },
+  content: 'dm hello',
+  channel_id: 'DM-CHANNEL',
+  guild_id: 'DM-GUILD',
+  timestamp: '2026-07-21T10:03:00+08:00',
+};
+const dmResult = dispatchEvent('DIRECT_MESSAGE_CREATE', dmMessage, 'acct');
+check('解析频道私信事件', dmResult.action === 'message');
+if (dmResult.action === 'message') {
+  check('kind = dm', dmResult.msg.kind === 'dm');
+  check('私信保留 guild ID', dmResult.msg.guildId === 'DM-GUILD');
+}
+
 const unknownResult = dispatchEvent('SOME_UNKNOWN_EVENT', { a: 1 }, 'acct');
 check('未知事件走 raw 分支', unknownResult.action === 'raw');
 
@@ -223,6 +256,50 @@ bot.onMessage(() => {
   registered += 1;
 });
 check('注册处理器不触发', registered === 0);
+
+const inboundMessages: QQBotInboundMessage[] = [];
+bot.onMessage((message) => {
+  inboundMessages.push(message);
+});
+const internalClient = bot.client as unknown as {
+  handleInboundMessage(message: Omit<QQBotInboundMessage, 'replyTarget'>): Promise<void>;
+};
+await internalClient.handleInboundMessage({
+  rawEventType: 'AT_MESSAGE_CREATE',
+  kind: 'guild',
+  senderId: 'GUILD-USER',
+  senderName: '频道用户',
+  content: 'guild hello',
+  messageId: 'GUILD-MESSAGE',
+  timestamp: '2026-07-21T10:02:00+08:00',
+  channelId: 'CHANNEL',
+  guildId: 'GUILD',
+  raw: guildMessage,
+});
+await internalClient.handleInboundMessage({
+  rawEventType: 'DIRECT_MESSAGE_CREATE',
+  kind: 'dm',
+  senderId: 'DM-USER',
+  senderName: '私信用户',
+  content: 'dm hello',
+  messageId: 'DM-MESSAGE',
+  timestamp: '2026-07-21T10:03:00+08:00',
+  channelId: 'DM-CHANNEL',
+  guildId: 'DM-GUILD',
+  raw: dmMessage,
+});
+check(
+  '频道消息公开事件生成 guild replyTarget',
+  inboundMessages[0]?.replyTarget.scope === 'guild' &&
+    inboundMessages[0].replyTarget.targetId === 'CHANNEL' &&
+    inboundMessages[0].replyTarget.msgId === 'GUILD-MESSAGE',
+);
+check(
+  '频道私信公开事件生成 dm replyTarget',
+  inboundMessages[1]?.replyTarget.scope === 'dm' &&
+    inboundMessages[1].replyTarget.targetId === 'DM-GUILD' &&
+    inboundMessages[1].replyTarget.msgId === 'DM-MESSAGE',
+);
 
 // ---------------------------------------------------------------------------
 section('聊天记录落盘');

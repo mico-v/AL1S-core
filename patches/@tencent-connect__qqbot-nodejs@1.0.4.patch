@@ -1,0 +1,351 @@
+diff --git a/dist/QQBot.d.ts b/dist/QQBot.d.ts
+index b34016764a74f76d1e4a8545dcc940585eba391e..5a40f59c7833f6ae9779b9c27e6f98995766c780 100644
+--- a/dist/QQBot.d.ts
++++ b/dist/QQBot.d.ts
+@@ -47,6 +47,8 @@ export declare const MsgType: {
+     readonly MEDIA: 7;
+ };
+ export type MsgType = (typeof MsgType)[keyof typeof MsgType];
++/** Message target scopes supported by the high-level facade. */
++export type ReplyTargetScope = ChatScope | "guild" | "dm";
+ /** Universal message send options — supports all QQ platform message types. */
+ export interface SendMessageOptions {
+     /** Target peer. When `msgId` is present → reply; otherwise → proactive. */
+@@ -108,9 +110,9 @@ export interface ApiGateway {
+ }
+ /** Resolved peer for outbound messages. */
+ export interface ReplyTarget {
+-    /** "c2c" for private chat, "group" for group chat. */
+-    scope: ChatScope;
+-    /** User openid (c2c) or group openid (group). */
++    /** c2c user, group, guild channel, or guild DM. */
++    scope: ReplyTargetScope;
++    /** User/group openid, channel id (guild), or guild id (dm). */
+     targetId: string;
+     /** Inbound message id — used to associate the reply with the trigger. */
+     msgId?: string;
+diff --git a/dist/QQBot.js b/dist/QQBot.js
+index dcd9ca0a2218f4117f61e7a09a395e36aae9a6aa..e2481f32ef77247c22d93b330696d9efeae7ea6f 100644
+--- a/dist/QQBot.js
++++ b/dist/QQBot.js
+@@ -415,6 +415,12 @@ export class QQBot {
+             body.message_reference = opts.messageReference;
+         if (opts.extra)
+             Object.assign(body, opts.extra);
++        if (opts.target.scope === "guild") {
++            return this.messageApi.sendChannelMessageRaw(opts.target.targetId, this.creds, body);
++        }
++        if (opts.target.scope === "dm") {
++            return this.messageApi.sendDmMessageRaw(opts.target.targetId, this.creds, body);
++        }
+         return this.messageApi.sendRaw(opts.target.scope, opts.target.targetId, this.creds, body);
+     }
+     /**
+@@ -430,6 +436,18 @@ export class QQBot {
+      * a proactive push.
+      */
+     async sendText(target, content) {
++        if (target.scope === "guild") {
++            return this.messageApi.sendChannelMessageRaw(target.targetId, this.creds, {
++                content,
++                ...(target.msgId ? { msg_id: target.msgId } : {}),
++            });
++        }
++        if (target.scope === "dm") {
++            return this.messageApi.sendDmMessageRaw(target.targetId, this.creds, {
++                content,
++                ...(target.msgId ? { msg_id: target.msgId } : {}),
++            });
++        }
+         if (target.msgId) {
+             return this.messageApi.sendMessage(target.scope, target.targetId, content, this.creds, {
+                 msgId: target.msgId,
+@@ -439,6 +457,20 @@ export class QQBot {
+     }
+     /** Send a text message with an inline keyboard. */
+     async sendTextWithKeyboard(target, content, inlineKeyboard) {
++        if (target.scope === "guild") {
++            return this.messageApi.sendChannelMessageRaw(target.targetId, this.creds, {
++                content,
++                ...(target.msgId ? { msg_id: target.msgId } : {}),
++                keyboard: inlineKeyboard,
++            });
++        }
++        if (target.scope === "dm") {
++            return this.messageApi.sendDmMessageRaw(target.targetId, this.creds, {
++                content,
++                msg_id: target.msgId,
++                keyboard: inlineKeyboard,
++            });
++        }
+         return this.messageApi.sendMessage(target.scope, target.targetId, content, this.creds, {
+             msgId: target.msgId,
+             inlineKeyboard,
+@@ -473,6 +505,12 @@ export class QQBot {
+      * ```
+      */
+     async recallMessage(target, messageId) {
++        if (target.scope === "guild") {
++            return this.messageApi.recallChannelMessageRaw(target.targetId, messageId, this.creds);
++        }
++        if (target.scope === "dm") {
++            return this.messageApi.recallDmMessageRaw(target.targetId, messageId, this.creds);
++        }
+         return this.messageApi.recallMessage(target.scope, target.targetId, messageId, this.creds);
+     }
+     /**
+@@ -623,6 +661,9 @@ export class QQBot {
+      * {@link LARGE_FILE_THRESHOLD} bytes.
+      */
+     async uploadMedia(opts) {
++        if (opts.target.scope !== "c2c" && opts.target.scope !== "group") {
++            throw new Error("uploadMedia is not supported for guild or DM targets");
++        }
+         const sources = [opts.url, opts.fileData, opts.buffer, opts.localPath].filter((v) => v !== undefined);
+         if (sources.length === 0) {
+             throw new Error("uploadMedia: one of url/fileData/buffer/localPath is required");
+@@ -669,6 +710,9 @@ export class QQBot {
+      * Upload + send a media message to a C2C user or group.
+      */
+     async sendMedia(opts) {
++        if (opts.target.scope !== "c2c" && opts.target.scope !== "group") {
++            throw new Error("sendMedia is not supported for guild or DM targets");
++        }
+         const upload = await this.uploadMedia({ ...opts, srvSendMsg: false });
+         const message = await this.mediaApi.sendMediaMessage(opts.target.scope, opts.target.targetId, upload.file_info, this.creds, {
+             msgId: opts.target.msgId,
+@@ -724,8 +768,12 @@ export class QQBot {
+         if (raw.kind === "group" && raw.groupOpenid) {
+             return { scope: "group", targetId: raw.groupOpenid, msgId: raw.messageId };
+         }
+-        // Guild / DM 暂时没有 channel-level 的 c2c/group 等价。SDK 选择忽略
+-        // 这两类消息（业务侧仍然可以通过 raw 字段自己处理）。
++        if (raw.kind === "guild" && raw.channelId) {
++            return { scope: "guild", targetId: raw.channelId, msgId: raw.messageId };
++        }
++        if (raw.kind === "dm" && raw.guildId) {
++            return { scope: "dm", targetId: raw.guildId, msgId: raw.messageId };
++        }
+         return null;
+     }
+     async computeSourceSize(opts) {
+diff --git a/dist/index.d.ts b/dist/index.d.ts
+index 52ffac80fe7989e6c93bc18cf2dd3bb2cb8a9e92..f7b1326ea41629549893ee78cf475371e69953ae 100644
+--- a/dist/index.d.ts
++++ b/dist/index.d.ts
+@@ -32,7 +32,7 @@
+  */
+ export { QQBot } from "./QQBot.js";
+ export { MsgType } from "./QQBot.js";
+-export type { QQBotOptions, QQBotEventMap, QQBotInboundMessage, ReplyTarget, SendMessageOptions, ApiGateway, InteractionContext, RawEventContext, } from "./QQBot.js";
++export type { QQBotOptions, QQBotEventMap, QQBotInboundMessage, ReplyTarget, ReplyTargetScope, SendMessageOptions, ApiGateway, InteractionContext, RawEventContext, } from "./QQBot.js";
+ export { StreamSession } from "./streaming.js";
+ export type { StreamSessionOptions } from "./streaming.js";
+ export { runMiddlewareChain, messageFilter, contentSanitizer, rateLimiter, concurrencyGuard, accessPolicy, mentionGate, quoteRef, MemoryRefIndexStore, envelopeFormatter, slashCommand, historyBuffer, MemoryHistoryStore, typingIndicator, errorHandler, } from "./middleware/index.js";
+diff --git a/dist/protocol/api/messages.d.ts b/dist/protocol/api/messages.d.ts
+index da9e01fa2306e3a3cbefeac04026020f24d05458..5b642736c8dbe15fa225d6e6c1cfea54d6b9ec47 100644
+--- a/dist/protocol/api/messages.d.ts
++++ b/dist/protocol/api/messages.d.ts
+@@ -74,6 +74,10 @@ export declare class MessageApi {
+      * Send a DM (direct message) in a guild.
+      */
+     sendDmMessageRaw(guildId: string, creds: Credentials, body: Record<string, unknown>): Promise<MessageResponse>;
++    /** Recall a message sent to a guild text channel. */
++    recallChannelMessageRaw(channelId: string, messageId: string, creds: Credentials): Promise<void>;
++    /** Recall a direct message sent in a guild. */
++    recallDmMessageRaw(guildId: string, messageId: string, creds: Credentials): Promise<void>;
+     /**
+      * Recall (delete) a message.
+      */
+diff --git a/dist/protocol/api/messages.js b/dist/protocol/api/messages.js
+index ee291a15a52f0f92ff58ee3550b173b6cea18adc..80592e00ecdeb15dd7563b34b022972c87b9e9df 100644
+--- a/dist/protocol/api/messages.js
++++ b/dist/protocol/api/messages.js
+@@ -157,6 +157,16 @@ export class MessageApi {
+         const cleaned = Object.fromEntries(Object.entries(body).filter(([, v]) => v !== undefined));
+         return this.client.request(token, "POST", dmMessagePath(guildId), cleaned);
+     }
++    /** Recall a message sent to a guild text channel. */
++    async recallChannelMessageRaw(channelId, messageId, creds) {
++        const token = await this.tokenManager.getAccessToken(creds.appId, creds.clientSecret);
++        await this.client.request(token, "DELETE", `${channelMessagePath(channelId)}/${messageId}`);
++    }
++    /** Recall a direct message sent in a guild. */
++    async recallDmMessageRaw(guildId, messageId, creds) {
++        const token = await this.tokenManager.getAccessToken(creds.appId, creds.clientSecret);
++        await this.client.request(token, "DELETE", `${dmMessagePath(guildId)}/${messageId}`);
++    }
+     /**
+      * Recall (delete) a message.
+      */
+diff --git a/src/QQBot.ts b/src/QQBot.ts
+index 78cb81f411cf5710021f869c5100e6251032db1a..53df5356fc055ac787078ffd88ed5de65b7b3a54 100644
+--- a/src/QQBot.ts
++++ b/src/QQBot.ts
+@@ -71,6 +71,9 @@ export const MsgType = {
+ } as const;
+ export type MsgType = (typeof MsgType)[keyof typeof MsgType];
+ 
++/** Message target scopes supported by the high-level facade. */
++export type ReplyTargetScope = ChatScope | "guild" | "dm";
++
+ /** Universal message send options — supports all QQ platform message types. */
+ export interface SendMessageOptions {
+   /** Target peer. When `msgId` is present → reply; otherwise → proactive. */
+@@ -116,9 +119,9 @@ export interface ApiGateway {
+ 
+ /** Resolved peer for outbound messages. */
+ export interface ReplyTarget {
+-  /** "c2c" for private chat, "group" for group chat. */
+-  scope: ChatScope;
+-  /** User openid (c2c) or group openid (group). */
++  /** c2c user, group, guild channel, or guild DM. */
++  scope: ReplyTargetScope;
++  /** User/group openid, channel id (guild), or guild id (dm). */
+   targetId: string;
+   /** Inbound message id — used to associate the reply with the trigger. */
+   msgId?: string;
+@@ -661,6 +664,12 @@ export class QQBot {
+     if (opts.keyboard) body.keyboard = opts.keyboard;
+     if (opts.messageReference) body.message_reference = opts.messageReference;
+     if (opts.extra) Object.assign(body, opts.extra);
++    if (opts.target.scope === "guild") {
++      return this.messageApi.sendChannelMessageRaw(opts.target.targetId, this.creds, body);
++    }
++    if (opts.target.scope === "dm") {
++      return this.messageApi.sendDmMessageRaw(opts.target.targetId, this.creds, body);
++    }
+     return this.messageApi.sendRaw(opts.target.scope, opts.target.targetId, this.creds, body);
+   }
+ 
+@@ -677,6 +686,18 @@ export class QQBot {
+    * a proactive push.
+    */
+   async sendText(target: ReplyTarget, content: string): Promise<MessageResponse> {
++    if (target.scope === "guild") {
++      return this.messageApi.sendChannelMessageRaw(target.targetId, this.creds, {
++        content,
++        ...(target.msgId ? { msg_id: target.msgId } : {}),
++      });
++    }
++    if (target.scope === "dm") {
++      return this.messageApi.sendDmMessageRaw(target.targetId, this.creds, {
++        content,
++        ...(target.msgId ? { msg_id: target.msgId } : {}),
++      });
++    }
+     if (target.msgId) {
+       return this.messageApi.sendMessage(target.scope, target.targetId, content, this.creds, {
+         msgId: target.msgId,
+@@ -696,6 +717,20 @@ export class QQBot {
+     content: string,
+     inlineKeyboard: InlineKeyboard,
+   ): Promise<MessageResponse> {
++    if (target.scope === "guild") {
++      return this.messageApi.sendChannelMessageRaw(target.targetId, this.creds, {
++        content,
++        ...(target.msgId ? { msg_id: target.msgId } : {}),
++        keyboard: inlineKeyboard,
++      });
++    }
++    if (target.scope === "dm") {
++      return this.messageApi.sendDmMessageRaw(target.targetId, this.creds, {
++        content,
++        msg_id: target.msgId,
++        keyboard: inlineKeyboard,
++      });
++    }
+     return this.messageApi.sendMessage(target.scope, target.targetId, content, this.creds, {
+       msgId: target.msgId,
+       inlineKeyboard,
+@@ -736,6 +771,12 @@ export class QQBot {
+    * ```
+    */
+   async recallMessage(target: ReplyTarget, messageId: string): Promise<void> {
++    if (target.scope === "guild") {
++      return this.messageApi.recallChannelMessageRaw(target.targetId, messageId, this.creds);
++    }
++    if (target.scope === "dm") {
++      return this.messageApi.recallDmMessageRaw(target.targetId, messageId, this.creds);
++    }
+     return this.messageApi.recallMessage(target.scope, target.targetId, messageId, this.creds);
+   }
+ 
+@@ -934,6 +975,9 @@ export class QQBot {
+     srvSendMsg?: boolean;
+     onProgress?: (uploaded: number, total: number) => void;
+   }): Promise<UploadMediaResponse> {
++    if (opts.target.scope !== "c2c" && opts.target.scope !== "group") {
++      throw new Error("uploadMedia is not supported for guild or DM targets");
++    }
+     const sources = [opts.url, opts.fileData, opts.buffer, opts.localPath].filter(
+       (v) => v !== undefined,
+     );
+@@ -1004,6 +1048,9 @@ export class QQBot {
+     content?: string;
+     onProgress?: (uploaded: number, total: number) => void;
+   }): Promise<{ upload: UploadMediaResponse; message: MessageResponse | undefined }> {
++    if (opts.target.scope !== "c2c" && opts.target.scope !== "group") {
++      throw new Error("sendMedia is not supported for guild or DM targets");
++    }
+     const upload = await this.uploadMedia({ ...opts, srvSendMsg: false });
+     const message = await this.mediaApi.sendMediaMessage(
+       opts.target.scope,
+@@ -1091,8 +1138,12 @@ export class QQBot {
+     if (raw.kind === "group" && raw.groupOpenid) {
+       return { scope: "group", targetId: raw.groupOpenid, msgId: raw.messageId };
+     }
+-    // Guild / DM 暂时没有 channel-level 的 c2c/group 等价。SDK 选择忽略
+-    // 这两类消息（业务侧仍然可以通过 raw 字段自己处理）。
++    if (raw.kind === "guild" && raw.channelId) {
++      return { scope: "guild", targetId: raw.channelId, msgId: raw.messageId };
++    }
++    if (raw.kind === "dm" && raw.guildId) {
++      return { scope: "dm", targetId: raw.guildId, msgId: raw.messageId };
++    }
+     return null;
+   }
+ 
+diff --git a/src/index.ts b/src/index.ts
+index f0ca659f6c07cf8da0784d20ea3845b0e703b99a..2bf2c7c26fcb290e2b275b309221e6bf82916322 100644
+--- a/src/index.ts
++++ b/src/index.ts
+@@ -38,6 +38,7 @@ export type {
+   QQBotEventMap,
+   QQBotInboundMessage,
+   ReplyTarget,
++  ReplyTargetScope,
+   SendMessageOptions,
+   ApiGateway,
+   InteractionContext,
+diff --git a/src/protocol/api/messages.ts b/src/protocol/api/messages.ts
+index d0aa1781a93fad0a1159b624a726da5f35f9dcf6..f100f186294974258852205ba95866fb1c53230a 100644
+--- a/src/protocol/api/messages.ts
++++ b/src/protocol/api/messages.ts
+@@ -279,6 +279,26 @@ export class MessageApi {
+     );
+   }
+ 
++  /** Recall a message sent to a guild text channel. */
++  async recallChannelMessageRaw(
++    channelId: string,
++    messageId: string,
++    creds: Credentials,
++  ): Promise<void> {
++    const token = await this.tokenManager.getAccessToken(creds.appId, creds.clientSecret);
++    await this.client.request(token, "DELETE", `${channelMessagePath(channelId)}/${messageId}`);
++  }
++
++  /** Recall a direct message sent in a guild. */
++  async recallDmMessageRaw(
++    guildId: string,
++    messageId: string,
++    creds: Credentials,
++  ): Promise<void> {
++    const token = await this.tokenManager.getAccessToken(creds.appId, creds.clientSecret);
++    await this.client.request(token, "DELETE", `${dmMessagePath(guildId)}/${messageId}`);
++  }
++
+   /**
+    * Recall (delete) a message.
+    */

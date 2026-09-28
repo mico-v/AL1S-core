@@ -1,0 +1,18 @@
+# Prometheus 运行在宿主机时使用 127.0.0.1；容器部署请改为 bridge 的内网 DNS
+# 名称或专用 Docker network 地址，不要把 /metrics 暴露到公网。
+global:
+  scrape_interval: 15s
+  evaluation_interval: 15s
+
+rule_files:
+  - alerts.example.yml
+
+scrape_configs:
+  - job_name: al1s-matrix-bridge
+    metrics_path: /metrics
+    scheme: http
+    static_configs:
+      - targets:
+          - 127.0.0.1:29328
+        labels:
+          service: al1s-matrix-bridge
