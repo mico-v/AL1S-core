@@ -90,6 +90,8 @@ interface StructuredMessageContent {
   attachments: QqAttachment[];
   /** Matrix `m.mentions.user_ids` 对应的 ghost 用户。 */
   mentionUserIds: string[];
+  /** 正文或引用中出现、可持久化反向映射的 QQ openid。 */
+  mentionQqIds: string[];
   /** 是否包含 `@room`。 */
   mentionsRoom: boolean;
   /** 引用 fallback 中出现的 Matrix ghost 用户。 */
@@ -104,6 +106,7 @@ interface RenderedQqContent {
   text: string;
   formattedText: string;
   mentionUserIds: string[];
+  mentionQqIds: string[];
   mentionsRoom: boolean;
 }
 
@@ -250,6 +253,7 @@ function renderQqContent(value: string, context: QqMentionContext): RenderedQqCo
   const bodyParts: string[] = [];
   const htmlParts: string[] = [];
   const mentionUserIds = new Set<string>();
+  const mentionQqIds = new Set<string>();
   let mentionsRoom = false;
   let cursor = 0;
   const pushText = (text: string): void => {
@@ -291,6 +295,7 @@ function renderQqContent(value: string, context: QqMentionContext): RenderedQqCo
         )}</a>`,
       );
       mentionUserIds.add(matrixUserId);
+      mentionQqIds.add(id);
     }
     cursor = index + match[0].length;
   }
@@ -299,6 +304,7 @@ function renderQqContent(value: string, context: QqMentionContext): RenderedQqCo
     text: bodyParts.join('').trim(),
     formattedText: htmlParts.join('').trim(),
     mentionUserIds: [...mentionUserIds],
+    mentionQqIds: [...mentionQqIds],
     mentionsRoom,
   };
 }
@@ -604,6 +610,7 @@ function extractStructuredMessage(
   const attachments: QqAttachment[] = [];
   const seenAttachments = new Set<string>();
   const mentionUserIds = new Set<string>();
+  const mentionQqIds = new Set<string>();
   const quoteMentionUserIds = new Set<string>();
   let quoteAttachment: QqAttachment | undefined;
   let quoteSender: string | undefined;
@@ -627,6 +634,9 @@ function extractStructuredMessage(
     if (target === 'body') {
       for (const userId of value.mentionUserIds) {
         mentionUserIds.add(userId);
+      }
+      for (const qqUserId of value.mentionQqIds) {
+        mentionQqIds.add(qqUserId);
       }
       mentionsRoom ||= value.mentionsRoom;
     } else {
@@ -751,6 +761,7 @@ function extractStructuredMessage(
     ...(quoteSender === undefined ? {} : { quoteSender }),
     attachments,
     mentionUserIds: [...mentionUserIds],
+    mentionQqIds: [...mentionQqIds],
     mentionsRoom,
     quoteMentionUserIds: [...quoteMentionUserIds],
     quoteMentionsRoom,
@@ -777,6 +788,115 @@ function matrixReplyEventId(content: JsonObject): string | undefined {
     return undefined;
   }
   return typeof relation.event_id === 'string' ? relation.event_id : undefined;
+}
+
+function matrixMentionUserIds(content: JsonObject): string[] {
+  const value = content['m.mentions'];
+  if (!isRecord(value) || !Array.isArray(value['user_ids'])) {
+    return [];
+  }
+  return value['user_ids'].filter(
+    (userId): userId is string => typeof userId === 'string' && userId.startsWith('@'),
+  );
+}
+
+function matrixMentionsRoom(content: JsonObject): boolean {
+  const value = content['m.mentions'];
+  return isRecord(value) && value['room'] === true;
+}
+
+function decodeMatrixHtmlText(value: string): string {
+  return value
+    .replace(/<[^>]*>/g, '')
+    .replace(/&lt;/g, '<')
+    .replace(/&gt;/g, '>')
+    .replace(/&quot;/g, '"')
+    .replace(/&#39;/g, "'")
+    .replace(/&amp;/g, '&')
+    .trim();
+}
+
+/** 从 Matrix HTML 的 matrix.to 链接中提取可见提及文本，作为正文替换候选。 */
+function matrixMentionTextHints(content: JsonObject): Map<string, string[]> {
+  const hints = new Map<string, string[]>();
+  const formattedBody = stringField(content, 'formatted_body');
+  if (formattedBody === undefined) {
+    return hints;
+  }
+  const anchorPattern = /<a\b[^>]*\bhref="([^"]+)"[^>]*>([\s\S]*?)<\/a>/gi;
+  for (const match of formattedBody.matchAll(anchorPattern)) {
+    const href = match[1];
+    const innerHtml = match[2];
+    if (href === undefined || innerHtml === undefined) {
+      continue;
+    }
+    const marker = 'https://matrix.to/#/';
+    if (!href.startsWith(marker)) {
+      continue;
+    }
+    let userId: string;
+    try {
+      userId = decodeURIComponent(href.slice(marker.length).split('?', 1)[0] ?? '');
+    } catch {
+      continue;
+    }
+    const visibleText = decodeMatrixHtmlText(innerHtml);
+    if (!userId.startsWith('@') || visibleText === '') {
+      continue;
+    }
+    const candidates = hints.get(userId) ?? [];
+    candidates.push(visibleText, `@${visibleText}`);
+    hints.set(userId, candidates);
+  }
+  return hints;
+}
+
+function qqUserMention(qqUserId: string): string {
+  return `<qqbot-at-user id="${escapeHtml(qqUserId)}" />`;
+}
+
+function renderMatrixMentionsForQq(
+  content: JsonObject,
+  body: string,
+  room: BridgeRoomRecord,
+  store: BridgeStore,
+): string {
+  const hints = matrixMentionTextHints(content);
+  let rendered = body;
+  for (const matrixUserId of matrixMentionUserIds(content)) {
+    const user = store.getQqUser(matrixUserId);
+    if (user === undefined) {
+      continue;
+    }
+    const candidates = [
+      ...(hints.get(matrixUserId) ?? []),
+      `@${user.displayName}`,
+      user.displayName,
+      matrixUserId,
+    ]
+      .filter((value, index, values) => value !== '' && values.indexOf(value) === index)
+      .sort((left, right) => right.length - left.length);
+    let replaced = false;
+    for (const candidate of candidates) {
+      const index = rendered.indexOf(candidate);
+      if (index < 0) {
+        continue;
+      }
+      rendered =
+        rendered.slice(0, index) +
+        qqUserMention(user.qqUserId) +
+        rendered.slice(index + candidate.length);
+      replaced = true;
+      break;
+    }
+    if (!replaced) {
+      rendered = `${qqUserMention(user.qqUserId)} ${rendered}`;
+    }
+  }
+  if (room.kind === 'guild' && matrixMentionsRoom(content)) {
+    rendered = rendered.replace(/(^|\s)@room(?=\s|$)/, '$1<qqbot-at-everyone />');
+  }
+  return rendered.trim();
 }
 
 function quoteFallback(sender: string, excerpt: string): string {
@@ -1124,6 +1244,30 @@ export class QqMatrixBridge {
 
     const mentionContext = qqMentionContext(message, this.config);
     const structured = extractStructuredMessage(message, mentionContext);
+    const qqUsers = new Map<string, { qqUserId: string; displayName: string }>();
+    qqUsers.set(ghostUserId, { qqUserId: message.senderId, displayName: senderDisplayName });
+    for (const qqUserId of new Set([
+      ...structured.mentionQqIds,
+      ...mentionContext.names.keys(),
+    ])) {
+      const mentionGhost = `@${deriveGhostLocalpart(
+        this.config.identitySecret,
+        qqUserId,
+        this.config.userPrefix,
+      )}:${this.config.domain}`;
+      qqUsers.set(mentionGhost, {
+        qqUserId,
+        displayName:
+          mentionContext.names.get(qqUserId) ??
+          `QQ用户_${digest(this.config.identitySecret, qqUserId, 8)}`,
+      });
+    }
+    await this.store.rememberQqUsers(
+      [...qqUsers].map(([matrixUserId, user]) => ({
+        matrixUserId,
+        ...user,
+      })),
+    );
     if (structured.truncated) {
       this.logger.debug('QQ 结构化消息超出限制，已截断', {
         kind: message.kind,
@@ -1560,6 +1704,7 @@ export class QqMatrixBridge {
       if (body === '') {
         return;
       }
+      const qqBody = renderMatrixMentionsForQq(event.content, body, room, this.store);
       const target = await this.qqTarget(room);
       const replyEventId = matrixReplyEventId(event.content);
       const messageReference =
@@ -1567,7 +1712,7 @@ export class QqMatrixBridge {
       const response = await this.sendQqWithRecovery(room, target, (currentTarget) =>
         this.bot.replyText(
           currentTarget,
-          body,
+          qqBody,
           messageReference === undefined ? undefined : { messageReference },
         ),
       );

@@ -102,7 +102,7 @@ pnpm ci:check      # 与 GitHub Actions 相同的完整门禁
 | `QQBOT_TRANSPORT` | `websocket`（默认）或 `webhook` |
 | `QQBOT_WEBHOOK_PORT` / `QQBOT_WEBHOOK_PATH` | 仅 webhook 模式使用 |
 | `QQBOT_INTENTS` | 自定义 intents 位掩码；默认使用 SDK 完整集合，含 guild、DM、群聊、单聊与互动 |
-| `QQBOT_MARKDOWN_SUPPORT` | 机器人是否有 Markdown 权限 |
+| `QQBOT_MARKDOWN_SUPPORT` | 机器人是否有 Markdown 权限；为 `true` 时，检测到 Markdown 语法的正文使用 `msg_type=2` |
 | `QQBOT_TOKEN_PREFETCH` | `sync`（默认，凭据错误立即暴露）或 `async` |
 | `QQBOT_API_BASE_URL` / `QQBOT_TOKEN_BASE_URL` | 可选，覆盖 OpenAPI / token 基址（自建代理或测试） |
 | `LOG_LEVEL` | `debug` / `info` / `warn` / `error` |
@@ -146,6 +146,14 @@ bridge 复用已上传的 Matrix `mxc://`，同一图片、表情包或文件不
 记录警告并忽略，但不会阻塞 transaction ACK。
 bridge 不枚举 QQ 群成员名单，ghost 在收到该用户消息后创建；QQ 未提供昵称时
 才会显示 `QQ用户_<8 位摘要>`，这不是硬编码用户列表。
+Matrix 发出的 `m.mentions.user_ids` 会在已持久化的 QQ ghost 映射中解析为
+QQ openid，并转换为 `msg_type=0/2` 都支持的 `<qqbot-at-user id="..." />`；
+普通 Matrix 用户不会被伪装成 QQ 用户。状态文件使用 schema v8 保存加密的
+ghost 反向映射，并支持 v2-v7 平滑迁移。
+Matrix 正文命中标题、列表、引用、代码、链接或强调语法时，在
+`QQBOT_MARKDOWN_SUPPORT=true` 且机器人有平台 Markdown 权限的前提下改用
+QQ `msg_type=2`；普通正文仍使用 `msg_type=0`。引用消息的
+`message_reference` 在两种类型下都会保留。
 QQ 入站消息会先加密写入持久化队列，bridge 重启后自动重放；失败按指数
 退避，队列容量和重试间隔可通过 `MATRIX_BRIDGE_QQ_*` 调整。
 

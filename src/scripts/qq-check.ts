@@ -17,7 +17,7 @@ import { createServer } from 'node:http';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import type { QQBotInboundMessage } from '@tencent-connect/qqbot-nodejs';
-import { QQBot } from '@tencent-connect/qqbot-nodejs';
+import { MsgType, QQBot } from '@tencent-connect/qqbot-nodejs';
 import {
   decodeGatewayMessageData,
   dispatchEvent,
@@ -25,7 +25,7 @@ import {
   signValidationResponse,
   verifyWebhookSignature,
 } from '@tencent-connect/qqbot-nodejs/protocol';
-import { Bot } from '../bot.js';
+import { Bot, looksLikeQqMarkdown } from '../bot.js';
 import { ChatStore } from '../chat-log.js';
 import { ConfigError, loadConfig } from '../config.js';
 import { createLogger, parseLogLevel } from '../logger.js';
@@ -300,6 +300,34 @@ check(
   inboundMessages[1]?.replyTarget.scope === 'dm' &&
     inboundMessages[1].replyTarget.targetId === 'DM-GUILD' &&
     inboundMessages[1].replyTarget.msgId === 'DM-MESSAGE',
+);
+
+check('识别 Markdown 标题', looksLikeQqMarkdown('# 标题'));
+check('识别 Markdown 粗体', looksLikeQqMarkdown('这是 **粗体**'));
+check('普通乘号不误判为 Markdown', !looksLikeQqMarkdown('2 * 3 * 4'));
+
+const outgoingOptions: Array<Parameters<QQBot['send']>[0]> = [];
+bot.client.send = async (options) => {
+  outgoingOptions.push(options);
+  return { id: `markdown-${String(outgoingOptions.length)}`, timestamp: 1 };
+};
+await bot.replyText(
+  { scope: 'group', targetId: 'GROUP' },
+  '**粗体**',
+  { messageReference: 'REFIDX-test' },
+);
+check(
+  'Markdown 正文使用 msg_type=2 并保留引用',
+  outgoingOptions[0]?.msgType === MsgType.MARKDOWN &&
+    outgoingOptions[0]?.markdown?.content === '**粗体**' &&
+    outgoingOptions[0]?.messageReference?.message_id === 'REFIDX-test',
+);
+await bot.replyText({ scope: 'group', targetId: 'GROUP' }, '普通文本');
+check(
+  '普通正文使用 msg_type=0',
+  outgoingOptions[1]?.msgType === MsgType.TEXT &&
+    outgoingOptions[1]?.content === '普通文本' &&
+    outgoingOptions[1]?.markdown === undefined,
 );
 
 // ---------------------------------------------------------------------------

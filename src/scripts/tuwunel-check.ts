@@ -1296,6 +1296,40 @@ async function main(): Promise<void> {
       reply.content === MATRIX_BODY,
     );
 
+    const mentionMatrixEvent = await matrix.sendEvent(
+      room.roomId,
+      'm.room.message',
+      {
+        msgtype: 'm.text',
+        body: '@Tuwunel check user',
+        'm.mentions': { user_ids: [ghostUserId] },
+      },
+      `tuwunel-check-mention-${randomBytes(8).toString('hex')}`,
+      ALLOWED_USER,
+    );
+    await waitFor('Matrix 提及 transaction 回推', async () => {
+      const event = transactionEvents(transactions).find(
+        (candidate) => candidate.event_id === mentionMatrixEvent.event_id,
+      );
+      if (event === undefined) {
+        throw new Error('尚未收到对应提及事件');
+      }
+      return event;
+    });
+    const mentionReply = await waitFor('Matrix 提及 QQ 出站调用', async () => {
+      const value = qqReplies.find(
+        (candidate) => candidate.content === `<qqbot-at-user id="${QQ_USER_ID}" />`,
+      );
+      if (value === undefined) {
+        throw new Error('尚未收到 Matrix 提及对应的 QQ 标签');
+      }
+      return value;
+    });
+    check(
+      'Matrix ghost 提及经 Tuwunel 映射为 QQ 原生提及',
+      mentionReply.content === `<qqbot-at-user id="${QQ_USER_ID}" />`,
+    );
+
     section('房间成员管理');
     const activeStatus = await runMatrixAdmin(matrix, bridgeConfig, {
       action: 'status',

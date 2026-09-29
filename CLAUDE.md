@@ -73,7 +73,7 @@ pnpm deploy:server      # 本地构建运行包并同步到服务器重启服务
 | `src/matrix/client.ts` | Matrix Client-Server API、媒体上传与下载 |
 | `src/matrix/appservice.ts` | Appservice transaction HTTP 服务与鉴权 |
 | `src/bridge/bridge.ts` | 双向消息转换、路由、提及/引用/媒体与回放 |
-| `src/bridge/store.ts` | schema v7 加密状态、引用、入站队列与媒体映射 |
+| `src/bridge/store.ts` | schema v8 加密状态、引用、入站队列、媒体与 QQ ghost 反向映射 |
 | `src/matrix/admin.ts` | 房间成员状态、邀请与踢出的管理逻辑 |
 | `src/scripts/qq-login.ts` | 扫码换取 AppID / AppSecret 并写入 `.env` |
 | `src/scripts/qq-check.ts` | 离线自检 |
@@ -123,11 +123,16 @@ QQ 平台
   `DEPLOYMENT.md`；代码行为变化必须同步三者中受影响的部分。
 - QQ `<@OPENID>` 必须转成可读 `body`、Matrix HTML、`m.mentions` 和稳定的
   ghost 用户，不得把原始 openid 或 `<@...>` 直接暴露给 Matrix。
+- Matrix `m.mentions.user_ids` 只对已持久化的 QQ ghost 反向映射生成
+  `<qqbot-at-user id="..." />`；原生 Matrix 用户保持普通文本。
+- 含高置信度 Markdown 语法的 Matrix 正文只有在
+  `QQBOT_MARKDOWN_SUPPORT=true` 时使用 `msg_type=2`，普通正文保持
+  `msg_type=0`，引用消息必须同时保留 `message_reference`。
 - 引用索引要兼容 `refMsgIdx`、原始 snake_case 字段、`message_scene.ext` 和
   嵌套 `msg_elements`。`TMP_*` 只能在房间、发送者与摘录唯一匹配时回退。
 - 媒体按 SHA-256 内容寻址；相同字节必须复用本地文件和 Matrix `mxc://`，
   并合并同哈希并发上传。修改时在 `matrix-check.ts` 增加重复内容断言。
-- 状态文件当前为 schema v7，必须保留 v2-v6 迁移；敏感字段加密、索引
+- 状态文件当前为 schema v8，必须保留 v2-v7 迁移；敏感字段加密、索引
   使用 HMAC。不要直接改状态 JSON，也不要提交 `data/`、`.env` 或 registration。
 
 ### 事件处理器约定

@@ -174,7 +174,7 @@ curl -i -X POST \
 - QQ 媒体先下载并上传 Matrix，再转换为对应的 `m.image`、`m.audio`、
   `m.video` 或 `m.file`。
 - QQ 媒体按下载字节的 SHA-256 内容寻址：聊天记录复用
-  `data/media-cache/<sha256>`，bridge 在 schema v7 状态中保存内容哈希到
+  `data/media-cache/<sha256>`，bridge 状态中保存内容哈希到
   Matrix `mxc://` 的映射，并合并同哈希并发上传。相同图片、表情包或文件不
   重复落盘和上传；引用元素附件也走同一去重路径。
 - Matrix 媒体下载使用已鉴权端点
@@ -194,6 +194,13 @@ curl -i -X POST \
   4096 字符、引用摘录 500 字符；超限时截断并追加 `[消息过长，已截断]`。
 - Matrix 文本按原正文发送到 QQ，不额外增加发送者标签；媒体消息也不把
   发送者标签作为 caption。
+- Matrix `m.mentions.user_ids` 通过已持久化的 QQ ghost 反向映射还原为
+  QQ openid，并生成官方 `<qqbot-at-user id="..." />` 提及标签；普通
+  Matrix 用户保持原文，不伪装成 QQ 用户。schema v8 使用 HMAC 索引和
+  AES-256-GCM 加密保存该映射。
+- Matrix 正文命中高置信度 Markdown 语法，且 `QQBOT_MARKDOWN_SUPPORT=true`
+  时，QQ 出站使用 `msg_type=2` 与 `markdown.content`；普通正文显式使用
+  `msg_type=0`。两种发送都会保留已有的 `message_reference`。
 - Matrix 出站优先使用最近 QQ 入站消息的被动回复窗口，无窗口时转为主动消息。
 - 每条 QQ 入站消息拥有独立配额；收到新消息时，后续 Matrix 出站切换到
   该消息的被动回复窗口。
@@ -391,6 +398,11 @@ curl -i -X POST \
     状态和日志均不泄漏原始 openid。
 27. 媒体以 SHA-256 内容地址去重，重复图片、表情包、文件和引用附件复用
     本地文件及 Matrix `mxc://`；并发上传合并为一次，重启后仍可复用映射。
+28. Matrix `m.mentions.user_ids` 中的 QQ ghost 在本地与重启后均能映射为
+    对应 QQ openid 和 `<qqbot-at-user>`；原生 Matrix 用户不生成 QQ 提及。
+29. 含 Markdown 语法的正文在机器人有权限且启用
+    `QQBOT_MARKDOWN_SUPPORT` 时使用 `msg_type=2`，普通正文使用
+    `msg_type=0`；引用回复在两种类型下均保留 `message_reference`。
 
 ## 风险评估
 
@@ -403,10 +415,10 @@ curl -i -X POST \
   同时成立。全局名单只是部署基线，不替代房间级批准；生产环境应限制谁有权
   执行 `matrix:admin`、邀请成员和修改 room state。`--actor` 会被
   appservice token 冒充，必须使用最小权限且妥善保护 `.env`。
-- bridge 状态当前为 schema v7，字段使用 AES-256-GCM 加密，索引使用
-  HMAC；支持 v2-v6 平滑迁移到 v7。v7 增加内容哈希到 Matrix 上传的映射。
-  v1 或未知版本仍会被拒绝；若已有状态文件，升级前必须停止 bridge 并单独
-  备份。
+- bridge 状态当前为 schema v8，字段使用 AES-256-GCM 加密，索引使用
+  HMAC；支持 v2-v7 平滑迁移到 v8。v7 增加内容哈希到 Matrix 上传的映射，
+  v8 增加 QQ ghost 到 openid 的加密反向映射。v1 或未知版本仍会被拒绝；
+  若已有状态文件，升级前必须停止 bridge 并单独备份。
 - Webhook transport 在校验签名后立即向 QQ 平台返回 ACK，再异步处理事件。
   “平台 ACK 后、bridge 持久化入队前”的极小崩溃窗口无法由 bridge 消除；
   平台重投和上层可用性要求必须覆盖该窗口。

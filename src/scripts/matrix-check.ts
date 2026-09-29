@@ -903,11 +903,13 @@ check(
 const persistedState = JSON.parse(readFileSync(storeFile, 'utf8')) as Record<string, unknown>;
 const persistedText = JSON.stringify(persistedState);
 check(
-  '状态 schema 为 v7 且不含旧 users 映射',
-  persistedState.version === 7 &&
+  '状态 schema 为 v8 且持久化 ghost 反向映射',
+  persistedState.version === 8 &&
     typeof persistedState.pendingQqMessages === 'object' &&
     typeof persistedState.matrixMedia === 'object' &&
-    !('users' in persistedState),
+    typeof persistedState.qqUsers === 'object' &&
+    !('users' in persistedState) &&
+    store.getQqUser(expectedGhost)?.qqUserId === 'QQ-SENDER-1',
 );
 check(
   '状态文件不包含 QQ openid 或 message ID',
@@ -2053,6 +2055,48 @@ check(
   replies.at(-1)?.content === 'approved member',
 );
 
+await bridge.handleTransaction('txn-qq-ghost-mention', {
+  events: [
+    {
+      type: 'm.room.message',
+      room_id: '!qq-room:matrix.test',
+      sender: '@alice:matrix.test',
+      event_id: '$matrix-ghost-mention',
+      content: {
+        msgtype: 'm.text',
+        body: '你好 @测试用户，请看 **这个**',
+        'm.mentions': { user_ids: [expectedGhost] },
+      },
+    },
+  ],
+});
+check(
+  'Matrix 提及 QQ ghost 映射为 QQ @ 用户标签',
+  replies.at(-1)?.content === '你好 <qqbot-at-user id="QQ-SENDER-1" />，请看 **这个**',
+  `actual=${replies.at(-1)?.content ?? ''}`,
+);
+
+await bridge.handleTransaction('txn-matrix-native-mention', {
+  events: [
+    {
+      type: 'm.room.message',
+      room_id: '!qq-room:matrix.test',
+      sender: '@alice:matrix.test',
+      event_id: '$matrix-native-mention',
+      content: {
+        msgtype: 'm.text',
+        body: 'hi @alice:matrix.test',
+        'm.mentions': { user_ids: ['@alice:matrix.test'] },
+      },
+    },
+  ],
+});
+check(
+  'Matrix 原生用户提及不会伪装成 QQ 提及',
+  replies.at(-1)?.content === 'hi @alice:matrix.test',
+  `actual=${replies.at(-1)?.content ?? ''}`,
+);
+
 const originalSendEvent = matrix.sendEvent;
 let markFlushSendStarted: () => void = () => {};
 let releaseFlushSend: () => void = () => {};
@@ -2204,6 +2248,10 @@ const reloaded = new BridgeStore({
   logger: silentLogger,
 });
 check('重启后恢复 room 映射', reloaded.getRoomByRoomId('!qq-room:matrix.test')?.targetId === 'GROUP-OPENID');
+check(
+  '重启后保留 QQ ghost 反向映射',
+  reloaded.getQqUser(expectedGhost)?.qqUserId === 'QQ-SENDER-1',
+);
 check('重启后保留 QQ message 去重记录', reloaded.hasQqMessage('qq-message-1'));
 check('重启后保留 Matrix event 去重记录', reloaded.hasMatrixEvent('$matrix-text'));
 check('重启后保留 transaction 去重记录', reloaded.hasTransaction('txn-1'));
@@ -2296,13 +2344,14 @@ const migratedStore = new BridgeStore({
 await migratedStore.rememberTransaction('v2-migrated');
 const migratedState = JSON.parse(readFileSync(v2File, 'utf8')) as Record<string, unknown>;
 check(
-  'v2 状态平滑迁移为 v7',
-  migratedState.version === 7 &&
+  'v2 状态平滑迁移为 v8',
+  migratedState.version === 8 &&
     typeof migratedState.outboundMessages === 'object' &&
     typeof migratedState.references === 'object' &&
     typeof migratedState.matrixReferences === 'object' &&
     typeof migratedState.pendingQqMessages === 'object' &&
     typeof migratedState.matrixMedia === 'object' &&
+    typeof migratedState.qqUsers === 'object' &&
     Array.isArray(migratedState.transactions),
 );
 
@@ -2328,12 +2377,13 @@ const v3MigratedStore = new BridgeStore({
 await v3MigratedStore.rememberTransaction('v3-migrated');
 const v3MigratedState = JSON.parse(readFileSync(v3File, 'utf8')) as Record<string, unknown>;
 check(
-  'v3 状态平滑迁移为 v7',
-  v3MigratedState.version === 7 &&
+  'v3 状态平滑迁移为 v8',
+  v3MigratedState.version === 8 &&
     typeof v3MigratedState.references === 'object' &&
     typeof v3MigratedState.matrixReferences === 'object' &&
     typeof v3MigratedState.pendingQqMessages === 'object' &&
-    typeof v3MigratedState.matrixMedia === 'object',
+    typeof v3MigratedState.matrixMedia === 'object' &&
+    typeof v3MigratedState.qqUsers === 'object',
 );
 
 const v4File = join(dataDir, 'v4-state.json');
@@ -2360,12 +2410,13 @@ const v4MigratedStore = new BridgeStore({
 await v4MigratedStore.rememberTransaction('v4-migrated');
 const v4MigratedState = JSON.parse(readFileSync(v4File, 'utf8')) as Record<string, unknown>;
 check(
-  'v4 状态平滑迁移为 v7',
-  v4MigratedState.version === 7 &&
+  'v4 状态平滑迁移为 v8',
+  v4MigratedState.version === 8 &&
     Array.isArray(v4MigratedState.transactions) &&
     typeof v4MigratedState.references === 'object' &&
     typeof v4MigratedState.pendingQqMessages === 'object' &&
-    typeof v4MigratedState.matrixMedia === 'object',
+    typeof v4MigratedState.matrixMedia === 'object' &&
+    typeof v4MigratedState.qqUsers === 'object',
 );
 
 const v5File = join(dataDir, 'v5-state.json');
@@ -2392,10 +2443,11 @@ const v5MigratedStore = new BridgeStore({
 await v5MigratedStore.rememberTransaction('v5-migrated');
 const v5MigratedState = JSON.parse(readFileSync(v5File, 'utf8')) as Record<string, unknown>;
 check(
-  'v5 状态平滑迁移为 v7',
-  v5MigratedState.version === 7 &&
+  'v5 状态平滑迁移为 v8',
+  v5MigratedState.version === 8 &&
     typeof v5MigratedState.pendingQqMessages === 'object' &&
     typeof v5MigratedState.matrixMedia === 'object' &&
+    typeof v5MigratedState.qqUsers === 'object' &&
     Array.isArray(v5MigratedState.transactions),
 );
 
@@ -2424,10 +2476,44 @@ const v6MigratedStore = new BridgeStore({
 await v6MigratedStore.rememberTransaction('v6-migrated');
 const v6MigratedState = JSON.parse(readFileSync(v6File, 'utf8')) as Record<string, unknown>;
 check(
-  'v6 状态平滑迁移为 v7',
-  v6MigratedState.version === 7 &&
+  'v6 状态平滑迁移为 v8',
+  v6MigratedState.version === 8 &&
     typeof v6MigratedState.matrixMedia === 'object' &&
+    typeof v6MigratedState.qqUsers === 'object' &&
     Array.isArray(v6MigratedState.transactions),
+);
+
+const v7File = join(dataDir, 'v7-state.json');
+writeFileSync(
+  v7File,
+  JSON.stringify({
+    version: 7,
+    rooms: {},
+    transactions: [],
+    matrixEvents: [],
+    qqMessages: [],
+    passiveReplies: {},
+    outboundMessages: {},
+    references: {},
+    matrixReferences: {},
+    pendingQqMessages: {},
+    matrixMedia: {},
+  }),
+  'utf8',
+);
+const v7MigratedStore = new BridgeStore({
+  file: v7File,
+  secret: bridgeConfig.identitySecret,
+  logger: silentLogger,
+});
+await v7MigratedStore.rememberTransaction('v7-migrated');
+const v7MigratedState = JSON.parse(readFileSync(v7File, 'utf8')) as Record<string, unknown>;
+check(
+  'v7 状态平滑迁移为 v8',
+  v7MigratedState.version === 8 &&
+    typeof v7MigratedState.matrixMedia === 'object' &&
+    typeof v7MigratedState.qqUsers === 'object' &&
+    Array.isArray(v7MigratedState.transactions),
 );
 
 const limitStore = new BridgeStore({

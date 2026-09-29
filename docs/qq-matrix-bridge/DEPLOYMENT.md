@@ -234,6 +234,13 @@ QQ 到 Matrix 的消息语义当前包括：`<@OPENID>` 转可读提及、HTML �
 上传复用。部署后应分别用群聊、单聊、提及、引用、表情包和图片各发一条测试
 消息，确认 Matrix 事件正文和媒体 URI。
 
+Matrix 到 QQ 当前会把已映射 ghost 的 `m.mentions.user_ids` 转为
+`<qqbot-at-user id="..."/>`，并使用 schema v8 的加密反向映射支持重启恢复。
+正文命中高置信度 Markdown 语法时，只有机器人确有平台权限且 `.env` 设置
+`QQBOT_MARKDOWN_SUPPORT=true` 才使用 `msg_type=2`；否则仍使用 `msg_type=0`。
+部署验收应额外覆盖 Matrix 侧 @ QQ 用户、Markdown 标题/列表/代码和带引用的
+Markdown 消息。
+
 `MATRIX_BRIDGE_SHUTDOWN_TIMEOUT_MS` 默认 30 秒，控制关闭时等待 appservice
 活跃请求的上限；超时后会强制关闭滞留连接，由 Tuwunel 重试未确认的
 transaction。该值应覆盖在途 Matrix 请求时间，并小于 systemd 的

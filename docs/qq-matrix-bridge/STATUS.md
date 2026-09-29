@@ -9,13 +9,13 @@
 
 ## 当前迭代
 
-- 目标：完善 QQ 到 Matrix 的提及、引用、表情/附件语义，对媒体做内容级去重，
-  并在 `as:/opt/al1s` 的原生 systemd 环境持续做真实 QQ 联调。
+- 目标：完善 QQ/Matrix 双向提及、引用、Markdown 与媒体语义，并在
+  `as:/opt/al1s` 的原生 systemd 环境持续做真实 QQ 联调。
 - 状态：DOING。
-- 已完成：提及与引用映射、`TMP_*` 唯一回退、结构化标签清理、媒体 SHA-256
-  去重与 Matrix 上传复用均通过离线检查和真实 Tuwunel 检查。
-- 剩余：在生产环境逐项确认 QQ 单聊、群聊提及、引用、表情包和图片，并记录
-  真实 QQ 平台与本地假端口之间的行为差异。
+- 已完成：双向提及映射、引用、`TMP_*` 唯一回退、结构化标签清理、Markdown
+  出站选择、媒体 SHA-256 去重与 Matrix 上传复用均通过离线检查。
+- 剩余：部署后在生产环境逐项确认 QQ 单聊、群聊提及、引用、Markdown、表情包
+  和图片，并记录真实 QQ 平台与本地假端口之间的行为差异。
 
 ## 当前状态
 
@@ -27,13 +27,15 @@
 | Matrix API client | DONE | 创建、加入、发送、上传、下载通过 mock 检查；下载改用已鉴权媒体端点并通过真实 Tuwunel 验证 |
 | QQ 到 Matrix 文本 | DONE | 群聊、单聊、guild、DM 进入隔离 room，ghost 身份与会话键正确 |
 | Matrix 到 QQ 文本 | DONE | 原正文转发、被动回复窗口、回环防护及 guild/DM 出站目标正确 |
+| Matrix 提及映射到 QQ | DONE | `m.mentions.user_ids` 只对持久化 QQ ghost 还原 openid 并生成 `<qqbot-at-user>`；原生 Matrix 用户保持文本，真实 Tuwunel 验证 appservice 回推后输出 QQ 标签，重启后映射仍可查询 |
+| QQ Markdown 出站 | DONE | 高置信度 Markdown 语法在 `QQBOT_MARKDOWN_SUPPORT=true` 时使用 `msg_type=2`；普通正文使用 `msg_type=0`，两种类型均保留 `message_reference` |
 | 会话级并发控制 | DONE | 同一 QQ 会话并发首条消息只创建一个 Matrix room，且两条消息均投递成功 |
 | QQ 到 Matrix 媒体 | DONE | 离线检查覆盖图片上传与事件内容；真实 Tuwunel 验证上传、mxc 下载及字节一致性 |
 | Matrix 到 QQ 媒体 | DONE | 群聊/单聊覆盖 mxc 下载、类型和发送参数，真实 Tuwunel 验证回推后字节到达 QQ 端口；guild/DM 明确忽略并 ACK |
 | Matrix 全局发送者基线 | DONE | 默认拒绝、精确用户名单、显式通配符及非法配置均通过检查 |
 | 房间级成员授权 | DONE | 全局名单 + 目标房间成员 + 最低 power level；离线覆盖未入房、跨房间隔离和批准后放行，真实 Tuwunel 验证权限不足不调用 QQ、升级后放行 |
 | 房间成员运维工具 | DONE | `matrix:admin` 提供 `status`/`invite`/`kick`；离线覆盖请求路径、body 与无效参数零请求，真实 Tuwunel 验证踢出撤权及重新加入恢复 |
-| 持久化与恢复 | DONE | schema v7、v2-v6 平滑迁移、重启恢复和加密检查通过；v7 增加内容哈希到 Matrix 上传的映射 |
+| 持久化与恢复 | DONE | schema v8、v2-v7 平滑迁移、重启恢复和加密检查通过；v8 增加 QQ ghost 到 openid 的加密反向映射 |
 | QQ 入站可靠重放 | DONE | 入站消息加密入队；启动/定时重放、指数退避、成功去重、重启恢复和容量上限均有 `matrix:check` 覆盖 |
 | 状态文件原子持久化 | DONE | 同目录临时文件、文件/目录 `fsync`、原子替换和失败重试通过；新建目录/文件权限分别为 `0700`/`0600` |
 | Matrix 撤回映射 | DONE | 离线检查覆盖清理映射；真实 Tuwunel 验证 redaction 回推后映射为 QQ recall |
@@ -63,6 +65,23 @@
 | 生产环境验证 | DONE | `as:/opt/al1s` 原生 systemd 部署已上线，`al1s-bridge.service` 与 `tuwunel.service` 均为 active，`/health` 返回 `{}`；当前运行包对应 `ed28674` |
 
 ## 实施日志
+
+### 2026-09-29
+
+- 增加 Matrix 到 QQ 的完整提及映射：QQ 用户首次出现或其 openid 出现在
+  提及中时，持久化 Matrix ghost 到 QQ openid 的加密反向映射；Matrix
+  `m.mentions.user_ids` 命中后生成 `<qqbot-at-user id="..." />`，原生
+  Matrix 用户和未知用户不会被伪装成 QQ 提及。
+- 状态升级为 schema v8，新增 HMAC 索引、AES-256-GCM 加密的 `qqUsers`
+  映射，并覆盖 v2-v7 平滑迁移和重启恢复。
+- QQ 出站增加高置信度 Markdown 选择：标题、列表、引用、代码、链接和强调
+  语法在机器人配置 `QQBOT_MARKDOWN_SUPPORT=true` 时使用 `msg_type=2` 和
+  `markdown.content`；普通正文显式使用 `msg_type=0`。引用回复在两种类型下
+  都保留 `message_reference`。
+- 离线检查新增 Matrix ghost 提及、原生 Matrix 用户透传、Markdown 语法识别、
+  `msg_type` 选择、引用保留、schema v8 迁移与重启映射断言。
+- 真实 Tuwunel 检查新增 Matrix ghost 提及经 appservice transaction 回推后
+  生成 `<qqbot-at-user id="..."/>` 的端到端断言。
 
 ### 2026-09-28
 

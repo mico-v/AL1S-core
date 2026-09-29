@@ -49,6 +49,23 @@ export interface QqReplyOptions {
   messageReference?: string;
 }
 
+const QQ_MARKDOWN_PATTERNS = [
+  /^ {0,3}```/m,
+  /^ {0,3}#{1,6}[ \t]+\S/m,
+  /^ {0,3}>[ \t]+\S/m,
+  /^ {0,3}(?:[-+*]|\d+[.)])[ \t]+\S/m,
+  /\[[^\]\n]+\]\((?:https?:\/\/|mailto:)[^)\s]+\)/,
+  /\*\*[^*\n]+\*\*/,
+  /__[^_\n]+__/,
+  /~~[^~\n]+~~/,
+  /`[^`\n]+`/,
+] as const;
+
+/** 只在高置信度 Markdown 语法出现时切换 QQ `msg_type=2`。 */
+export function looksLikeQqMarkdown(content: string): boolean {
+  return QQ_MARKDOWN_PATTERNS.some((pattern) => pattern.test(content));
+}
+
 export class Bot {
   readonly client: QQBot;
   readonly config: BotConfig;
@@ -163,15 +180,24 @@ export class Bot {
     content: string,
     options: QqReplyOptions = {},
   ): Promise<MessageResponse> {
-    if (options.messageReference !== undefined) {
+    const messageReference =
+      options.messageReference === undefined
+        ? {}
+        : { messageReference: { message_id: options.messageReference } };
+    if (this.config.markdownSupport && looksLikeQqMarkdown(content)) {
       return this.client.send({
         target,
-        msgType: MsgType.TEXT,
-        content,
-        messageReference: { message_id: options.messageReference },
+        msgType: MsgType.MARKDOWN,
+        markdown: { content },
+        ...messageReference,
       });
     }
-    return this.client.sendText(target, content);
+    return this.client.send({
+      target,
+      msgType: MsgType.TEXT,
+      content,
+      ...messageReference,
+    });
   }
 
   /** 回复 Markdown。 */
