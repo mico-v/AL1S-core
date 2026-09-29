@@ -852,7 +852,9 @@ function matrixMentionTextHints(content: JsonObject): Map<string, string[]> {
 }
 
 function qqUserMention(qqUserId: string): string {
-  return `<qqbot-at-user id="${escapeHtml(qqUserId)}" />`;
+  // QQ 文档已推荐 `<qqbot-at-user>`，但当前群聊客户端仍会把新标签显示为
+  // 普通文字；官方/主流 SDK 实际发送的兼容格式仍是 `<@openid>`。
+  return `<@${escapeHtml(qqUserId)}>`;
 }
 
 function renderMatrixMentionsForQq(
