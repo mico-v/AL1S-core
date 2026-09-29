@@ -124,7 +124,8 @@ QQ 平台
 - QQ `<@OPENID>` 必须转成可读 `body`、Matrix HTML、`m.mentions` 和稳定的
   ghost 用户，不得把原始 openid 或 `<@...>` 直接暴露给 Matrix。
 - Matrix `m.mentions.user_ids` 只对已持久化的 QQ ghost 反向映射生成
-  `<qqbot-at-user id="..." />`；原生 Matrix 用户保持普通文本。
+  `<@openid>`；官方新标签 `<qqbot-at-user>` 在当前群聊客户端可能显示为
+  普通文字，不能据此回归。原生 Matrix 用户保持普通文本。
 - 含高置信度 Markdown 语法的 Matrix 正文只有在
   `QQBOT_MARKDOWN_SUPPORT=true` 时使用 `msg_type=2`，普通正文保持
   `msg_type=0`，引用消息必须同时保留 `message_reference`。
