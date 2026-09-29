@@ -27,7 +27,7 @@ Caddy → Matrix 客户端
 - SSH 别名为 `as`，源码检出位于 `/opt/al1s`，运行包位于 `/opt/al1s/app`；
   状态和 Tuwunel 数据位于 `/opt/al1s/data`。
 - systemd 单元为 `al1s-bridge.service` 与 `tuwunel.service`；运行包目前对应
-  `ed28674`，两者均为 active，`http://127.0.0.1:29328/health` 返回 `{}`。
+  `ccd8825`，两者均为 active，`http://127.0.0.1:29328/health` 返回 `{}`。
 - `git push as main` 只更新 `/opt/al1s` 源码检出，不会替换正在运行的
   `/opt/al1s/app` 或重启服务。让新代码生效必须在本地运行 `pnpm deploy:server`。
 

@@ -62,7 +62,7 @@
 | 故障关闭与 HTTP 错误分类 | DONE | `matrix:check` 覆盖非法 JSON `400`、超限请求体 `413`、脱敏 `500`、指标分类、bridge 在途任务等待、状态写入失败重试和 appservice 滞留连接超时关闭；`tuwunel:check` 直接注入未捕获异常/未处理拒绝，验证统一优雅关闭、非零退出码和端口释放 |
 | 持续集成门禁 | DONE | `pnpm ci:check` 已完整通过；`.github/workflows/ci.yml` 在 push/PR 上复用同一命令，首次远端运行需推送后确认 |
 | 真实 QQ 联调 | DOING | 生产 QQ bot 已连接并出现群聊映射；单聊、提及、引用、表情包和媒体仍需按生产日志逐项验收，不能以离线检查代替 |
-| 生产环境验证 | DONE | `as:/opt/al1s` 原生 systemd 部署已上线，`al1s-bridge.service` 与 `tuwunel.service` 均为 active，`/health` 返回 `{}`；当前运行包对应 `ed28674` |
+| 生产环境验证 | DONE | `as:/opt/al1s` 原生 systemd 部署已上线，`al1s-bridge.service` 与 `tuwunel.service` 均为 active，`/health` 返回 `{}`；当前运行包对应 `ccd8825`，状态已从 v7 迁移到 v8 |
 
 ## 实施日志
 
@@ -82,6 +82,9 @@
   `msg_type` 选择、引用保留、schema v8 迁移与重启映射断言。
 - 真实 Tuwunel 检查新增 Matrix ghost 提及经 appservice transaction 回推后
   生成 `<qqbot-at-user id="..."/>` 的端到端断言。
+- 生产部署更新到 `ccd8825`，服务器 `.env` 已启用 `QQBOT_MARKDOWN_SUPPORT=true`；
+  启动日志确认状态从 v7 迁移为 v8，QQ 网关已就绪，bridge 与 Tuwunel 均为
+  active，`/health` 返回 `{}`。
 
 ### 2026-09-28
 
