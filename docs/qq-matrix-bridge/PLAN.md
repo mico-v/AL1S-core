@@ -211,11 +211,12 @@ curl -i -X POST \
 - QQ 引用从 `refMsgIdx`、原始 `message_reference.message_id`、
   `ref_msg_idx`/`refMsgIdx`/`ref_idx` 等字段、`message_scene.ext` 和嵌套
   `msg_elements[].msg_idx`/`id`/`message_id` 收集候选索引；显式
-  `message_reference` 优先，当前消息的全部可用索引别名都会持久化，已有
-  历史记录继续兼容。
-- `TMP_*` 索引无法直接命中时，只在目标房间、发送者和引用摘录唯一匹配时
-  回退；重复或短摘录不建立错误关联。命中后发送 Matrix `m.in_reply_to`，
-  正文只包含回复内容；未知引用使用不含尖括号的可读文本 fallback。
+  `message_reference` 优先，当前消息的索引、原始 ID 与 message ID 别名都会
+  持久化，已有历史记录继续兼容。
+- `TMP_*` 索引无法直接命中时，按目标房间和引用摘录回退；完全一致时优先
+  同发送者并选择最新记录，包含关系仅在候选唯一时关联。纯媒体消息保存附件
+  摘录，避免空摘录无法回退。命中后发送 Matrix `m.in_reply_to`，正文只包含
+  回复内容；未知引用使用不含尖括号的可读文本 fallback。
 - Matrix 引用在存在 QQ `ref_idx` 映射时转换为 `message_reference`。
 - Matrix `m.replace` 编辑当前忽略，避免把编辑后的正文重复发送到 QQ；
   Matrix redaction 会映射为 QQ 撤回并删除出站映射。
@@ -346,8 +347,8 @@ curl -i -X POST \
 8. QQ 引用与 Matrix 引用可在对应事件已知时双向关联；候选索引覆盖
    `refMsgIdx`、`message_reference.message_id`、原始字段、
    `message_scene.ext` 和嵌套 `msg_elements` 的元素 ID，
-   `TMP_*` 只能通过同房间/发送者/摘录唯一匹配回退；未知引用使用可读
-   fallback，不阻断正文转发，也不输出 `> <...>` 调试文本。
+   `TMP_*` 通过同房间/发送者/摘录按发送者优先和最新记录回退；未知引用使用
+   可读 fallback，不阻断正文转发，也不输出 `> <...>` 调试文本。
 9. 全局名单用户只有在目标房间成员资格有效且 power level 达标时才能触发
    QQ 发送；未加入、已离开或权限不足时均默认拒绝。`tuwunel:check` 在真实
    Tuwunel 上验证权限不足不触发 QQ、更新房间 power level 后放行。

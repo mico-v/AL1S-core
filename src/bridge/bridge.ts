@@ -457,6 +457,18 @@ function normalizeAttachments(value: unknown): QqAttachment[] {
   return attachments;
 }
 
+/**
+ * 媒体消息的摘录占位文本。
+ *
+ * 纯媒体消息没有正文，聊天记录里保存该占位文本后，引用同一张图片或表情包
+ * 的 `TMP_*` 引用才能按发送者与时间回退关联。
+ */
+function attachmentExcerpt(attachment: QqAttachment): string {
+  return attachment.filename === undefined
+    ? `[${attachment.content_type}]`
+    : `[${attachment.content_type}: ${attachment.filename}]`;
+}
+
 function structuredElements(message: QQBotInboundMessage): unknown[] {
   if (Array.isArray(message.msgElements) && message.msgElements.length > 0) {
     return message.msgElements;
@@ -569,6 +581,18 @@ function explicitMessageReferenceId(
   );
 }
 
+/** 只保留可安全写入日志的引用索引形态：前缀类别与长度。 */
+function referenceShape(value: string): string {
+  const prefix = value.startsWith('TMP_')
+    ? 'TMP'
+    : value.startsWith('REFIDX_')
+      ? 'REFIDX'
+      : value.startsWith('ROBOT1.0_')
+        ? 'ROBOT'
+        : 'other';
+  return `${prefix}:${value.length}`;
+}
+
 /** 收集 QQ 引用消息可能使用的全部引用索引。 */
 function quoteReferenceCandidates(message: QQBotInboundMessage): string[] {
   const indexes: Array<string | undefined> = [explicitMessageReferenceId(message)];
@@ -600,7 +624,12 @@ function quoteReferenceCandidates(message: QQBotInboundMessage): string[] {
   return uniqueIndexes(indexes);
 }
 
-/** 收集当前 QQ 消息可保存的索引别名，`message.msgIdx` 最后写入并作为规范值。 */
+/**
+ * 收集当前 QQ 消息可保存的索引别名，`message.msgIdx` 最后写入并作为规范值。
+ *
+ * `msg_idx` 对应引用场景的 `ref_msg_idx`；消息 ID 则用于部分事件里
+ * `message_reference.message_id` 直接指向原消息 ID 的形态。
+ */
 function currentMessageReferenceAliases(message: QQBotInboundMessage): string[] {
   const indexes: Array<string | undefined> = [];
   const raw: Record<string, unknown> = isRecord(message.raw) ? message.raw : {};
@@ -609,8 +638,21 @@ function currentMessageReferenceAliases(message: QQBotInboundMessage): string[] 
   for (const entry of sceneExtValues(message)) {
     indexes.push(sceneIndex(entry, messageIndexNames));
   }
+  indexes.push(nonEmptyString(raw['id']));
+  indexes.push(message.messageId);
   indexes.push(message.msgIdx);
-  return uniqueIndexes(indexes);
+  const aliases = uniqueIndexes(indexes);
+  // `msg_idx` 可能已从 message_scene 中先加入；去重后仍要把它移回末尾，
+  // 确保 Matrix 回推优先使用 QQ 引用接口接受的规范索引。
+  const canonical = nonEmptyString(message.msgIdx);
+  if (canonical !== undefined) {
+    const existing = aliases.indexOf(canonical);
+    if (existing >= 0) {
+      aliases.splice(existing, 1);
+    }
+    aliases.push(canonical);
+  }
+  return aliases;
 }
 
 /**
@@ -781,10 +823,7 @@ function extractStructuredMessage(
     quoteExcerpt = truncateStructuredText(quoteExcerpt, STRUCTURED_MAX_EXCERPT_LENGTH);
   }
   if (quoteExcerpt === undefined && quoteAttachment !== undefined) {
-    quoteExcerpt =
-      quoteAttachment.filename === undefined
-        ? `[${quoteAttachment.content_type}]`
-        : `[${quoteAttachment.content_type}: ${quoteAttachment.filename}]`;
+    quoteExcerpt = attachmentExcerpt(quoteAttachment);
     quoteFormattedParts.push(escapeHtml(quoteExcerpt));
   }
   const hasBodyMentions = mentionUserIds.size > 0 || mentionsRoom;
@@ -1322,24 +1361,27 @@ export class QqMatrixBridge {
         break;
       }
     }
-    let quoteMatchedByExcerpt = false;
+    let quoteMatch: ReturnType<BridgeStore['matchReferenceByQuote']> | undefined;
     if (quoted === undefined && structured.quoteExcerpt !== undefined) {
-      quoted = this.store.findReferenceByQuote({
+      quoteMatch = this.store.matchReferenceByQuote({
         roomId: room.roomId,
         ...(structured.quoteSender === undefined
           ? {}
           : { sender: structured.quoteSender }),
         excerpt: structured.quoteExcerpt,
       });
-      quoteMatchedByExcerpt = quoted !== undefined;
+      quoted = quoteMatch.reference;
     }
     if (quoteCandidates.length > 0 || structured.quoteExcerpt !== undefined) {
       this.logger.info('QQ 引用消息匹配结果', {
         kind: message.kind,
         candidateCount: quoteCandidates.length,
+        candidateShapes: quoteCandidates.map(referenceShape),
         hasQuoteExcerpt: structured.quoteExcerpt !== undefined,
+        excerptLength: structured.quoteExcerpt?.length ?? 0,
         matched: quoted !== undefined,
-        matchedByExcerpt: quoteMatchedByExcerpt,
+        matchedByExcerpt: quoteMatch?.reference !== undefined,
+        fallback: quoteMatch?.diagnostics,
       });
     }
     const replyContent: JsonObject =
@@ -1431,12 +1473,17 @@ export class QqMatrixBridge {
     } else if (firstMatrixEventId !== undefined) {
       const aliases = currentMessageReferenceAliases(message);
       if (aliases.length > 0) {
+        const firstAttachment = structured.attachments[0];
         await this.store.rememberReferences(
           aliases.map((qqReference) => ({
             qqReference,
             matrixEventId: firstMatrixEventId,
             sender: senderDisplayName,
-            excerpt: (structured.text.trim() || structured.quoteExcerpt || '').slice(0, 500),
+            excerpt: (
+              structured.text.trim() ||
+              structured.quoteExcerpt ||
+              (firstAttachment === undefined ? '' : attachmentExcerpt(firstAttachment))
+            ).slice(0, 500),
             roomId: room.roomId,
           })),
         );

@@ -12,7 +12,7 @@
 - 目标：完善 QQ/Matrix 双向提及、引用、Markdown 与媒体语义，并在
   `as:/opt/al1s` 的原生 systemd 环境持续做真实 QQ 联调。
 - 状态：DOING。
-- 已完成：双向提及映射、引用、`TMP_*` 唯一回退、结构化标签清理、Markdown
+- 已完成：双向提及映射、引用、`TMP_*` 发送者优先回退、结构化标签清理、Markdown
   出站选择、媒体 SHA-256 去重与 Matrix 上传复用均通过离线检查。
 - 剩余：部署后在生产环境逐项确认 QQ 单聊、群聊提及、引用、Markdown、表情包
   和图片，并记录真实 QQ 平台与本地假端口之间的行为差异。
@@ -41,7 +41,7 @@
 | Matrix 撤回映射 | DONE | 离线检查覆盖清理映射；真实 Tuwunel 验证 redaction 回推后映射为 QQ recall |
 | Matrix 编辑处理 | DONE | 当前策略为忽略 `m.replace`，避免重复发送 QQ 消息 |
 | QQ 提及映射 | DONE | `<@OPENID>` 转为可读 `@昵称`、Matrix HTML、`m.mentions` 和 `matrix.to` 链接；`@room`、未知昵称稳定摘要及 openid 不泄漏均有离线与真实 Tuwunel 断言 |
-| QQ/Matrix 引用映射 | DONE | 从 `refMsgIdx`、`message_reference.message_id`、原始字段、`message_scene.ext` 和嵌套 `msg_elements` 的元素 ID 收集索引；显式引用优先，`TMP_*` 仅按同房间/发送者/摘录唯一回退；已知引用只发送 `m.in_reply_to` 与回复正文，旧引用记录仍兼容 |
+| QQ/Matrix 引用映射 | DONE | 从 `refMsgIdx`、`message_reference.message_id`、原始字段、`message_scene.ext` 和嵌套 `msg_elements` 的元素 ID 收集索引；原始消息 ID 与当前消息索引别名均持久化，显式引用优先；`TMP_*` 按同房间、发送者、最新摘录回退，纯媒体消息也保存附件摘录；已知引用只发送 `m.in_reply_to` 与回复正文，旧引用记录仍兼容 |
 | QQ 结构化消息 | DONE | `message_type=3/101/102/103` 卡片、并行、聊天记录与引用消息转为有界文本；嵌套附件去重转发，`faceType` 解码、`attachmentType` 等 `*Type=` 标签过滤，深度/元素/附件/长度上限均覆盖检查 |
 | QQ 媒体内容去重 | DONE | 聊天记录按 SHA-256 写入 `media-cache/<sha256>`，bridge 持久化内容哈希到 `mxc://` 映射并合并并发上传；重复图片、表情包和引用附件不重复落盘/上传，真实 Tuwunel 验证重复事件复用同一 mxc URI |
 | QQ 出站频控与重试 | DONE | `40034005`/`40034128` 降级主动消息，`40034100` 指数退避后交由 transaction 重试 |
@@ -68,6 +68,15 @@
 
 ### 2026-10-02
 
+- 修复生产引用仍显示 `> <...>` 的问题：真实事件只有 `TMP_*` 候选时，历史
+  索引为 `REFIDX_*`，旧“唯一摘录”规则会因同房间重复的 @ 文本放弃匹配。
+  现在完全一致时优先同发送者，再按最新记录选择；弱包含仍只在候选唯一时
+  关联，降低误关联风险。
+- 当前 QQ 消息新增原始 ID 与 message ID 引用别名；纯媒体消息不再保存空
+  摘录，而是保存 `[content_type: filename]`，使图片、表情包被引用的
+  `TMP_*` 事件可以回退到原 Matrix 媒体事件。
+- 离线检查新增原始消息 ID、重复摘录发送者/时间消歧和纯媒体回退断言。
+  生产发布后仍需用真实 QQ 引用事件确认 `matched: true`。
 - 补齐 QQ 入站引用候选：兼容 `message_reference.message_id` 与引用元素
   `id`/`message_id`，显式引用优先于 `message_scene.ext` 的 `ref_msg_idx`；
   增加不含引用 ID 的匹配结果 `info` 日志（仅引用消息触发），便于在默认

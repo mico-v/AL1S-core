@@ -169,6 +169,25 @@ export interface BridgeReference {
   roomId?: string;
 }
 
+/** 摘录回退匹配的计数，用于日志诊断，不包含任何标识或正文。 */
+export interface QuoteMatchDiagnostics {
+  /** 同房间候选引用总数。 */
+  roomReferences: number;
+  /** 正文与引用摘录完全一致的候选数。 */
+  exactMatches: number;
+  /** 正文包含引用摘录的候选数。 */
+  containedMatches: number;
+  /** 完全一致且发送者也一致的候选数。 */
+  senderExactMatches: number;
+  /** 引用事件是否带有发送者信息。 */
+  senderKnown: boolean;
+}
+
+export interface QuoteMatchResult {
+  reference?: BridgeReference;
+  diagnostics: QuoteMatchDiagnostics;
+}
+
 export interface PendingQqMessage {
   message: QQBotInboundMessage;
   attempts: number;
@@ -870,20 +889,38 @@ export class BridgeStore {
    * 按同房间发送者与引用摘录回退匹配。
    *
    * QQ 有时只提供 `TMP_*` 引用索引，而消息正文与引用元素仍包含可信内容。
-   * 仅返回唯一匹配，避免短文本或同房间重复内容造成错误关联。
+   * 群聊里同一句常见文本（例如只 @ 某人的消息）会反复出现，因此完全一致
+   * 的候选优先按引用发送者过滤，再按最新优先选择；包含关系更弱，只在候选
+   * 唯一时建立关联。
    */
   findReferenceByQuote(options: {
     roomId: string;
     sender?: string;
     excerpt: string;
   }): BridgeReference | undefined {
+    return this.matchReferenceByQuote(options).reference;
+  }
+
+  /** 与 `findReferenceByQuote` 相同，但额外返回脱敏的匹配计数。 */
+  matchReferenceByQuote(options: {
+    roomId: string;
+    sender?: string;
+    excerpt: string;
+  }): QuoteMatchResult {
+    const diagnostics: QuoteMatchDiagnostics = {
+      roomReferences: 0,
+      exactMatches: 0,
+      containedMatches: 0,
+      senderExactMatches: 0,
+      senderKnown: options.sender !== undefined,
+    };
     const excerpt = normalizeReferenceText(options.excerpt);
     if (excerpt === '') {
-      return undefined;
+      return { diagnostics };
     }
     const sender =
       options.sender === undefined ? undefined : normalizeReferenceSender(options.sender);
-    const references = Object.values(this.state.references)
+    const entries = Object.values(this.state.references)
       .filter((stored) => !this.isReferenceExpired(stored))
       .map((stored) => ({
         reference: {
@@ -897,41 +934,50 @@ export class BridgeStore {
         },
         createdAt: this.referenceCreatedAt(stored),
       }))
-      .sort((left, right) => right.createdAt - left.createdAt)
-      .map(({ reference }) => reference)
       .filter(
-        (reference) => reference.roomId === undefined || reference.roomId === options.roomId,
+        ({ reference }) =>
+          reference.roomId === undefined || reference.roomId === options.roomId,
+      )
+      .sort((left, right) => right.createdAt - left.createdAt);
+    diagnostics.roomReferences = entries.length;
+
+    const matchesSender = (reference: BridgeReference): boolean =>
+      sender === undefined || normalizeReferenceSender(reference.sender) === sender;
+    const exact = entries.filter(
+      ({ reference }) => normalizeReferenceText(reference.excerpt) === excerpt,
+    );
+    const contained = entries.filter(({ reference }) => {
+      const candidate = normalizeReferenceText(reference.excerpt);
+      return (
+        candidate.length >= 4 && excerpt.length >= 4 && candidate.includes(excerpt)
       );
+    });
+    const reverseContained = entries.filter(({ reference }) => {
+      const candidate = normalizeReferenceText(reference.excerpt);
+      return (
+        candidate.length >= 4 && excerpt.length >= 4 && excerpt.includes(candidate)
+      );
+    });
+    diagnostics.exactMatches = exact.length;
+    diagnostics.containedMatches = contained.length;
+    diagnostics.senderExactMatches = exact.filter(({ reference }) =>
+      matchesSender(reference),
+    ).length;
 
-    const withMatchingSender = (candidates: BridgeReference[]): BridgeReference[] =>
-      sender === undefined
-        ? candidates
-        : candidates.filter(
-            (reference) => normalizeReferenceSender(reference.sender) === sender,
-          );
-    const exact = withMatchingSender(
-      references.filter(
-        (reference) => normalizeReferenceText(reference.excerpt) === excerpt,
-      ),
-    );
-    if (exact.length === 1) {
-      return exact[0];
-    }
-    if (exact.length > 1) {
-      return undefined;
-    }
-
-    const contained = withMatchingSender(
-      references.filter((reference) => {
-        const candidate = normalizeReferenceText(reference.excerpt);
-        return (
-          candidate.length >= 4 &&
-          excerpt.length >= 4 &&
-          (candidate.includes(excerpt) || excerpt.includes(candidate))
-        );
-      }),
-    );
-    return contained.length === 1 ? contained[0] : undefined;
+    // 候选已按 createdAt 倒序，取第一个即最新一条。
+    const newest = (
+      candidates: Array<{ reference: BridgeReference }>,
+    ): BridgeReference | undefined => candidates[0]?.reference;
+    const reference =
+      newest(exact.filter(({ reference }) => matchesSender(reference))) ??
+      newest(exact) ??
+      newest(contained.filter(({ reference }) => matchesSender(reference))) ??
+      (contained.length === 1 ? contained[0]?.reference : undefined) ??
+      (reverseContained.length === 1 ? reverseContained[0]?.reference : undefined);
+    return {
+      ...(reference === undefined ? {} : { reference }),
+      diagnostics,
+    };
   }
 
   getQqReference(matrixEventId: string): string | undefined {

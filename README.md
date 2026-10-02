@@ -136,9 +136,10 @@ QQ 侧已支持文本、媒体、引用与结构化消息（`message_type=3/101/
 Matrix room 提及。
 QQ 引用会从 `refMsgIdx`、原始 `message_reference.message_id`、原始字段、
 `message_scene.ext` 和嵌套 `msg_elements` 的 `msg_idx`/`id`/`message_id`
-中收集索引；`TMP_*` 索引无法直接命中时，仅在目标房间、发送者和引用正文
-唯一匹配时回退关联。命中后只保留 Matrix `m.in_reply_to` 和回复正文，不再
-输出 `> <...>` 调试文本。
+中收集索引；当前消息的原始 ID 也会作为别名保存。`TMP_*` 无法直接命中时，
+按目标房间和引用正文回退，优先同发送者与最新记录；纯媒体消息使用附件名
+保存可匹配摘录。命中后只保留 Matrix `m.in_reply_to` 和回复正文，不再输出
+`> <...>` 调试文本。
 媒体按 SHA-256 内容哈希去重：聊天记录共用 `data/media-cache/<sha256>`，
 bridge 复用已上传的 Matrix `mxc://`，同一图片、表情包或文件不会重复落盘，
 也不会因同一批消息并发上传多次。

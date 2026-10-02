@@ -1522,6 +1522,41 @@ check(
   `body=${messageReferenceQuoteEvent?.body?.body ?? ''}`,
 );
 
+const rawMessageIdReference = 'qq-raw-message-id-target';
+const rawMessageIdText = '通过原始消息 ID 关联的引用目标';
+await bridge.handleQqMessage(
+  groupMessage(
+    rawMessageIdReference,
+    'QQ-SENDER-2',
+    rawMessageIdText,
+    undefined,
+    'GROUP-RAW-MESSAGE-ID',
+  ),
+);
+const rawMessageIdEventId = store.getReference(rawMessageIdReference)?.matrixEventId;
+await bridge.handleQqMessage(
+  structuredGroupMessage(
+    'qq-raw-message-id-quote',
+    'QQ-SENDER-1',
+    '使用原始消息 ID 回复',
+    {
+      message_type: 103,
+      message_reference: { message_id: rawMessageIdReference },
+      msg_elements: [{ message_type: 0, content: rawMessageIdText }],
+    },
+    'GROUP-RAW-MESSAGE-ID',
+  ),
+);
+const rawMessageIdQuoteEvent = matrixState.sentEvents.at(-1) as
+  | { body?: { body?: string; 'm.relates_to'?: { event_id?: string } } }
+  | undefined;
+check(
+  'QQ 原始消息 ID 可作为引用别名直接关联',
+  rawMessageIdEventId !== undefined &&
+    rawMessageIdQuoteEvent?.body?.['m.relates_to']?.event_id === rawMessageIdEventId &&
+    rawMessageIdQuoteEvent?.body?.body === '使用原始消息 ID 回复',
+);
+
 const elementMessageIdReference = 'REFIDX-element-message-id';
 const elementMessageIdText = '引用元素 message_id 关联目标';
 await bridge.handleQqMessage(
@@ -1717,6 +1752,67 @@ check(
     !(fallbackQuoteEvent.body?.body ?? '').includes('>') &&
     !(fallbackQuoteEvent.body?.body ?? '').includes('TMP_'),
   `body=${fallbackQuoteEvent?.body?.body ?? ''}`,
+);
+
+const mediaFallbackReference = 'REFIDX-media-fallback-target';
+const mediaFallbackRoom = 'GROUP-MEDIA-FALLBACK';
+await bridge.handleQqMessage({
+  ...groupMessage(
+    'qq-media-fallback-target',
+    'QQ-SENDER-2',
+    '',
+    [
+      {
+        content_type: 'image/png',
+        url: 'http://qq.test/media-fallback.png',
+        filename: 'media-fallback.png',
+      },
+    ],
+    mediaFallbackRoom,
+  ),
+  msgIdx: mediaFallbackReference,
+});
+const mediaFallbackTargetEventId = store.getReference(mediaFallbackReference)?.matrixEventId;
+const mediaFallbackUploadsBefore = matrixState.uploads.length;
+await bridge.handleQqMessage({
+  ...structuredGroupMessage(
+    'qq-media-fallback-quote',
+    'QQ-SENDER-1',
+    '引用纯媒体消息',
+    {
+      message_type: 103,
+      msg_elements: [
+        {
+          message_type: 0,
+          author: { username: '测试用户' },
+          attachments: [
+            {
+              content_type: 'image/png',
+              url: 'http://qq.test/media-fallback.png',
+              filename: 'media-fallback.png',
+            },
+          ],
+        },
+      ],
+      message_scene: {
+        source: 'default',
+        ext: ['ref_msg_idx=TMP_media-fallback'],
+      },
+    },
+    mediaFallbackRoom,
+  ),
+  refMsgIdx: 'TMP_media-fallback',
+});
+const mediaFallbackQuoteEvent = matrixState.sentEvents.at(-1) as
+  | { body?: { body?: string; 'm.relates_to'?: { event_id?: string } } }
+  | undefined;
+check(
+  '纯媒体 QQ 消息保存附件摘录并可回退关联引用',
+  mediaFallbackTargetEventId !== undefined &&
+    mediaFallbackQuoteEvent?.body?.['m.relates_to']?.event_id ===
+      mediaFallbackTargetEventId &&
+    mediaFallbackQuoteEvent?.body?.body === '引用纯媒体消息' &&
+    matrixState.uploads.length === mediaFallbackUploadsBefore,
 );
 
 await bridge.handleQqMessage({
@@ -2863,6 +2959,80 @@ check(
   '旧引用记录缺少索引字段时仍可回退匹配',
   legacyReferenceMatch?.matrixEventId === '$legacy-fallback' &&
     legacyReferenceMatch.qqReference === '',
+);
+
+const duplicateQuoteFile = join(dataDir, 'duplicate-quote-state.json');
+let duplicateQuoteNow = Date.parse('2026-09-27T00:00:00.000Z');
+const duplicateQuoteStore = new BridgeStore({
+  file: duplicateQuoteFile,
+  secret: bridgeConfig.identitySecret,
+  logger: silentLogger,
+  now: () => duplicateQuoteNow,
+});
+const duplicateQuoteRoomId = '!duplicate-quote:matrix.test';
+const duplicateQuoteExcerpt = '@共同提及目标';
+await duplicateQuoteStore.rememberReference({
+  qqReference: 'REF-DUPLICATE-A',
+  matrixEventId: '$duplicate-a',
+  sender: '甲',
+  excerpt: duplicateQuoteExcerpt,
+  roomId: duplicateQuoteRoomId,
+});
+duplicateQuoteNow += 1;
+await duplicateQuoteStore.rememberReference({
+  qqReference: 'REF-DUPLICATE-B',
+  matrixEventId: '$duplicate-b',
+  sender: '乙',
+  excerpt: duplicateQuoteExcerpt,
+  roomId: duplicateQuoteRoomId,
+});
+duplicateQuoteNow += 1;
+await duplicateQuoteStore.rememberReference({
+  qqReference: 'REF-DUPLICATE-C',
+  matrixEventId: '$duplicate-c',
+  sender: '丙',
+  excerpt: duplicateQuoteExcerpt,
+  roomId: duplicateQuoteRoomId,
+});
+const senderFilteredQuoteMatch = duplicateQuoteStore.matchReferenceByQuote({
+  roomId: duplicateQuoteRoomId,
+  sender: '甲',
+  excerpt: duplicateQuoteExcerpt,
+});
+check(
+  '重复引用摘录优先匹配同发送者而不是最新无关记录',
+  senderFilteredQuoteMatch.reference?.matrixEventId === '$duplicate-a' &&
+    senderFilteredQuoteMatch.diagnostics.exactMatches === 3 &&
+    senderFilteredQuoteMatch.diagnostics.senderExactMatches === 1,
+  JSON.stringify(senderFilteredQuoteMatch.diagnostics),
+);
+duplicateQuoteNow += 1;
+await duplicateQuoteStore.rememberReference({
+  qqReference: 'REF-DUPLICATE-A-NEW',
+  matrixEventId: '$duplicate-a-new',
+  sender: '甲',
+  excerpt: duplicateQuoteExcerpt,
+  roomId: duplicateQuoteRoomId,
+});
+const latestSenderQuoteMatch = duplicateQuoteStore.matchReferenceByQuote({
+  roomId: duplicateQuoteRoomId,
+  sender: '甲',
+  excerpt: duplicateQuoteExcerpt,
+});
+const latestAnyQuoteMatch = duplicateQuoteStore.matchReferenceByQuote({
+  roomId: duplicateQuoteRoomId,
+  excerpt: duplicateQuoteExcerpt,
+});
+check(
+  '重复引用摘录在同发送者内选择最新记录',
+  latestSenderQuoteMatch.reference?.matrixEventId === '$duplicate-a-new' &&
+    latestSenderQuoteMatch.diagnostics.exactMatches === 4 &&
+    latestSenderQuoteMatch.diagnostics.senderExactMatches === 2,
+);
+check(
+  '无引用发送者时重复摘录回退到最新记录',
+  latestAnyQuoteMatch.reference?.matrixEventId === '$duplicate-a-new' &&
+    latestAnyQuoteMatch.diagnostics.senderKnown === false,
 );
 
 // ---------------------------------------------------------------------------
