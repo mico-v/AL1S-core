@@ -61,9 +61,16 @@ const QQ_MARKDOWN_PATTERNS = [
   /`[^`\n]+`/,
 ] as const;
 
+const QQ_MENTION_MARKUP_PATTERN = /<@!?[^>\s]+>|<qqbot-at-user\s+[^>]*\/?>/i;
+
 /** 只在高置信度 Markdown 语法出现时切换 QQ `msg_type=2`。 */
 export function looksLikeQqMarkdown(content: string): boolean {
   return QQ_MARKDOWN_PATTERNS.some((pattern) => pattern.test(content));
+}
+
+/** QQ 只在 Markdown 消息中解析原生提及标签。 */
+export function requiresQqMarkdown(content: string): boolean {
+  return QQ_MENTION_MARKUP_PATTERN.test(content);
 }
 
 export class Bot {
@@ -184,7 +191,10 @@ export class Bot {
       options.messageReference === undefined
         ? {}
         : { messageReference: { message_id: options.messageReference } };
-    if (this.config.markdownSupport && looksLikeQqMarkdown(content)) {
+    if (
+      this.config.markdownSupport &&
+      (looksLikeQqMarkdown(content) || requiresQqMarkdown(content))
+    ) {
       return this.client.send({
         target,
         msgType: MsgType.MARKDOWN,

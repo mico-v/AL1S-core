@@ -25,7 +25,7 @@ import {
   signValidationResponse,
   verifyWebhookSignature,
 } from '@tencent-connect/qqbot-nodejs/protocol';
-import { Bot, looksLikeQqMarkdown } from '../bot.js';
+import { Bot, looksLikeQqMarkdown, requiresQqMarkdown } from '../bot.js';
 import { ChatStore } from '../chat-log.js';
 import { ConfigError, loadConfig } from '../config.js';
 import { createLogger, parseLogLevel } from '../logger.js';
@@ -305,6 +305,12 @@ check(
 check('识别 Markdown 标题', looksLikeQqMarkdown('# 标题'));
 check('识别 Markdown 粗体', looksLikeQqMarkdown('这是 **粗体**'));
 check('普通乘号不误判为 Markdown', !looksLikeQqMarkdown('2 * 3 * 4'));
+check('识别 QQ 兼容提及标记', requiresQqMarkdown('你好 <@OPENID>'));
+check(
+  '识别 QQ 官方提及标签',
+  requiresQqMarkdown('你好 <qqbot-at-user id="OPENID" />'),
+);
+check('普通 @ 文本不误判为 QQ 提及', !requiresQqMarkdown('你好 @OPENID'));
 
 const outgoingOptions: Array<Parameters<QQBot['send']>[0]> = [];
 bot.client.send = async (options) => {
@@ -322,12 +328,24 @@ check(
     outgoingOptions[0]?.markdown?.content === '**粗体**' &&
     outgoingOptions[0]?.messageReference?.message_id === 'REFIDX-test',
 );
+await bot.replyText(
+  { scope: 'group', targetId: 'GROUP' },
+  '你好 <qqbot-at-user id="OPENID" />',
+  { messageReference: 'REFIDX-mention' },
+);
+check(
+  'QQ 提及强制使用 Markdown 并保留引用',
+  outgoingOptions[1]?.msgType === MsgType.MARKDOWN &&
+    outgoingOptions[1]?.markdown?.content ===
+      '你好 <qqbot-at-user id="OPENID" />' &&
+    outgoingOptions[1]?.messageReference?.message_id === 'REFIDX-mention',
+);
 await bot.replyText({ scope: 'group', targetId: 'GROUP' }, '普通文本');
 check(
   '普通正文使用 msg_type=0',
-  outgoingOptions[1]?.msgType === MsgType.TEXT &&
-    outgoingOptions[1]?.content === '普通文本' &&
-    outgoingOptions[1]?.markdown === undefined,
+  outgoingOptions[2]?.msgType === MsgType.TEXT &&
+    outgoingOptions[2]?.content === '普通文本' &&
+    outgoingOptions[2]?.markdown === undefined,
 );
 
 // ---------------------------------------------------------------------------

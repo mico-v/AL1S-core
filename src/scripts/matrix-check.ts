@@ -2072,7 +2072,8 @@ await bridge.handleTransaction('txn-qq-ghost-mention', {
 });
 check(
   'Matrix 提及 QQ ghost 映射为 QQ @ 用户标签',
-  replies.at(-1)?.content === '你好 <@QQ-SENDER-1>，请看 **这个**',
+  replies.at(-1)?.content ===
+    '你好 <qqbot-at-user id="QQ-SENDER-1" />，请看 **这个**',
   `actual=${replies.at(-1)?.content ?? ''}`,
 );
 

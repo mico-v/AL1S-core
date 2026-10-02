@@ -1317,8 +1317,9 @@ async function main(): Promise<void> {
       return event;
     });
     const mentionReply = await waitFor('Matrix 提及 QQ 出站调用', async () => {
+      const expected = `<qqbot-at-user id="${QQ_USER_ID}" />`;
       const value = qqReplies.find(
-        (candidate) => candidate.content === `<@${QQ_USER_ID}>`,
+        (candidate) => candidate.content === expected,
       );
       if (value === undefined) {
         throw new Error('尚未收到 Matrix 提及对应的 QQ 标签');
@@ -1327,7 +1328,7 @@ async function main(): Promise<void> {
     });
     check(
       'Matrix ghost 提及经 Tuwunel 映射为 QQ 原生提及',
-      mentionReply.content === `<@${QQ_USER_ID}>`,
+      mentionReply.content === `<qqbot-at-user id="${QQ_USER_ID}" />`,
     );
 
     section('房间成员管理');
