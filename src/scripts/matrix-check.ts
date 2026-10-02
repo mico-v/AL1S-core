@@ -1482,6 +1482,146 @@ check(
     rawSceneQuoteEvent?.body?.body === '使用原始场景索引回复',
 );
 
+const messageReferenceOnly = 'REFIDX-message-reference-only';
+const messageReferenceOnlyText = '通过 message_reference 关联的引用目标';
+await bridge.handleQqMessage(
+  structuredGroupMessage(
+    'qq-message-reference-target',
+    'QQ-SENDER-2',
+    messageReferenceOnlyText,
+    {
+      message_type: 0,
+      message_scene: { source: 'default', ext: [`msg_idx=${messageReferenceOnly}`] },
+    },
+    'GROUP-MESSAGE-REFERENCE',
+  ),
+);
+const messageReferenceOnlyEventId = store.getReference(messageReferenceOnly)?.matrixEventId;
+await bridge.handleQqMessage(
+  structuredGroupMessage(
+    'qq-message-reference-quote',
+    'QQ-SENDER-1',
+    '使用 message_reference 回复',
+    {
+      message_type: 103,
+      message_reference: { message_id: messageReferenceOnly },
+      msg_elements: [{ message_type: 0, content: messageReferenceOnlyText }],
+    },
+    'GROUP-MESSAGE-REFERENCE',
+  ),
+);
+const messageReferenceQuoteEvent = matrixState.sentEvents.at(-1) as
+  | { body?: { body?: string; 'm.relates_to'?: { event_id?: string } } }
+  | undefined;
+check(
+  'QQ message_reference.message_id 映射到 Matrix m.in_reply_to',
+  messageReferenceOnlyEventId !== undefined &&
+    messageReferenceQuoteEvent?.body?.['m.relates_to']?.event_id ===
+      messageReferenceOnlyEventId &&
+    messageReferenceQuoteEvent?.body?.body === '使用 message_reference 回复',
+  `body=${messageReferenceQuoteEvent?.body?.body ?? ''}`,
+);
+
+const elementMessageIdReference = 'REFIDX-element-message-id';
+const elementMessageIdText = '引用元素 message_id 关联目标';
+await bridge.handleQqMessage(
+  structuredGroupMessage(
+    'qq-element-message-id-target',
+    'QQ-SENDER-2',
+    elementMessageIdText,
+    {
+      message_type: 0,
+      message_scene: { source: 'default', ext: [`msg_idx=${elementMessageIdReference}`] },
+    },
+    'GROUP-ELEMENT-MESSAGE-ID',
+  ),
+);
+const elementMessageIdEventId = store.getReference(elementMessageIdReference)?.matrixEventId;
+await bridge.handleQqMessage(
+  structuredGroupMessage(
+    'qq-element-message-id-quote',
+    'QQ-SENDER-1',
+    '使用元素 message_id 回复',
+    {
+      message_type: 103,
+      msg_elements: [
+        {
+          id: elementMessageIdReference,
+          message_type: 0,
+          content: elementMessageIdText,
+        },
+      ],
+    },
+    'GROUP-ELEMENT-MESSAGE-ID',
+  ),
+);
+const elementMessageIdQuoteEvent = matrixState.sentEvents.at(-1) as
+  | { body?: { body?: string; 'm.relates_to'?: { event_id?: string } } }
+  | undefined;
+check(
+  'QQ 引用元素 id/message_id 可映射到 Matrix m.in_reply_to',
+  elementMessageIdEventId !== undefined &&
+    elementMessageIdQuoteEvent?.body?.['m.relates_to']?.event_id === elementMessageIdEventId &&
+    elementMessageIdQuoteEvent?.body?.body === '使用元素 message_id 回复',
+  `body=${elementMessageIdQuoteEvent?.body?.body ?? ''}`,
+);
+
+const explicitReferenceWins = 'REFIDX-explicit-reference-wins';
+const tmpReferenceLoses = 'REFIDX-tmp-reference-loses';
+const explicitReferenceTargetText = '显式引用目标';
+const tmpReferenceTargetText = 'TMP 回退目标';
+await bridge.handleQqMessage(
+  structuredGroupMessage(
+    'qq-explicit-reference-wins-target',
+    'QQ-SENDER-2',
+    explicitReferenceTargetText,
+    {
+      message_type: 0,
+      message_scene: { source: 'default', ext: [`msg_idx=${explicitReferenceWins}`] },
+    },
+    'GROUP-REFERENCE-PRIORITY',
+  ),
+);
+await bridge.handleQqMessage(
+  structuredGroupMessage(
+    'qq-tmp-reference-loses-target',
+    'QQ-SENDER-2',
+    tmpReferenceTargetText,
+    {
+      message_type: 0,
+      message_scene: { source: 'default', ext: [`msg_idx=${tmpReferenceLoses}`] },
+    },
+    'GROUP-REFERENCE-PRIORITY',
+  ),
+);
+const explicitWinsEventId = store.getReference(explicitReferenceWins)?.matrixEventId;
+const tmpLosesEventId = store.getReference(tmpReferenceLoses)?.matrixEventId;
+await bridge.handleQqMessage({
+  ...structuredGroupMessage(
+    'qq-reference-priority-quote',
+    'QQ-SENDER-1',
+    '显式引用优先',
+    {
+      message_type: 103,
+      message_reference: { message_id: explicitReferenceWins },
+      msg_elements: [{ message_type: 0, content: explicitReferenceTargetText }],
+      message_scene: { source: 'default', ext: [`ref_msg_idx=${tmpReferenceLoses}`] },
+    },
+    'GROUP-REFERENCE-PRIORITY',
+  ),
+  refMsgIdx: tmpReferenceLoses,
+});
+const referencePriorityEvent = matrixState.sentEvents.at(-1) as
+  | { body?: { 'm.relates_to'?: { event_id?: string } } }
+  | undefined;
+check(
+  '显式 message_reference 优先于 ref_msg_idx',
+  explicitWinsEventId !== undefined &&
+    tmpLosesEventId !== undefined &&
+    explicitWinsEventId !== tmpLosesEventId &&
+    referencePriorityEvent?.body?.['m.relates_to']?.event_id === explicitWinsEventId,
+);
+
 const nestedReference = 'REFIDX-nested-element-reference';
 await bridge.handleQqMessage(
   structuredGroupMessage(
@@ -1929,6 +2069,41 @@ check(
   '记录 QQ 回复引用索引',
   matrixTextQqReference?.startsWith('REFIDX-qq-') === true,
   matrixTextQqReference ?? 'missing',
+);
+
+const c2cReferenceTarget = 'REFIDX-c2c-message-reference';
+await bridge.handleQqMessage({
+  ...c2cMessage('qq-c2c-reference-target', 'QQ-C2C-REFERENCE', '单聊引用目标'),
+  msgIdx: c2cReferenceTarget,
+});
+const c2cReferenceTargetEventId = store.getReference(c2cReferenceTarget)?.matrixEventId;
+await bridge.handleQqMessage({
+  ...c2cMessage('qq-c2c-reference-quote', 'QQ-C2C-REFERENCE', '单聊使用 message_reference 回复'),
+  msgType: 103,
+  msgElements: [
+    {
+      message_type: 0,
+      content: '单聊引用目标',
+    },
+  ] as unknown as NonNullable<QQBotInboundMessage['msgElements']>,
+  raw: {
+    ...(c2cMessage('qq-c2c-reference-quote', 'QQ-C2C-REFERENCE', '').raw as unknown as Record<
+      string,
+      unknown
+    >),
+    message_type: 103,
+    message_reference: { message_id: c2cReferenceTarget },
+    msg_elements: [{ message_type: 0, content: '单聊引用目标' }],
+  } as unknown as QQBotInboundMessage['raw'],
+});
+const c2cReferenceQuoteEvent = matrixState.sentEvents.at(-1) as
+  | { body?: { body?: string; 'm.relates_to'?: { event_id?: string } } }
+  | undefined;
+check(
+  'QQ 单聊 message_reference.message_id 映射到 Matrix 引用',
+  c2cReferenceTargetEventId !== undefined &&
+    c2cReferenceQuoteEvent?.body?.['m.relates_to']?.event_id === c2cReferenceTargetEventId &&
+    c2cReferenceQuoteEvent?.body?.body === '单聊使用 message_reference 回复',
 );
 
 await bridge.handleTransaction('txn-matrix-reply', {

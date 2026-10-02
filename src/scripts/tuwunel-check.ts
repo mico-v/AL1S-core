@@ -603,7 +603,6 @@ function quotedGroupMessage(): QQBotInboundMessage {
     messageId: QUOTED_QQ_MESSAGE_ID,
     timestamp,
     groupOpenid: GROUP_OPENID,
-    refMsgIdx: REFERENCE_INDEX,
     msgType: 103,
     msgElements: elements as unknown as NonNullable<QQBotInboundMessage['msgElements']>,
     replyTarget: {
@@ -622,8 +621,8 @@ function quotedGroupMessage(): QQBotInboundMessage {
       },
       group_openid: GROUP_OPENID,
       message_type: 103,
+      message_reference: { message_id: REFERENCE_INDEX },
       msg_elements: elements,
-      message_scene: { ext: [`ref_msg_idx=${REFERENCE_INDEX}`] },
     } as unknown as QQBotInboundMessage['raw'],
   };
 }

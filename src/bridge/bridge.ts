@@ -513,7 +513,7 @@ function collectElementIndexes(
     if (!isRecord(node)) {
       continue;
     }
-    const index = nonEmptyString(node['msg_idx']);
+    const index = structuredElementReference(node);
     if (index !== undefined) {
       indexes.push(index);
     }
@@ -531,9 +531,48 @@ function uniqueIndexes(indexes: Array<string | undefined>): string[] {
   return [...unique];
 }
 
+function structuredElementReference(
+  value: Record<string, unknown>,
+): string | undefined {
+  return (
+    nonEmptyString(value['msg_idx']) ??
+    nonEmptyString(value['message_id']) ??
+    nonEmptyString(value['messageId']) ??
+    nonEmptyString(value['id'])
+  );
+}
+
+function messageReferenceId(value: unknown): string | undefined {
+  if (typeof value === 'string') {
+    return nonEmptyString(value);
+  }
+  if (!isRecord(value)) {
+    return undefined;
+  }
+  return (
+    nonEmptyString(value['message_id']) ??
+    nonEmptyString(value['messageId']) ??
+    nonEmptyString(value['id'])
+  );
+}
+
+/** 读取 SDK 归一化字段与原始事件中的显式引用消息 ID。 */
+function explicitMessageReferenceId(
+  message: QQBotInboundMessage,
+): string | undefined {
+  const normalized = (message as { messageReference?: unknown }).messageReference;
+  const raw: Record<string, unknown> = isRecord(message.raw) ? message.raw : {};
+  return (
+    messageReferenceId(normalized) ??
+    messageReferenceId(raw['message_reference']) ??
+    messageReferenceId(raw['messageReference'])
+  );
+}
+
 /** 收集 QQ 引用消息可能使用的全部引用索引。 */
 function quoteReferenceCandidates(message: QQBotInboundMessage): string[] {
-  const indexes: Array<string | undefined> = [message.refMsgIdx];
+  const indexes: Array<string | undefined> = [explicitMessageReferenceId(message)];
+  indexes.push(message.refMsgIdx);
   const raw: Record<string, unknown> = isRecord(message.raw) ? message.raw : {};
   for (const key of ['ref_msg_idx', 'refMsgIdx', 'ref_idx', 'reference_msg_idx']) {
     indexes.push(nonEmptyString(raw[key]));
@@ -599,7 +638,8 @@ function extractStructuredMessage(
     refIndex !== undefined &&
     elements.some(
       (element) =>
-        isRecord(element) && quoteCandidates.includes(nonEmptyString(element['msg_idx']) ?? ''),
+        isRecord(element) &&
+        quoteCandidates.includes(structuredElementReference(element) ?? ''),
     );
   const quoteAsWhole = refIndex !== undefined && (messageType === 103 || !hasIndexedQuote);
 
@@ -1275,12 +1315,14 @@ export class QqMatrixBridge {
       });
     }
     let quoted: ReturnType<BridgeStore['getReference']> = undefined;
-    for (const candidate of quoteReferenceCandidates(message)) {
+    const quoteCandidates = quoteReferenceCandidates(message);
+    for (const candidate of quoteCandidates) {
       quoted = this.store.getReference(candidate);
       if (quoted !== undefined) {
         break;
       }
     }
+    let quoteMatchedByExcerpt = false;
     if (quoted === undefined && structured.quoteExcerpt !== undefined) {
       quoted = this.store.findReferenceByQuote({
         roomId: room.roomId,
@@ -1288,6 +1330,16 @@ export class QqMatrixBridge {
           ? {}
           : { sender: structured.quoteSender }),
         excerpt: structured.quoteExcerpt,
+      });
+      quoteMatchedByExcerpt = quoted !== undefined;
+    }
+    if (quoteCandidates.length > 0 || structured.quoteExcerpt !== undefined) {
+      this.logger.info('QQ 引用消息匹配结果', {
+        kind: message.kind,
+        candidateCount: quoteCandidates.length,
+        hasQuoteExcerpt: structured.quoteExcerpt !== undefined,
+        matched: quoted !== undefined,
+        matchedByExcerpt: quoteMatchedByExcerpt,
       });
     }
     const replyContent: JsonObject =

@@ -208,9 +208,11 @@ curl -i -X POST \
 - QQ 出站命中 `40034005` 或 `40034128` 时清除失效的被动窗口并降级为主动
   消息；命中 `40034100` 时按 2/4/8 秒退避重试，耗尽后交由 Appservice
   transaction 重试。仅对平台明确拒绝的错误重试，网络超时不自动重发。
-- QQ 引用从 `refMsgIdx`、原始 `ref_msg_idx`/`refMsgIdx`/`ref_idx` 等字段、
-  `message_scene.ext` 和嵌套 `msg_elements[].msg_idx` 收集候选索引；当前
-  消息的全部可用索引别名都会持久化，已有历史记录继续兼容。
+- QQ 引用从 `refMsgIdx`、原始 `message_reference.message_id`、
+  `ref_msg_idx`/`refMsgIdx`/`ref_idx` 等字段、`message_scene.ext` 和嵌套
+  `msg_elements[].msg_idx`/`id`/`message_id` 收集候选索引；显式
+  `message_reference` 优先，当前消息的全部可用索引别名都会持久化，已有
+  历史记录继续兼容。
 - `TMP_*` 索引无法直接命中时，只在目标房间、发送者和引用摘录唯一匹配时
   回退；重复或短摘录不建立错误关联。命中后发送 Matrix `m.in_reply_to`，
   正文只包含回复内容；未知引用使用不含尖括号的可读文本 fallback。
@@ -342,7 +344,8 @@ curl -i -X POST \
 6. 日志、状态文件和文档中不出现 token、AppSecret 或完整 openid。
 7. 文档记录每阶段实现、验证命令、已知限制和剩余工作。
 8. QQ 引用与 Matrix 引用可在对应事件已知时双向关联；候选索引覆盖
-   `refMsgIdx`、原始字段、`message_scene.ext` 和嵌套 `msg_elements`，
+   `refMsgIdx`、`message_reference.message_id`、原始字段、
+   `message_scene.ext` 和嵌套 `msg_elements` 的元素 ID，
    `TMP_*` 只能通过同房间/发送者/摘录唯一匹配回退；未知引用使用可读
    fallback，不阻断正文转发，也不输出 `> <...>` 调试文本。
 9. 全局名单用户只有在目标房间成员资格有效且 power level 达标时才能触发

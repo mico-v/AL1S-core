@@ -41,7 +41,7 @@
 | Matrix 撤回映射 | DONE | 离线检查覆盖清理映射；真实 Tuwunel 验证 redaction 回推后映射为 QQ recall |
 | Matrix 编辑处理 | DONE | 当前策略为忽略 `m.replace`，避免重复发送 QQ 消息 |
 | QQ 提及映射 | DONE | `<@OPENID>` 转为可读 `@昵称`、Matrix HTML、`m.mentions` 和 `matrix.to` 链接；`@room`、未知昵称稳定摘要及 openid 不泄漏均有离线与真实 Tuwunel 断言 |
-| QQ/Matrix 引用映射 | DONE | 从 `refMsgIdx`、原始字段、`message_scene.ext` 和嵌套 `msg_elements` 收集索引；`TMP_*` 仅按同房间/发送者/摘录唯一回退；已知引用只发送 `m.in_reply_to` 与回复正文，旧引用记录仍兼容 |
+| QQ/Matrix 引用映射 | DONE | 从 `refMsgIdx`、`message_reference.message_id`、原始字段、`message_scene.ext` 和嵌套 `msg_elements` 的元素 ID 收集索引；显式引用优先，`TMP_*` 仅按同房间/发送者/摘录唯一回退；已知引用只发送 `m.in_reply_to` 与回复正文，旧引用记录仍兼容 |
 | QQ 结构化消息 | DONE | `message_type=3/101/102/103` 卡片、并行、聊天记录与引用消息转为有界文本；嵌套附件去重转发，`faceType` 解码、`attachmentType` 等 `*Type=` 标签过滤，深度/元素/附件/长度上限均覆盖检查 |
 | QQ 媒体内容去重 | DONE | 聊天记录按 SHA-256 写入 `media-cache/<sha256>`，bridge 持久化内容哈希到 `mxc://` 映射并合并并发上传；重复图片、表情包和引用附件不重复落盘/上传，真实 Tuwunel 验证重复事件复用同一 mxc URI |
 | QQ 出站频控与重试 | DONE | `40034005`/`40034128` 降级主动消息，`40034100` 指数退避后交由 transaction 重试 |
@@ -68,6 +68,18 @@
 
 ### 2026-10-02
 
+- 补齐 QQ 入站引用候选：兼容 `message_reference.message_id` 与引用元素
+  `id`/`message_id`，显式引用优先于 `message_scene.ext` 的 `ref_msg_idx`；
+  增加不含引用 ID 的匹配结果 `info` 日志（仅引用消息触发），便于在默认
+  生产日志级别定位候选形态。
+- 离线检查新增群聊显式引用、元素 ID、引用优先级和单聊显式引用断言；真实
+  Tuwunel 引用样例改为官方 `message_reference` 形态，验证入站事件经
+  Tuwunel 回推后仍生成正确的 Matrix `m.in_reply_to`。
+- 本轮验证：`pnpm typecheck`、`pnpm matrix:check`、`pnpm integration:check`
+  与 `TUWUNEL_BIN=<tuwunel-release> pnpm tuwunel:check` 全部通过；真实
+  Tuwunel 断言官方 `message_reference.message_id` 形态经 appservice 回推后
+  仍映射为 Matrix `m.in_reply_to`。生产 `LOG_LEVEL=info`，新增引用匹配结果
+  日志在该级别可见。
 - 修正 Matrix 到 QQ 提及仍显示为文字的问题：QQ 只在 `msg_type=2` 的
   Markdown 消息中解析提及。bridge 重新生成官方
   `<qqbot-at-user id="..." />`，`replyText` 对官方标签和兼容 `<@openid>`

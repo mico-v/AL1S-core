@@ -229,8 +229,9 @@ TUWUNEL_BIN=/path/to/tuwunel pnpm tuwunel:check   # 本机 Tuwunel 双向集成�
 也不连接 QQ 开放平台。
 
 QQ 到 Matrix 的消息语义当前包括：`<@OPENID>` 转可读提及、HTML 链接和
-`m.mentions`，引用索引变体与 `TMP_*` 唯一匹配回退，`faceType` 表情名解码，
-内部 `attachmentType`/`*Type=` 标签清理，以及 SHA-256 媒体去重和 Matrix
+`m.mentions`，`message_reference.message_id`/引用元素 ID/索引变体与
+`TMP_*` 唯一匹配回退，`faceType` 表情名解码，内部
+`attachmentType`/`*Type=` 标签清理，以及 SHA-256 媒体去重和 Matrix
 上传复用。部署后应分别用群聊、单聊、提及、引用、表情包和图片各发一条测试
 消息，确认 Matrix 事件正文和媒体 URI。
 
