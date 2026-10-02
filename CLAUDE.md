@@ -124,11 +124,11 @@ QQ 平台
 - QQ `<@OPENID>` 必须转成可读 `body`、Matrix HTML、`m.mentions` 和稳定的
   ghost 用户，不得把原始 openid 或 `<@...>` 直接暴露给 Matrix。
 - Matrix `m.mentions.user_ids` 只对已持久化的 QQ ghost 反向映射生成
-  `<@openid>`；官方新标签 `<qqbot-at-user>` 在当前群聊客户端可能显示为
-  普通文字，不能据此回归。原生 Matrix 用户保持普通文本。
-- 含高置信度 Markdown 语法的 Matrix 正文只有在
-  `QQBOT_MARKDOWN_SUPPORT=true` 时使用 `msg_type=2`，普通正文保持
-  `msg_type=0`，引用消息必须同时保留 `message_reference`。
+  `<qqbot-at-user id="..." />`；原生 Matrix 用户保持普通文本。
+- QQ 仅在 Markdown 消息中解析提及标签；正文含 `<qqbot-at-user>` 或兼容
+  `<@openid>` 时，`replyText` 必须强制使用 `msg_type=2`。该能力要求
+  `QQBOT_MARKDOWN_SUPPORT=true`；普通正文保持 `msg_type=0`，引用消息在两种
+  类型下都必须保留 `message_reference`。
 - 引用索引要兼容 `refMsgIdx`、原始 snake_case 字段、`message_scene.ext` 和
   嵌套 `msg_elements`。`TMP_*` 只能在房间、发送者与摘录唯一匹配时回退。
 - 媒体按 SHA-256 内容寻址；相同字节必须复用本地文件和 Matrix `mxc://`，

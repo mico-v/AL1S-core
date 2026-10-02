@@ -27,8 +27,8 @@
 | Matrix API client | DONE | 创建、加入、发送、上传、下载通过 mock 检查；下载改用已鉴权媒体端点并通过真实 Tuwunel 验证 |
 | QQ 到 Matrix 文本 | DONE | 群聊、单聊、guild、DM 进入隔离 room，ghost 身份与会话键正确 |
 | Matrix 到 QQ 文本 | DONE | 原正文转发、被动回复窗口、回环防护及 guild/DM 出站目标正确 |
-| Matrix 提及映射到 QQ | DONE | `m.mentions.user_ids` 只对持久化 QQ ghost 还原 openid 并生成客户端兼容的 `<@openid>`；原生 Matrix 用户保持文本，真实 Tuwunel 验证 appservice 回推后输出 QQ 标签，重启后映射仍可查询 |
-| QQ Markdown 出站 | DONE | 高置信度 Markdown 语法在 `QQBOT_MARKDOWN_SUPPORT=true` 时使用 `msg_type=2`；普通正文使用 `msg_type=0`，两种类型均保留 `message_reference` |
+| Matrix 提及映射到 QQ | DONE | `m.mentions.user_ids` 只对持久化 QQ ghost 还原 openid 并生成 `<qqbot-at-user id="..." />`；提及强制使用 Markdown，原生 Matrix 用户保持文本，真实 Tuwunel 验证 appservice 回推后输出官方标签，重启后映射仍可查询 |
+| QQ Markdown 出站 | DONE | 高置信度 Markdown 语法或 QQ 提及标签在 `QQBOT_MARKDOWN_SUPPORT=true` 时使用 `msg_type=2`；普通正文使用 `msg_type=0`，两种类型均保留 `message_reference` |
 | 会话级并发控制 | DONE | 同一 QQ 会话并发首条消息只创建一个 Matrix room，且两条消息均投递成功 |
 | QQ 到 Matrix 媒体 | DONE | 离线检查覆盖图片上传与事件内容；真实 Tuwunel 验证上传、mxc 下载及字节一致性 |
 | Matrix 到 QQ 媒体 | DONE | 群聊/单聊覆盖 mxc 下载、类型和发送参数，真实 Tuwunel 验证回推后字节到达 QQ 端口；guild/DM 明确忽略并 ACK |
@@ -62,9 +62,20 @@
 | 故障关闭与 HTTP 错误分类 | DONE | `matrix:check` 覆盖非法 JSON `400`、超限请求体 `413`、脱敏 `500`、指标分类、bridge 在途任务等待、状态写入失败重试和 appservice 滞留连接超时关闭；`tuwunel:check` 直接注入未捕获异常/未处理拒绝，验证统一优雅关闭、非零退出码和端口释放 |
 | 持续集成门禁 | DONE | `pnpm ci:check` 已完整通过；`.github/workflows/ci.yml` 在 push/PR 上复用同一命令，首次远端运行需推送后确认 |
 | 真实 QQ 联调 | DOING | 生产 QQ bot 已连接并出现群聊映射；单聊、提及、引用、表情包和媒体仍需按生产日志逐项验收，不能以离线检查代替 |
-| 生产环境验证 | DONE | `as:/opt/al1s` 原生 systemd 部署已上线，`al1s-bridge.service` 与 `tuwunel.service` 均为 active，`/health` 返回 `{}`；当前运行包对应 `4a253b9`，状态已从 v7 迁移到 v8 |
+| 生产环境验证 | DONE | `as:/opt/al1s` 原生 systemd 部署已上线，`al1s-bridge.service` 与 `tuwunel.service` 均为 active，`/health` 返回 `{}`；当前运行包对应 `909eac0`，状态为 v8 |
 
 ## 实施日志
+
+### 2026-10-02
+
+- 修正 Matrix 到 QQ 提及仍显示为文字的问题：QQ 只在 `msg_type=2` 的
+  Markdown 消息中解析提及。bridge 重新生成官方
+  `<qqbot-at-user id="..." />`，`replyText` 对官方标签和兼容 `<@openid>`
+  均强制使用 Markdown，同时保留引用 `message_reference`。
+- 离线 `matrix:check` 与真实 Tuwunel 检查均断言官方标签经过 appservice
+  回推后到达 QQ 出站端口；普通正文仍断言 `msg_type=0`。
+- 生产运行包更新到 `909eac0`，`al1s-bridge.service` 与 `tuwunel.service`
+  均为 active，`/health` 返回 `{}`，编译产物已包含提及标签与 Markdown 分支。
 
 ### 2026-09-29
 

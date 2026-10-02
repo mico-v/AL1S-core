@@ -195,13 +195,13 @@ curl -i -X POST \
 - Matrix 文本按原正文发送到 QQ，不额外增加发送者标签；媒体消息也不把
   发送者标签作为 caption。
 - Matrix `m.mentions.user_ids` 通过已持久化的 QQ ghost 反向映射还原为
-  QQ openid，并生成当前客户端与主流 SDK 可解析的 `<@openid>` 提及标签；
-  官方文档推荐的新标签 `<qqbot-at-user>` 在部分群聊客户端仍显示为普通
-  文字。普通 Matrix 用户保持原文，不伪装成 QQ 用户。schema v8 使用
-  HMAC 索引和 AES-256-GCM 加密保存该映射。
-- Matrix 正文命中高置信度 Markdown 语法，且 `QQBOT_MARKDOWN_SUPPORT=true`
-  时，QQ 出站使用 `msg_type=2` 与 `markdown.content`；普通正文显式使用
-  `msg_type=0`。两种发送都会保留已有的 `message_reference`。
+  QQ openid，并生成官方 `<qqbot-at-user id="..." />` 提及标签。普通 Matrix
+  用户保持原文，不伪装成 QQ 用户。schema v8 使用 HMAC 索引和
+  AES-256-GCM 加密保存该映射。
+- QQ 仅在 Markdown 消息中解析提及标签；正文命中高置信度 Markdown 语法或
+  包含 QQ 提及标签，且 `QQBOT_MARKDOWN_SUPPORT=true` 时，QQ 出站使用
+  `msg_type=2` 与 `markdown.content`。普通正文显式使用 `msg_type=0`，
+  两种发送都会保留已有的 `message_reference`。
 - Matrix 出站优先使用最近 QQ 入站消息的被动回复窗口，无窗口时转为主动消息。
 - 每条 QQ 入站消息拥有独立配额；收到新消息时，后续 Matrix 出站切换到
   该消息的被动回复窗口。
@@ -400,9 +400,9 @@ curl -i -X POST \
 27. 媒体以 SHA-256 内容地址去重，重复图片、表情包、文件和引用附件复用
     本地文件及 Matrix `mxc://`；并发上传合并为一次，重启后仍可复用映射。
 28. Matrix `m.mentions.user_ids` 中的 QQ ghost 在本地与重启后均能映射为
-    对应 QQ openid 和客户端兼容的 `<@openid>`；原生 Matrix 用户不生成
-    QQ 提及。
-29. 含 Markdown 语法的正文在机器人有权限且启用
+    对应 QQ openid 和官方 `<qqbot-at-user id="..." />`；原生 Matrix 用户
+    不生成 QQ 提及。
+29. 含 Markdown 语法或 QQ 提及标签的正文在机器人有权限且启用
     `QQBOT_MARKDOWN_SUPPORT` 时使用 `msg_type=2`，普通正文使用
     `msg_type=0`；引用回复在两种类型下均保留 `message_reference`。
 

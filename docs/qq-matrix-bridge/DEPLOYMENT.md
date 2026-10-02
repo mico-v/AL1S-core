@@ -27,7 +27,7 @@ Caddy → Matrix 客户端
 - SSH 别名为 `as`，源码检出位于 `/opt/al1s`，运行包位于 `/opt/al1s/app`；
   状态和 Tuwunel 数据位于 `/opt/al1s/data`。
 - systemd 单元为 `al1s-bridge.service` 与 `tuwunel.service`；运行包目前对应
-  `4a253b9`，两者均为 active，`http://127.0.0.1:29328/health` 返回 `{}`。
+  `909eac0`，两者均为 active，`http://127.0.0.1:29328/health` 返回 `{}`。
 - `git push as main` 只更新 `/opt/al1s` 源码检出，不会替换正在运行的
   `/opt/al1s/app` 或重启服务。让新代码生效必须在本地运行 `pnpm deploy:server`。
 
@@ -235,10 +235,11 @@ QQ 到 Matrix 的消息语义当前包括：`<@OPENID>` 转可读提及、HTML �
 消息，确认 Matrix 事件正文和媒体 URI。
 
 Matrix 到 QQ 当前会把已映射 ghost 的 `m.mentions.user_ids` 转为
-`<@openid>`，并使用 schema v8 的加密反向映射支持重启恢复。官方新标签
-`<qqbot-at-user>` 在部分 QQ 群聊客户端仍显示为普通文字，因此暂不采用。
-正文命中高置信度 Markdown 语法时，只有机器人确有平台权限且 `.env` 设置
-`QQBOT_MARKDOWN_SUPPORT=true` 才使用 `msg_type=2`；否则仍使用 `msg_type=0`。
+官方 `<qqbot-at-user id="..." />`，并使用 schema v8 的加密反向映射支持重启
+恢复。QQ 只在 Markdown 消息中解析提及，因此含标签的正文会强制使用
+`msg_type=2`，部署时必须设置 `QQBOT_MARKDOWN_SUPPORT=true`。普通正文仍使用
+`msg_type=0`；含高置信度 Markdown 语法但不含提及的正文同样需要该开关才能
+使用 Markdown。
 部署验收应额外覆盖 Matrix 侧 @ QQ 用户、Markdown 标题/列表/代码和带引用的
 Markdown 消息。
 
