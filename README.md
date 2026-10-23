@@ -85,6 +85,29 @@ src/scripts/webhook-check.ts  webhook 端到端自检
 
 `pnpm agent:try --image <文件> "这图什么意思"` 可以本地验证整条链路。
 
+### 调用审计
+
+每一次模型调用（闲聊 / 看图 / 归纳）都会往 `data/calls/YYYY-MM-DD.jsonl` 追加一行：
+
+| 字段 | 含义 |
+| --- | --- |
+| `purpose` | `chat` / `caption` / `learn` |
+| `promptTokens` / `completionTokens` / `reasoningTokens` | 三段 token |
+| `cachedTokens` / `cacheRate` | 缓存命中的 token 与命中率 |
+| `ms` / `tokensPerSecond` | 端到端耗时与输出速度 |
+| `contextRate` | 本次 prompt 占上下文窗口的比例 |
+| `stack` | 调用链（只保留 `src/` 里的帧，自动剔除 node_modules） |
+| `conversationId` / `speaker` | 哪个群、谁说的 |
+| `attempt` / `ok` / `status` / `error` | 第几次尝试、成败与错误 |
+
+```bash
+pnpm agent:stats              # 最近一天：总量、缓存率、p50/p95、按用途拆分、最慢调用
+pnpm agent:stats --days 7
+pnpm agent:stats --json
+```
+
+审计写入失败只会打 warning，不会影响回复。单文件超过 50MB 自动滚动。
+
 ```bash
 pnpm agent:check    # 离线自检，不联网
 pnpm agent:try "今天好累啊"   # 用真实模型试跑一句，调人格用

@@ -34,6 +34,12 @@ export interface AgentConfig {
   ownerOpenids: string[];
   /** 私聊是否启用。 */
   directEnabled: boolean;
+  /** 调用审计。 */
+  callLog: {
+    enabled: boolean;
+    dir: string;
+    contextWindow: number;
+  };
 }
 
 export function readAgentConfig(env: NodeJS.ProcessEnv): AgentConfig {
@@ -61,6 +67,11 @@ export function readAgentConfig(env: NodeJS.ProcessEnv): AgentConfig {
     contextSize: Number(env.AGENT_CONTEXT_SIZE ?? 40),
     ownerOpenids: list(env.AGENT_OWNER_OPENIDS),
     directEnabled: env.AGENT_DIRECT_ENABLED !== 'false',
+    callLog: {
+      enabled: env.AGENT_CALL_LOG !== 'false',
+      dir: env.AGENT_CALL_LOG_DIR ?? './data/calls',
+      contextWindow: Number(env.AGENT_CONTEXT_WINDOW ?? 128_000),
+    },
   };
 }
 
@@ -309,7 +320,12 @@ export class ChatAgent {
     ];
 
     try {
-      const reply = await this.complete(messages, this.config.llm);
+      const reply = await this.complete(messages, {
+        ...this.config.llm,
+        purpose: 'chat',
+        conversationId: scope.conversationId,
+        speaker,
+      });
       const cleaned = reply.replace(/^\s*\[SILENT\]\s*$/i, '').trim();
       if (!cleaned) {
         return;

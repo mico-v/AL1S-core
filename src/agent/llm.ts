@@ -7,6 +7,7 @@
 
 import { randomUUID } from 'node:crypto';
 import { setTimeout as sleep } from 'node:timers/promises';
+import { buildRecord, recordCall } from './telemetry.js';
 
 /** opencode-go 要求带上会话标识，否则拒收请求（MissingSessionID）。 */
 const PROCESS_SESSION_ID = randomUUID();
@@ -34,6 +35,20 @@ export interface LlmOptions {
    * 闲聊不需要长思考，而且推理会吃掉 max_tokens 导致正文为空。
    */
   disableThinking?: boolean;
+  /** 用途标签，进调用记录：chat / caption / learn … */
+  purpose?: string;
+  conversationId?: string;
+  speaker?: string;
+  /** 模型上下文窗口，用来算占用率。 */
+  contextWindow?: number;
+}
+
+export interface UsageLike {
+  prompt_tokens?: number;
+  completion_tokens?: number;
+  total_tokens?: number;
+  prompt_tokens_details?: { cached_tokens?: number };
+  completion_tokens_details?: { reasoning_tokens?: number };
 }
 
 export class LlmError extends Error {
@@ -53,17 +68,60 @@ export async function chatComplete(
   retries = 2,
 ): Promise<string> {
   const url = `${opts.baseUrl.replace(/\/+$/, '')}/chat/completions`;
+  const maxTokens = opts.maxTokens ?? 500;
+  const temperature = opts.temperature ?? 0.9;
   const body = JSON.stringify({
     model: opts.model,
     messages,
-    temperature: opts.temperature ?? 0.9,
-    max_tokens: opts.maxTokens ?? 500,
+    temperature,
+    max_tokens: maxTokens,
     stream: false,
     ...(opts.disableThinking ? { thinking: { type: 'disabled' } } : {}),
   });
 
+  const startedAt = Date.now();
+  const stack = new Error().stack;
+  const shape = {
+    messages: messages.length,
+    promptChars: messages.reduce((acc, m) => {
+      const text = typeof m.content === 'string' ? m.content : JSON.stringify(m.content);
+      return acc + text.length;
+    }, 0),
+    images: messages.reduce((acc, m) => {
+      if (!Array.isArray(m.content)) {
+        return acc;
+      }
+      return acc + m.content.filter((part) => part.type === 'image_url').length;
+    }, 0),
+    maxTokens,
+    temperature,
+  };
+
   let lastError: unknown;
+  let attemptsUsed = 0;
+
+  const recordFailure = async (error: unknown): Promise<void> => {
+    const err = error instanceof Error ? error : new LlmError(String(error));
+    await recordCall(
+      buildRecord({
+        purpose: opts.purpose ?? 'chat',
+        model: opts.model,
+        attempt: attemptsUsed,
+        ok: false,
+        status: err instanceof LlmError ? err.status : undefined,
+        error: err.message.slice(0, 300),
+        ms: Date.now() - startedAt,
+        ...shape,
+        conversationId: opts.conversationId,
+        speaker: opts.speaker,
+        stack,
+        contextWindow: opts.contextWindow,
+      }),
+    );
+  };
+
   for (let attempt = 0; attempt <= retries; attempt += 1) {
+    attemptsUsed = attempt;
     if (attempt > 0) {
       await sleep(400 * 2 ** (attempt - 1));
     }
@@ -91,6 +149,7 @@ export async function chatComplete(
       }
       const data = (await res.json()) as {
         choices?: Array<{ message?: { content?: string }; finish_reason?: string }>;
+        usage?: UsageLike;
       };
       const choice = data.choices?.[0];
       const text = choice?.message?.content;
@@ -99,9 +158,25 @@ export async function chatComplete(
         lastError = new LlmError(`空回复（finish_reason=${choice?.finish_reason ?? '未知'}）`);
         continue;
       }
+      await recordCall(
+        buildRecord({
+          purpose: opts.purpose ?? 'chat',
+          model: opts.model,
+          attempt,
+          ok: true,
+          ms: Date.now() - startedAt,
+          usage: data.usage,
+          ...shape,
+          conversationId: opts.conversationId,
+          speaker: opts.speaker,
+          stack,
+          contextWindow: opts.contextWindow,
+        }),
+      );
       return text.trim();
     } catch (error) {
       if (error instanceof LlmError && error.status && error.status < 500) {
+        await recordFailure(error);
         throw error;
       }
       lastError = error;
@@ -109,5 +184,6 @@ export async function chatComplete(
       clearTimeout(timer);
     }
   }
+  await recordFailure(lastError);
   throw lastError instanceof Error ? lastError : new LlmError(String(lastError));
 }
