@@ -120,7 +120,15 @@ export async function learnGroup(
     },
   ];
 
-  const raw = await chatComplete(messages, { ...config.llm, maxTokens: 2000, temperature: 0.3 });
+  const raw = await chatComplete(messages, {
+    ...config.llm,
+    maxTokens: 2500,
+    temperature: 0.3,
+    // 结构化输出不需要推理；开着会把预算烧光，返回空内容
+    disableThinking: true,
+    purpose: 'learn',
+    conversationId: groupOpenid,
+  });
   const profiles = parseProfiles(raw);
   for (const profile of profiles) {
     await memory.saveMember(profile.openid, profile.name, profile.markdown);

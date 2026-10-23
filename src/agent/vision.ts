@@ -118,6 +118,7 @@ export async function describeImage(
         temperature: 0.2,
         timeoutMs: CAPTION_TIMEOUT_MS,
         disableThinking: true,
+        purpose: 'caption',
       }),
     );
     return text.trim() || undefined;

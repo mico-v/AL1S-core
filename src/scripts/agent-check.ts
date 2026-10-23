@@ -15,6 +15,7 @@ import { GroupBuffer } from '../agent/context.js';
 import { GroupMemory } from '../agent/memory.js';
 import { PERSONA } from '../agent/persona.js';
 import { cleanQQText } from '../agent/text.js';
+import { buildRecord, summarize } from '../agent/telemetry.js';
 import type { Bot } from '../bot.js';
 import type { QQBotInboundMessage } from '@tencent-connect/qqbot-nodejs';
 import type { AppLogger } from '../logger.js';
@@ -166,6 +167,45 @@ async function main(): Promise<void> {
     console.log('\n[8] 看不到图时的规矩');
     check('人格要求不许猜图', PERSONA.includes('绝对不许猜图里是什么'));
     check('人格要求直说没加载', PERSONA.includes('没加载出来'));
+
+    console.log('\n[9] 调用记录');
+    const rec = buildRecord({
+      purpose: 'chat',
+      model: 'deepseek-v4.1-flash',
+      attempt: 0,
+      ok: true,
+      ms: 2000,
+      usage: {
+        prompt_tokens: 1000,
+        completion_tokens: 100,
+        total_tokens: 1100,
+        prompt_tokens_details: { cached_tokens: 400 },
+        completion_tokens_details: { reasoning_tokens: 0 },
+      },
+      messages: 2,
+      promptChars: 3000,
+      images: 0,
+      maxTokens: 400,
+      temperature: 0.9,
+      contextWindow: 100_000,
+      stack: 'Error\n    at chatComplete (/x/src/agent/llm.ts:100:5)\n    at reply (/x/src/agent/index.ts:320:20)\n    at process (/x/node_modules/foo.js:1:1)',
+    });
+    check('缓存率算对', rec.cacheRate === 0.4, `实际 ${rec.cacheRate}`);
+    check('速度算对', rec.tokensPerSecond === 50, `实际 ${rec.tokensPerSecond}`);
+    check('上下文占用算对', rec.contextRate === 0.01, `实际 ${rec.contextRate}`);
+    check('调用栈只留应用帧', rec.stack.length === 2 && !rec.stack.join(' ').includes('node_modules'), rec.stack.join(' | '));
+
+    const sum = summarize([
+      { ...rec, ms: 1000, ok: true },
+      { ...rec, ms: 3000, ok: true },
+      { ...rec, ms: 5000, ok: false },
+      { ...rec, ms: 9000, ok: true },
+    ]);
+    check('统计: 调用数', sum.calls === 4);
+    check('统计: 失败数', sum.failedCalls === 1);
+    check('统计: p50', sum.p50Ms === 5000, `实际 ${sum.p50Ms}`);
+    check('统计: 平均耗时', sum.avgMs === 4500, `实际 ${sum.avgMs}`);
+    check('统计: 缓存率', sum.cacheRate === 0.4, `实际 ${sum.cacheRate}`);
   } finally {
     await rm(tmp, { recursive: true, force: true });
   }

@@ -6,6 +6,7 @@
  */
 
 import { ChatAgent, readAgentConfig } from './agent/index.js';
+import { configureTelemetry } from './agent/telemetry.js';
 import { learnAllGroups } from './agent/updater.js';
 import { Bot } from './bot.js';
 import { ConfigError, loadConfig } from './config.js';
@@ -20,6 +21,12 @@ try {
   bot = new Bot(config, log);
 
   const agentConfig = readAgentConfig(process.env);
+  configureTelemetry({
+    enabled: agentConfig.callLog.enabled,
+    dir: agentConfig.callLog.dir,
+    contextWindow: agentConfig.callLog.contextWindow,
+    log,
+  });
   agent = new ChatAgent(agentConfig, log);
   log.info('聊天 agent', {
     enabled: agentConfig.enabled,
