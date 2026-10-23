@@ -30,6 +30,8 @@ export interface AgentConfig {
   contextSize: number;
   /** 主人的 openid：语气可以更放松。 */
   ownerOpenids: string[];
+  /** 私聊是否启用。 */
+  directEnabled: boolean;
 }
 
 export function readAgentConfig(env: NodeJS.ProcessEnv): AgentConfig {
@@ -55,6 +57,7 @@ export function readAgentConfig(env: NodeJS.ProcessEnv): AgentConfig {
     groupAllowlist: list(env.AGENT_GROUPS),
     contextSize: Number(env.AGENT_CONTEXT_SIZE ?? 40),
     ownerOpenids: list(env.AGENT_OWNER_OPENIDS),
+    directEnabled: env.AGENT_DIRECT_ENABLED !== 'false',
   };
 }
 
@@ -94,12 +97,55 @@ export function isBotMentioned(message: QQBotInboundMessage, config: AgentConfig
 
 export type CompleteFn = (messages: ChatMessage[], opts: LlmOptions) => Promise<string>;
 
+/** 单条消息上限（QQ 文本消息过长会被截断或发送失败）。 */
+export const MAX_REPLY_CHARS = 700;
+
+/** 长回复切成多条：优先在空行/换行/句末断开，避免劈开句子。 */
+export function splitReply(text: string, limit: number = MAX_REPLY_CHARS): string[] {
+  const trimmed = text.trim();
+  if (!trimmed) {
+    return [];
+  }
+  if (trimmed.length <= limit) {
+    return [trimmed];
+  }
+  const chunks: string[] = [];
+  let rest = trimmed;
+  while (rest.length > limit) {
+    const window = rest.slice(0, limit);
+    const breakAt = Math.max(
+      window.lastIndexOf('\n\n'),
+      window.lastIndexOf('\n'),
+      window.lastIndexOf('。'),
+      window.lastIndexOf('！'),
+      window.lastIndexOf('？'),
+      window.lastIndexOf('，'),
+    );
+    const cut = breakAt > limit * 0.5 ? breakAt + 1 : limit;
+    chunks.push(rest.slice(0, cut).trim());
+    rest = rest.slice(cut).trimStart();
+  }
+  if (rest) {
+    chunks.push(rest);
+  }
+  return chunks.filter(Boolean);
+}
+
+interface Scope {
+  conversationId: string;
+  memoryKey: string;
+  isDirect: boolean;
+  replyTarget: QQBotInboundMessage['replyTarget'];
+}
+
 export class ChatAgent {
   private readonly config: AgentConfig;
   private readonly log: AppLogger;
   private readonly buffer: GroupBuffer;
   private readonly members = new Map<string, GroupMemory>();
   private readonly complete: CompleteFn;
+  /** 同一会话串行处理，避免同一群里两条 @ 并发抢回复。 */
+  private readonly chains = new Map<string, Promise<void>>();
 
   constructor(config: AgentConfig, log: AppLogger, complete: CompleteFn = chatComplete) {
     this.config = config;
@@ -117,16 +163,44 @@ export class ChatAgent {
     return store;
   }
 
-  /** 入口：所有群消息都从这里过。 */
+  private resolveScope(message: QQBotInboundMessage): Scope | undefined {
+    if (message.kind === 'group') {
+      const groupOpenid = message.groupOpenid;
+      if (!groupOpenid) {
+        return undefined;
+      }
+      if (this.config.groupAllowlist.length > 0 && !this.config.groupAllowlist.includes(groupOpenid)) {
+        return undefined;
+      }
+      return {
+        conversationId: groupOpenid,
+        memoryKey: groupOpenid,
+        isDirect: false,
+        replyTarget: message.replyTarget,
+      };
+    }
+    if (message.kind === 'c2c' || message.kind === 'dm') {
+      if (!this.config.directEnabled) {
+        return undefined;
+      }
+      return {
+        conversationId: `dm:${message.senderId}`,
+        memoryKey: `dm_${message.senderId}`,
+        isDirect: true,
+        replyTarget: message.replyTarget,
+      };
+    }
+    // guild / 频道消息暂不处理
+    return undefined;
+  }
+
+  /** 入口：所有消息都从这里过。 */
   async handle(message: QQBotInboundMessage, bot: Bot): Promise<void> {
     if (!this.config.enabled) {
       return;
     }
-    if (message.kind !== 'group' || !message.groupOpenid) {
-      return;
-    }
-    const groupOpenid = message.groupOpenid;
-    if (this.config.groupAllowlist.length > 0 && !this.config.groupAllowlist.includes(groupOpenid)) {
+    const scope = this.resolveScope(message);
+    if (!scope) {
       return;
     }
 
@@ -136,13 +210,13 @@ export class ChatAgent {
     }
     // 别的机器人的命令
     if (text.startsWith('/')) {
-      this.log.debug('忽略命令类消息', { groupOpenid, text: text.slice(0, 40) });
+      this.log.debug('忽略命令类消息', { conversationId: scope.conversationId, text: text.slice(0, 40) });
       return;
     }
 
-    const called = isBotMentioned(message, this.config);
+    const called = scope.isDirect || isBotMentioned(message, this.config);
     if (!called) {
-      this.buffer.push(groupOpenid, {
+      this.buffer.push(scope.conversationId, {
         senderName: message.senderName ?? message.senderId.slice(0, 8),
         text,
         timestamp: Date.now(),
@@ -150,8 +224,26 @@ export class ChatAgent {
       return;
     }
 
-    const pending = this.buffer.drain(groupOpenid);
-    const memory = this.memory(groupOpenid);
+    // 同会话串行：把本次处理挂在上一次后面
+    const prev = this.chains.get(scope.conversationId) ?? Promise.resolve();
+    const task: Promise<void> = prev.catch(() => undefined).then(() => this.reply(message, bot, scope, text));
+    const tail: Promise<void> = task.finally(() => {
+      if (this.chains.get(scope.conversationId) === tail) {
+        this.chains.delete(scope.conversationId);
+      }
+    });
+    this.chains.set(scope.conversationId, tail);
+    await task;
+  }
+
+  private async reply(
+    message: QQBotInboundMessage,
+    bot: Bot,
+    scope: Scope,
+    text: string,
+  ): Promise<void> {
+    const pending = scope.isDirect ? [] : this.buffer.drain(scope.conversationId);
+    const memory = this.memory(scope.memoryKey);
     const speaker = message.senderName ?? message.senderId.slice(0, 8);
 
     const remembered = await memory.renderContext([message.senderId]);
@@ -161,6 +253,9 @@ export class ChatAgent {
     }
     if (this.config.ownerOpenids.includes(message.senderId)) {
       parts.push('## 提示\n\n现在说话的是**主人**，可以更放松、更直接一点。');
+    }
+    if (scope.isDirect) {
+      parts.push('## 提示\n\n现在是私聊，不是群里，可以放开一点聊。');
     }
 
     const system = [PERSONA, ...parts].join('\n\n---\n\n');
@@ -176,19 +271,26 @@ export class ChatAgent {
 
     try {
       const reply = await this.complete(messages, this.config.llm);
-      const cleaned = reply.replace(/^\[SILENT\]$/i, '').trim();
+      const cleaned = reply.replace(/^\s*\[SILENT\]\s*$/i, '').trim();
       if (!cleaned) {
         return;
       }
-      await bot.replyText(message.replyTarget, cleaned);
+      const chunks = splitReply(cleaned);
+      for (let i = 0; i < chunks.length; i += 1) {
+        await bot.replyText(scope.replyTarget, chunks[i] as string);
+        if (i < chunks.length - 1) {
+          await new Promise((resolve) => setTimeout(resolve, 350));
+        }
+      }
       this.log.info('已回复', {
-        groupOpenid,
+        conversationId: scope.conversationId,
         speaker,
         chars: cleaned.length,
+        chunks: chunks.length,
         contextLines: pending.length,
       });
     } catch (error) {
-      this.log.error('回复失败', { groupOpenid, error });
+      this.log.error('回复失败', { conversationId: scope.conversationId, error });
     }
   }
 
