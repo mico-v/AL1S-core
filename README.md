@@ -47,6 +47,8 @@ src/scripts/webhook-check.ts  webhook 端到端自检
 
 ## 聊天 agent
 
+> 完整的改造背景、设计取舍、踩坑记录与实测数据见 [`docs/agent-report.md`](docs/agent-report.md)。
+
 `src/agent/` 是本仓库唯一的业务层，把 QQ 协议框架变成一个会聊天的群友。
 
 | 模块 | 作用 |
