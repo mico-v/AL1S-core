@@ -1,2 +1,5 @@
 patchedDependencies:
   '@tencent-connect/qqbot-nodejs@1.0.4': patches/@tencent-connect__qqbot-nodejs@1.0.4.patch
+# tsx 依赖 esbuild 的二进制，必须允许它的构建脚本
+onlyBuiltDependencies:
+  - esbuild
