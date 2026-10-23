@@ -8,9 +8,8 @@
 - [`@tencent-connect/qqbot-nodejs`](https://www.npmjs.com/package/@tencent-connect/qqbot-nodejs)：
   协议层，负责连接与收发消息。
 
-仓库包含 QQ 官方协议框架，以及可选的 QQ/Tuwunel Matrix Application
-Service bridge。bridge 以 ghost 用户呈现 QQ 用户，并由 QQ 机器人代理
-Matrix 出站消息；不包含 OneBot、LLM、插件和沙箱等上层设计。
+仓库包含 QQ 官方协议框架，以及构建在其上的群聊 agent（人格、群聊缓冲、
+成员记忆、看图、调用审计）。不包含 OneBot、插件和沙箱等上层设计。
 `@tencent-connect/qqbot-nodejs` 固定为 `1.0.4`，并通过
 `pnpm-workspace.yaml` 加载本地 patch；该 patch 为 guild/DM 文本与撤回补充
 channel/DM 路由。升级 SDK 时必须同步审查或重做 patch。
@@ -22,17 +21,13 @@ src/index.ts      入口：加载配置 → 创建 Bot → 注册事件 → star
 src/config.ts     环境变量解析与校验
 src/logger.ts     分级日志（兼容连接器 Logger 接口，密钥脱敏）
 src/bot.ts        对协议层的薄封装：生命周期 / 事件分发 / 回复转发
-src/matrix-bridge.ts  QQ / Tuwunel bridge 独立入口
-src/matrix/        Matrix CS API、appservice transaction 服务与指标
-src/matrix/admin.ts  房间成员状态、邀请与踢出的管理逻辑
-src/bridge/        双向路由、媒体转换与加密持久化
-src/deploy/        部署前 registration / .env 一致性校验
 src/scripts/qq-login.ts   扫码获取凭据并写入 .env
 src/scripts/qq-check.ts   离线协议自检
-src/scripts/matrix-check.ts  Matrix bridge 离线自检
-src/scripts/matrix-admin.ts  Matrix 房间成员管理 CLI
-src/scripts/tuwunel-check.ts  临时 Tuwunel 双向集成检查
-src/scripts/deploy-check.ts   生产部署前配置检查
+src/agent/        群聊 agent（编排 / 人格 / 记忆 / 看图 / 审计）
+src/scripts/agent-check.ts  agent 离线自检（不联网）
+src/scripts/agent-try.ts    用真实模型试跑一句
+src/scripts/agent-stats.ts  AI 调用统计
+src/scripts/agent-learn.ts  手动归纳成员档案
 src/scripts/webhook-check.ts  webhook 端到端自检
 ```
 
@@ -171,15 +166,9 @@ pnpm typecheck   # 类型检查
 pnpm build       # 编译到 dist/，供部署脚本打包
 pnpm qq:login    # 扫码获取 AppID / AppSecret 并写入 .env
 pnpm qq:check    # 离线协议自检（不联网）
-pnpm matrix:check   # Matrix bridge 离线自检
-pnpm matrix:admin   # 查询、邀请或踢出 Matrix 房间成员
-pnpm tuwunel:check  # 用 TUWUNEL_BIN 的本机 Tuwunel 检查双向桥接与生产入口生命周期
-pnpm deploy:check   # 校验生产 registration、.env、权限与部署 URL
 pnpm deploy:server  # 本地构建运行包并同步到服务器重启服务
-pnpm bridge       # 启动独立 QQ / Tuwunel bridge
-pnpm bridge:dev   # 以 watch 模式启动 bridge
 pnpm webhook:check  # 本地起 webhook 服务，端到端验证收消息
-pnpm integration:check  # typecheck + build + qq:check + matrix:check + webhook:check
+pnpm integration:check  # typecheck + build + qq:check + webhook:check
 pnpm ci:check      # 与 GitHub Actions 相同的完整门禁
 ```
 
@@ -205,62 +194,6 @@ pnpm ci:check      # 与 GitHub Actions 相同的完整门禁
 | `CHAT_DATA_DIR` | 数据根目录，默认 `./data` |
 | `CHAT_SAVE_MEDIA` | 是否下载图片/语音/视频/文件，默认 `true` |
 | `CHAT_MEDIA_MAX_MB` | 单个媒体大小上限，默认 50 |
-| `MATRIX_BRIDGE_*` | Tuwunel appservice、身份密钥、状态文件与发送者授权配置；详见 `.env.example` |
-
-启用 Matrix bridge 时，除全局发送者名单外，发送者还必须是目标 QQ 映射
-房间的已加入成员，并达到 `MATRIX_BRIDGE_MIN_POWER_LEVEL`。完整架构、
-映射规则、Tuwunel 联调步骤和限制见
-[`docs/qq-matrix-bridge/PLAN.md`](docs/qq-matrix-bridge/PLAN.md)；生产部署、
-备份、密钥操作及 Prometheus 告警示例见
-[`docs/qq-matrix-bridge/DEPLOYMENT.md`](docs/qq-matrix-bridge/DEPLOYMENT.md)。
-当前实现状态、实施日志、验证证据和阻塞项见
-[`docs/qq-matrix-bridge/STATUS.md`](docs/qq-matrix-bridge/STATUS.md)。
-原生部署资产位于 [`deploy/`](deploy)：systemd 单元、Tuwunel 配置模板与
-`deploy-server.sh`（本地构建后同步到服务器）。
-`/health` 与 `/metrics` 不鉴权，只应暴露在 Tuwunel 可达的内网。
-QQ 侧已支持文本、媒体、引用与结构化消息（`message_type=3/101/102/103`
-卡片、并行消息、聊天记录、引用），结构化内容合并为有界文本并递归转发
-元素内附件，超限时截断标记。
-消息正文中的 `<@OPENID>` 会映射为可读的 `@昵称`，并生成
-`formatted_body`、`https://matrix.to/#/...` 链接和 `m.mentions`；无法取得
-昵称时使用稳定的 `QQ用户_<8 位摘要>`，不会暴露 openid。`@room` 也会映射为
-Matrix room 提及。
-QQ 引用会从 `refMsgIdx`、原始 `message_reference.message_id`、原始字段、
-`message_scene.ext` 和嵌套 `msg_elements` 的 `msg_idx`/`id`/`message_id`
-中收集索引；当前消息的原始 ID 也会作为别名保存。`TMP_*` 无法直接命中时，
-按目标房间和引用正文回退，优先同发送者与最新记录；纯媒体消息使用附件名
-保存可匹配摘录。命中后只保留 Matrix `m.in_reply_to` 和回复正文，不再输出
-`> <...>` 调试文本。
-媒体按 SHA-256 内容哈希去重：聊天记录共用 `data/media-cache/<sha256>`，
-bridge 复用已上传的 Matrix `mxc://`，同一图片、表情包或文件不会重复落盘，
-也不会因同一批消息并发上传多次。
-消息桥接覆盖 QQ 群聊、单聊、频道和频道私信。guild/DM 已支持双向文本与
-撤回；受 QQ channel/DM API 限制，Matrix 到 guild/DM 的媒体发送当前会
-记录警告并忽略，但不会阻塞 transaction ACK。
-bridge 不枚举 QQ 群成员名单，ghost 在收到该用户消息后创建；QQ 未提供昵称时
-才会显示 `QQ用户_<8 位摘要>`，这不是硬编码用户列表。
-Matrix 发出的 `m.mentions.user_ids` 会在已持久化的 QQ ghost 映射中解析为
-QQ openid，并生成官方 `<qqbot-at-user id="..." />`。QQ 只在 Markdown
-消息中解析该标签，因此含提及的正文会强制使用 `msg_type=2`，并要求
-`QQBOT_MARKDOWN_SUPPORT=true`。普通 Matrix 用户不会被伪装成 QQ 用户。
-状态文件使用 schema v8 保存加密的 ghost 反向映射，并支持 v2-v7 平滑迁移。
-Matrix 正文命中标题、列表、引用、代码、链接、强调语法或 QQ 提及标签时，
-在机器人有平台 Markdown 权限的前提下改用 QQ `msg_type=2`；普通正文仍使用
-`msg_type=0`。引用消息的 `message_reference` 在两种类型下都会保留。
-QQ 入站消息会先加密写入持久化队列，bridge 重启后自动重放；失败按指数
-退避，队列容量和重试间隔可通过 `MATRIX_BRIDGE_QQ_*` 调整。
-
-房间成员可通过管理 CLI 查询和调整。`invite` 与 `kick` 必须显式指定具备
-对应权限的 `--actor`；踢出后 bridge 会在下一条消息时立即拒绝该成员，
-无需重启：
-
-```bash
-pnpm matrix:admin status --room '!room-id' --user '@alice:example.org'
-pnpm matrix:admin invite --room '!room-id' --user '@alice:example.org' \
-  --actor '@_qq_<digest>:example.org'
-pnpm matrix:admin kick --room '!room-id' --user '@alice:example.org' \
-  --actor '@_qq_<digest>:example.org' --reason 'policy review'
-```
 
 ## 日志
 
