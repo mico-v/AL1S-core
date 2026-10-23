@@ -5,16 +5,60 @@
  * 在 `bot.onMessage` 之上叠加，不修改这里的连接层。
  */
 
+import { ChatAgent, readAgentConfig } from './agent/index.js';
+import { configureTelemetry } from './agent/telemetry.js';
+import { learnAllGroups } from './agent/updater.js';
 import { Bot } from './bot.js';
 import { ConfigError, loadConfig } from './config.js';
 import { createLogger } from './logger.js';
 
 let bot: Bot;
+let agent: ChatAgent;
 
 try {
   const config = loadConfig();
   const log = createLogger(config.logging);
   bot = new Bot(config, log);
+
+  const agentConfig = readAgentConfig(process.env);
+  configureTelemetry({
+    enabled: agentConfig.callLog.enabled,
+    dir: agentConfig.callLog.dir,
+    contextWindow: agentConfig.callLog.contextWindow,
+    log,
+  });
+  agent = new ChatAgent(agentConfig, log);
+  log.info('聊天 agent', {
+    enabled: agentConfig.enabled,
+    model: agentConfig.llm.model,
+    apiBase: agentConfig.llm.baseUrl,
+    botOpenids: agentConfig.botOpenids.length,
+    botUsernames: agentConfig.botUsernames,
+    groups: agentConfig.groupAllowlist.length || 'all',
+    contextSize: agentConfig.contextSize,
+  });
+
+  if (agentConfig.enabled && !agentConfig.llm.apiKey) {
+    log.warn('AGENT_API_KEY 为空：能连上 QQ，但不会回复任何消息');
+  }
+
+  // 档案归纳是后台任务，不参与实时回复，慢一点无所谓。
+  if (agentConfig.enabled) {
+    const learnEveryMs = Number(process.env.AGENT_LEARN_INTERVAL_MS ?? 30 * 60 * 1000);
+    if (learnEveryMs > 0) {
+      const timer = setInterval(() => {
+        void learnAllGroups({ dataRoot: agentConfig.dataRoot, llm: agentConfig.llm }, log)
+          .then((result) => {
+            if (result.written > 0) {
+              log.info('定时归纳完成', result);
+            }
+          })
+          .catch((error: unknown) => log.warn('定时归纳失败', { error }));
+      }, learnEveryMs);
+      timer.unref();
+      log.info('已开启档案定时归纳', { intervalMs: learnEveryMs });
+    }
+  }
 
   log.info('配置已加载', {
     appId: config.appId,
@@ -60,9 +104,8 @@ try {
       return;
     }
 
-    // 示例回显，后续替换为业务逻辑。
-    await b.replyText(message.replyTarget, `收到：${message.content}`);
-    log.debug('已回复', { messageId: message.messageId });
+    // 交给聊天 agent：@ 才进模型，其余只进滚动缓冲。
+    await agent.handle(message, b);
   });
 
   bot.onInteraction(async (event, _ctx, b) => {

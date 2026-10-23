@@ -45,6 +45,97 @@ src/scripts/webhook-check.ts  webhook 端到端自检
 
 我们的代码只做组装与业务，不重新实现协议。
 
+## 聊天 agent
+
+> 完整的改造背景、设计取舍、踩坑记录与实测数据见 [`docs/agent-report.md`](docs/agent-report.md)。
+
+`src/agent/` 是本仓库唯一的业务层，把 QQ 协议框架变成一个会聊天的群友。
+
+| 模块 | 作用 |
+| --- | --- |
+| `llm.ts` | OpenAI 兼容客户端（默认 opencode-go；`x-opencode-session` 头是必需的） |
+| `persona.ts` | 人格提示词（从历史实战聊天记录提炼的语感） |
+| `context.ts` | 群聊滚动缓冲：非 @ 消息不进模型 |
+| `text.ts` | 清掉 QQ 协议标记（`<@openid>`、`<faceType=…>`） |
+| `vision.ts` | 看图 / 听语音：附件转成可读文本 |
+| `memory.ts` | 成员档案与群日记，数据从 chat-log 的 JSONL 派生 |
+| `updater.ts` | 从新消息归纳成员档案（定时或手动） |
+| `index.ts` | 编排：@ 才回、私聊必回、`/` 开头忽略 |
+
+行为约定：
+
+- **群聊只有被 @ 才回**，其余消息只进缓冲（省钱、不刷屏）；
+- 被 @ 时把「上次说话之后群里聊了什么」连同说话人档案一起注入；
+- **私聊每条都回**，不需要 @；
+- 同一个会话串行处理，两条 @ 不会并发抢回复；
+- 长回复按空行/句末切成多条发送，单条不超过 700 字；
+- `AGENT_LEARN_INTERVAL_MS`（默认 30 分钟）在后台把新消息归纳进成员档案。
+
+### 看图与语音
+
+`deepseek-v4.1-flash` 本身多模态，但它是推理模型：`max_tokens` 给小了，
+预算会全烧在 `reasoning_content` 上，`content` 直接是空的（表现为「看不见图」）。
+
+所以看图和闲聊分成两次调用：
+
+1. 看图单独发一次请求，`thinking: disabled`、`max_tokens: 600`，只取一句描述；
+2. 描述以 `[图1] …` 的形式当文本注入主对话 —— 主对话始终纯文本，便宜且快。
+
+- 同一条消息最多看 3 张图；同一 URL 描述会缓存，表情包反复发不重复花钱；
+- 语音优先用 QQ 自带的转写（`asr_refer_text`）；
+- 下载失败或看不懂会写成 `（没看清）`，人格里明令**不许猜图里是什么**，只能直说。
+
+`pnpm agent:try --image <文件> "这图什么意思"` 可以本地验证整条链路。
+
+### 调用审计
+
+每一次模型调用（闲聊 / 看图 / 归纳）都会往 `data/calls/YYYY-MM-DD.jsonl` 追加一行：
+
+| 字段 | 含义 |
+| --- | --- |
+| `purpose` | `chat` / `caption` / `learn` |
+| `promptTokens` / `completionTokens` / `reasoningTokens` | 三段 token |
+| `cachedTokens` / `cacheRate` | 缓存命中的 token 与命中率 |
+| `ms` / `tokensPerSecond` | 端到端耗时与输出速度 |
+| `contextRate` | 本次 prompt 占上下文窗口的比例 |
+| `stack` | 调用链（只保留 `src/` 里的帧，自动剔除 node_modules） |
+| `conversationId` / `speaker` | 哪个群、谁说的 |
+| `attempt` / `ok` / `status` / `error` | 第几次尝试、成败与错误 |
+
+```bash
+pnpm agent:stats              # 最近一天：总量、缓存率、p50/p95、按用途拆分、最慢调用
+pnpm agent:stats --days 7
+pnpm agent:stats --json
+```
+
+审计写入失败只会打 warning，不会影响回复。单文件超过 50MB 自动滚动。
+
+```bash
+pnpm agent:check    # 离线自检，不联网
+pnpm agent:try "今天好累啊"   # 用真实模型试跑一句，调人格用
+pnpm agent:learn    # 手动跑一次档案归纳
+```
+
+配置见 `.env.example` 的「聊天 agent」段。最低要求：`AGENT_API_KEY`，
+以及 `AGENT_BOT_OPENIDS`（机器人在群里的 member_openid）或
+`AGENT_BOT_USERNAMES`（机器人昵称，需同时 `bot=true`）之一 ——
+**不要**用「mentions 里有任意 bot」来判断，群里 @ 别的机器人会误触发。
+
+## 部署
+
+```bash
+pnpm install
+cp .env.example .env    # 填 QQBOT_APP_ID / QQBOT_APP_SECRET / AGENT_API_KEY
+mkdir -p logs
+cp deploy/al1s-bot.service /etc/systemd/system/
+systemctl daemon-reload && systemctl enable --now al1s-bot
+```
+
+同一个 AppID 只能有一个进程连 WebSocket —— 部署前先把其它占用同一 AppID 的进程停掉
+（包括别的 Hermes profile 的 qqbot 适配器），否则两边会互相抢事件、随机丢消息。
+
+日志在 `logs/service.log`，聊天记录在 `data/chats/`。
+
 ## 要求
 
 - Node.js ≥ 22（推荐 24，`.node-version` 为 24.13.0）
