@@ -1,0 +1,18 @@
+[Unit]
+Description=AL1S QQ chat bot — QQ 官方机器人
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=/opt/git/mico-v/al1s
+EnvironmentFile=/opt/git/mico-v/al1s/.env
+# 用系统 node，别用 Hermes 自带的（升级时会被清掉）
+ExecStart=/usr/bin/node /opt/git/mico-v/al1s/node_modules/tsx/dist/cli.mjs src/index.ts
+Restart=always
+RestartSec=5
+StandardOutput=append:/opt/git/mico-v/al1s/logs/service.log
+StandardError=append:/opt/git/mico-v/al1s/logs/service.err.log
+
+[Install]
+WantedBy=multi-user.target
