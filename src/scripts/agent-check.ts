@@ -13,6 +13,8 @@ import { ChatAgent, isBotMentioned, readAgentConfig, splitReply } from '../agent
 import type { ChatMessage } from '../agent/llm.js';
 import { GroupBuffer } from '../agent/context.js';
 import { GroupMemory } from '../agent/memory.js';
+import { PERSONA } from '../agent/persona.js';
+import { cleanQQText } from '../agent/text.js';
 import type { Bot } from '../bot.js';
 import type { QQBotInboundMessage } from '@tencent-connect/qqbot-nodejs';
 import type { AppLogger } from '../logger.js';
@@ -154,6 +156,16 @@ async function main(): Promise<void> {
       dmBot,
     );
     check('私聊不需要 @ 也回', dmReplies.length === 1, `实际 ${dmReplies.length}`);
+
+    console.log('\n[7] 正文清洗');
+    check('去掉 @ 协议标记', !cleanQQText('<@010356C972961F4612B45B858C77091A> 在吗').includes('010356'));
+    check('保留 @ 语义', cleanQQText('<@010356C972961F4612B45B858C77091A> 在吗').includes('@某人'));
+    check('表情转成 [表情]', cleanQQText('<faceType=6,faceId="0",ext="xxx=">') === '[表情]');
+    check('普通文字不受影响', cleanQQText('今天吃什么') === '今天吃什么');
+
+    console.log('\n[8] 看不到图时的规矩');
+    check('人格要求不许猜图', PERSONA.includes('绝对不许猜图里是什么'));
+    check('人格要求直说没加载', PERSONA.includes('没加载出来'));
   } finally {
     await rm(tmp, { recursive: true, force: true });
   }

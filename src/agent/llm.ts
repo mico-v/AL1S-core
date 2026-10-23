@@ -11,9 +11,13 @@ import { setTimeout as sleep } from 'node:timers/promises';
 /** opencode-go 要求带上会话标识，否则拒收请求（MissingSessionID）。 */
 const PROCESS_SESSION_ID = randomUUID();
 
+export type ContentPart =
+  | { type: 'text'; text: string }
+  | { type: 'image_url'; image_url: { url: string } };
+
 export interface ChatMessage {
   role: 'system' | 'user' | 'assistant';
-  content: string;
+  content: string | ContentPart[];
 }
 
 export interface LlmOptions {
@@ -25,6 +29,11 @@ export interface LlmOptions {
   timeoutMs?: number;
   /** opencode-go 的会话标识；不传则用进程级 UUID。 */
   sessionId?: string;
+  /**
+   * 关掉推理（deepseek-v4.1-flash 是推理模型）。
+   * 闲聊不需要长思考，而且推理会吃掉 max_tokens 导致正文为空。
+   */
+  disableThinking?: boolean;
 }
 
 export class LlmError extends Error {
@@ -50,6 +59,7 @@ export async function chatComplete(
     temperature: opts.temperature ?? 0.9,
     max_tokens: opts.maxTokens ?? 500,
     stream: false,
+    ...(opts.disableThinking ? { thinking: { type: 'disabled' } } : {}),
   });
 
   let lastError: unknown;
@@ -80,11 +90,13 @@ export async function chatComplete(
         continue;
       }
       const data = (await res.json()) as {
-        choices?: Array<{ message?: { content?: string } }>;
+        choices?: Array<{ message?: { content?: string }; finish_reason?: string }>;
       };
-      const text = data.choices?.[0]?.message?.content;
+      const choice = data.choices?.[0];
+      const text = choice?.message?.content;
       if (typeof text !== 'string' || !text.trim()) {
-        lastError = new LlmError('空回复');
+        // 推理模型可能把预算全烧在 reasoning 上，content 就是空的
+        lastError = new LlmError(`空回复（finish_reason=${choice?.finish_reason ?? '未知'}）`);
         continue;
       }
       return text.trim();
