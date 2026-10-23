@@ -6,6 +6,7 @@
  */
 
 import { ChatAgent, readAgentConfig } from './agent/index.js';
+import { learnAllGroups } from './agent/updater.js';
 import { Bot } from './bot.js';
 import { ConfigError, loadConfig } from './config.js';
 import { createLogger } from './logger.js';
@@ -29,6 +30,28 @@ try {
     groups: agentConfig.groupAllowlist.length || 'all',
     contextSize: agentConfig.contextSize,
   });
+
+  if (agentConfig.enabled && !agentConfig.llm.apiKey) {
+    log.warn('AGENT_API_KEY 为空：能连上 QQ，但不会回复任何消息');
+  }
+
+  // 档案归纳是后台任务，不参与实时回复，慢一点无所谓。
+  if (agentConfig.enabled) {
+    const learnEveryMs = Number(process.env.AGENT_LEARN_INTERVAL_MS ?? 30 * 60 * 1000);
+    if (learnEveryMs > 0) {
+      const timer = setInterval(() => {
+        void learnAllGroups({ dataRoot: agentConfig.dataRoot, llm: agentConfig.llm }, log)
+          .then((result) => {
+            if (result.written > 0) {
+              log.info('定时归纳完成', result);
+            }
+          })
+          .catch((error: unknown) => log.warn('定时归纳失败', { error }));
+      }, learnEveryMs);
+      timer.unref();
+      log.info('已开启档案定时归纳', { intervalMs: learnEveryMs });
+    }
+  }
 
   log.info('配置已加载', {
     appId: config.appId,

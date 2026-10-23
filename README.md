@@ -45,6 +45,39 @@ src/scripts/webhook-check.ts  webhook 端到端自检
 
 我们的代码只做组装与业务，不重新实现协议。
 
+## 聊天 agent
+
+`src/agent/` 是本仓库唯一的业务层，把 QQ 协议框架变成一个会聊天的群友。
+
+| 模块 | 作用 |
+| --- | --- |
+| `llm.ts` | OpenAI 兼容客户端（默认 opencode-go；`x-opencode-session` 头是必需的） |
+| `persona.ts` | 人格提示词（从历史实战聊天记录提炼的语感） |
+| `context.ts` | 群聊滚动缓冲：非 @ 消息不进模型 |
+| `memory.ts` | 成员档案与群日记，数据从 chat-log 的 JSONL 派生 |
+| `updater.ts` | 从新消息归纳成员档案（定时或手动） |
+| `index.ts` | 编排：@ 才回、私聊必回、`/` 开头忽略 |
+
+行为约定：
+
+- **群聊只有被 @ 才回**，其余消息只进缓冲（省钱、不刷屏）；
+- 被 @ 时把「上次说话之后群里聊了什么」连同说话人档案一起注入；
+- **私聊每条都回**，不需要 @；
+- 同一个会话串行处理，两条 @ 不会并发抢回复；
+- 长回复按空行/句末切成多条发送，单条不超过 700 字；
+- `AGENT_LEARN_INTERVAL_MS`（默认 30 分钟）在后台把新消息归纳进成员档案。
+
+```bash
+pnpm agent:check    # 离线自检，不联网
+pnpm agent:try "今天好累啊"   # 用真实模型试跑一句，调人格用
+pnpm agent:learn    # 手动跑一次档案归纳
+```
+
+配置见 `.env.example` 的「聊天 agent」段。最低要求：`AGENT_API_KEY`，
+以及 `AGENT_BOT_OPENIDS`（机器人在群里的 member_openid）或
+`AGENT_BOT_USERNAMES`（机器人昵称，需同时 `bot=true`）之一 ——
+**不要**用「mentions 里有任意 bot」来判断，群里 @ 别的机器人会误触发。
+
 ## 要求
 
 - Node.js ≥ 22（推荐 24，`.node-version` 为 24.13.0）

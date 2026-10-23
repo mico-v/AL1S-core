@@ -5,6 +5,9 @@
  * 由定时器或 `pnpm agent:learn` 触发，不参与实时回复，所以慢一点没关系。
  */
 
+import { existsSync } from 'node:fs';
+import { readdir } from 'node:fs/promises';
+import path from 'node:path';
 import type { AppLogger } from '../logger.js';
 import { chatComplete, type LlmOptions } from './llm.js';
 import { GroupMemory, readNewRecords, type RawRecord } from './memory.js';
@@ -131,4 +134,30 @@ export async function learnGroup(
 
   log.info('归纳完成', { groupOpenid, records: records.length, written: profiles.length });
   return { processed: records.length, written: profiles.length };
+}
+
+/** 遍历 dataRoot 下所有群，各归纳一轮。定时任务用。 */
+export async function learnAllGroups(
+  config: UpdaterConfig,
+  log: AppLogger,
+): Promise<{ groups: number; written: number }> {
+  const dir = path.join(config.dataRoot, 'chats', 'group');
+  if (!existsSync(dir)) {
+    return { groups: 0, written: 0 };
+  }
+  let groups = 0;
+  let written = 0;
+  for (const name of await readdir(dir)) {
+    if (name.startsWith('.')) {
+      continue;
+    }
+    groups += 1;
+    try {
+      const result = await learnGroup(config, name, log);
+      written += result.written;
+    } catch (error) {
+      log.warn('归纳失败', { groupOpenid: name, error });
+    }
+  }
+  return { groups, written };
 }

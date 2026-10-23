@@ -9,7 +9,7 @@
 import { mkdtemp, rm } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
-import { ChatAgent, isBotMentioned, readAgentConfig } from '../agent/index.js';
+import { ChatAgent, isBotMentioned, readAgentConfig, splitReply } from '../agent/index.js';
 import type { ChatMessage } from '../agent/llm.js';
 import { GroupBuffer } from '../agent/context.js';
 import { GroupMemory } from '../agent/memory.js';
@@ -133,6 +133,27 @@ async function main(): Promise<void> {
     );
     const second = calls[1]?.map((m) => m.content).join('\n') ?? '';
     check('背景用完后被清空', !second.includes('没人叫你的话1'));
+
+    console.log('\n[5] 长回复分片');
+    check('短回复不切', splitReply('诶 累就早点歇').length === 1);
+    const long = '第一段内容'.repeat(200) + '\n\n' + '第二段内容'.repeat(200);
+    const parts = splitReply(long);
+    check('长回复被切开', parts.length >= 2, `实际 ${parts.length}`);
+    check('每片不超限', parts.every((p) => p.length <= 700), `最长 ${Math.max(...parts.map((p) => p.length))}`);
+    check('没有丢内容', parts.join('').replace(/\s/g, '').length === long.replace(/\s/g, '').length);
+
+    console.log('\n[6] 私聊');
+    const dmReplies: string[] = [];
+    const dmBot = {
+      replyText: async (_t: unknown, reply: string) => {
+        dmReplies.push(reply);
+      },
+    } as unknown as Bot;
+    await agent.handle(
+      makeMessage({ kind: 'c2c', groupOpenid: undefined, content: '在不', mentions: [] }),
+      dmBot,
+    );
+    check('私聊不需要 @ 也回', dmReplies.length === 1, `实际 ${dmReplies.length}`);
   } finally {
     await rm(tmp, { recursive: true, force: true });
   }
