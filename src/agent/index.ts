@@ -14,6 +14,8 @@ import { GroupBuffer, renderBuffer } from './context.js';
 import { chatComplete, type ChatMessage, type LlmOptions } from './llm.js';
 import { GroupMemory } from './memory.js';
 import { CONTEXT_FOOTER, CONTEXT_HEADER, PERSONA } from './persona.js';
+import { cleanQQText } from './text.js';
+import { digestAttachments } from './vision.js';
 
 export interface AgentConfig {
   enabled: boolean;
@@ -50,6 +52,7 @@ export function readAgentConfig(env: NodeJS.ProcessEnv): AgentConfig {
       temperature: Number(env.AGENT_TEMPERATURE ?? 0.95),
       maxTokens: Number(env.AGENT_MAX_TOKENS ?? 400),
       timeoutMs: Number(env.AGENT_TIMEOUT_MS ?? 45_000),
+      disableThinking: env.AGENT_DISABLE_THINKING !== 'false',
     },
     dataRoot: env.CHAT_DATA_DIR ?? './data',
     botOpenids: list(env.AGENT_BOT_OPENIDS),
@@ -204,29 +207,47 @@ export class ChatAgent {
       return;
     }
 
-    const text = (message.content ?? '').trim();
-    if (!text || message.senderIsBot) {
+    const raw = (message.content ?? '').trim();
+    const withoutMentions = raw.replace(/<@!?[0-9A-Fa-f]{16,}>/g, '').trim();
+    const text = cleanQQText(raw);
+    const attachments = message.attachments ?? [];
+    const hasAttachments = attachments.length > 0;
+
+    if (message.senderIsBot || (!text && !hasAttachments)) {
       return;
     }
-    // 别的机器人的命令
-    if (text.startsWith('/')) {
-      this.log.debug('忽略命令类消息', { conversationId: scope.conversationId, text: text.slice(0, 40) });
+    // 别的机器人的命令（@课表Bot /课表 也算）
+    if (withoutMentions.startsWith('/')) {
+      this.log.debug('忽略命令类消息', { conversationId: scope.conversationId, text: withoutMentions.slice(0, 40) });
       return;
     }
 
     const called = scope.isDirect || isBotMentioned(message, this.config);
     if (!called) {
-      this.buffer.push(scope.conversationId, {
+      const line = {
         senderName: message.senderName ?? message.senderId.slice(0, 8),
         text,
         timestamp: Date.now(),
-      });
+      };
+      this.buffer.push(scope.conversationId, line);
+      if (hasAttachments) {
+        // 后台看懂，看懂后原地补进这一行，别挡住后续消息
+        void this.enrich(message, attachments).then((extra) => {
+          if (extra) {
+            line.text = `${line.text}\n${extra}`.trim();
+          }
+        });
+      }
       return;
     }
 
+    // 被 @ 了：先把图看懂，再回
+    const extra = hasAttachments ? await this.enrich(message, attachments) : '';
+    const fullText = [text, extra].filter(Boolean).join('\n');
+
     // 同会话串行：把本次处理挂在上一次后面
     const prev = this.chains.get(scope.conversationId) ?? Promise.resolve();
-    const task: Promise<void> = prev.catch(() => undefined).then(() => this.reply(message, bot, scope, text));
+    const task: Promise<void> = prev.catch(() => undefined).then(() => this.reply(message, bot, scope, fullText));
     const tail: Promise<void> = task.finally(() => {
       if (this.chains.get(scope.conversationId) === tail) {
         this.chains.delete(scope.conversationId);
@@ -234,6 +255,24 @@ export class ChatAgent {
     });
     this.chains.set(scope.conversationId, tail);
     await task;
+  }
+
+  /** 把附件转成可读文本；失败也返回「没看清」这类标记，绝不留空。 */
+  private async enrich(
+    message: QQBotInboundMessage,
+    attachments: NonNullable<QQBotInboundMessage['attachments']>,
+  ): Promise<string> {
+    const startedAt = Date.now();
+    const digest = await digestAttachments(attachments, this.config.llm, this.log);
+    if (digest.imagesSeen > 0 || digest.imagesFailed > 0) {
+      this.log.info('看图', {
+        conversationId: message.groupOpenid ?? message.senderId.slice(0, 8),
+        seen: digest.imagesSeen,
+        failed: digest.imagesFailed,
+        ms: Date.now() - startedAt,
+      });
+    }
+    return digest.text;
   }
 
   private async reply(

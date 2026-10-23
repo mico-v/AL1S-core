@@ -54,6 +54,8 @@ src/scripts/webhook-check.ts  webhook 端到端自检
 | `llm.ts` | OpenAI 兼容客户端（默认 opencode-go；`x-opencode-session` 头是必需的） |
 | `persona.ts` | 人格提示词（从历史实战聊天记录提炼的语感） |
 | `context.ts` | 群聊滚动缓冲：非 @ 消息不进模型 |
+| `text.ts` | 清掉 QQ 协议标记（`<@openid>`、`<faceType=…>`） |
+| `vision.ts` | 看图 / 听语音：附件转成可读文本 |
 | `memory.ts` | 成员档案与群日记，数据从 chat-log 的 JSONL 派生 |
 | `updater.ts` | 从新消息归纳成员档案（定时或手动） |
 | `index.ts` | 编排：@ 才回、私聊必回、`/` 开头忽略 |
@@ -66,6 +68,22 @@ src/scripts/webhook-check.ts  webhook 端到端自检
 - 同一个会话串行处理，两条 @ 不会并发抢回复；
 - 长回复按空行/句末切成多条发送，单条不超过 700 字；
 - `AGENT_LEARN_INTERVAL_MS`（默认 30 分钟）在后台把新消息归纳进成员档案。
+
+### 看图与语音
+
+`deepseek-v4.1-flash` 本身多模态，但它是推理模型：`max_tokens` 给小了，
+预算会全烧在 `reasoning_content` 上，`content` 直接是空的（表现为「看不见图」）。
+
+所以看图和闲聊分成两次调用：
+
+1. 看图单独发一次请求，`thinking: disabled`、`max_tokens: 600`，只取一句描述；
+2. 描述以 `[图1] …` 的形式当文本注入主对话 —— 主对话始终纯文本，便宜且快。
+
+- 同一条消息最多看 3 张图；同一 URL 描述会缓存，表情包反复发不重复花钱；
+- 语音优先用 QQ 自带的转写（`asr_refer_text`）；
+- 下载失败或看不懂会写成 `（没看清）`，人格里明令**不许猜图里是什么**，只能直说。
+
+`pnpm agent:try --image <文件> "这图什么意思"` 可以本地验证整条链路。
 
 ```bash
 pnpm agent:check    # 离线自检，不联网
