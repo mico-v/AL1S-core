@@ -78,6 +78,21 @@ pnpm agent:learn    # 手动跑一次档案归纳
 `AGENT_BOT_USERNAMES`（机器人昵称，需同时 `bot=true`）之一 ——
 **不要**用「mentions 里有任意 bot」来判断，群里 @ 别的机器人会误触发。
 
+## 部署
+
+```bash
+pnpm install
+cp .env.example .env    # 填 QQBOT_APP_ID / QQBOT_APP_SECRET / AGENT_API_KEY
+mkdir -p logs
+cp deploy/al1s-bot.service /etc/systemd/system/
+systemctl daemon-reload && systemctl enable --now al1s-bot
+```
+
+同一个 AppID 只能有一个进程连 WebSocket —— 部署前先把其它占用同一 AppID 的进程停掉
+（包括别的 Hermes profile 的 qqbot 适配器），否则两边会互相抢事件、随机丢消息。
+
+日志在 `logs/service.log`，聊天记录在 `data/chats/`。
+
 ## 要求
 
 - Node.js ≥ 22（推荐 24，`.node-version` 为 24.13.0）
