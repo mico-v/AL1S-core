@@ -109,7 +109,7 @@ export function isBotMentioned(message: QQBotInboundMessage, config: AgentConfig
   return false;
 }
 
-export type CompleteFn = (messages: ChatMessage[], opts: LlmOptions) => Promise<string>;
+export type CompleteFn = (messages: ChatMessage[], opts: LlmOptions, retries?: number) => Promise<string>;
 
 /** 单条消息上限（QQ 文本消息过长会被截断或发送失败）。 */
 export const MAX_REPLY_CHARS = 700;
@@ -320,12 +320,16 @@ export class ChatAgent {
     ];
 
     try {
-      const reply = await this.complete(messages, {
-        ...this.config.llm,
-        purpose: 'chat',
-        conversationId: scope.conversationId,
-        speaker,
-      });
+      const reply = await this.complete(
+        messages,
+        {
+          ...this.config.llm,
+          purpose: 'chat',
+          conversationId: scope.conversationId,
+          speaker,
+        },
+        1,
+      );
       const cleaned = reply.replace(/^\s*\[SILENT\]\s*$/i, '').trim();
       if (!cleaned) {
         return;

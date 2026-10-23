@@ -16,7 +16,8 @@ const MAX_IMAGE_BYTES = 4 * 1024 * 1024;
 const MAX_IMAGES_PER_MESSAGE = 3;
 /** 看图的 token 预算。关掉推理后 600 足够，留点余量防止截断。 */
 const CAPTION_MAX_TOKENS = 600;
-const CAPTION_TIMEOUT_MS = 120_000;
+/** 看图最多等这么久：超过就认「没看清」，别让人干等。 */
+const CAPTION_TIMEOUT_MS = 25_000;
 /** 同时在跑的看图请求数。 */
 const CAPTION_CONCURRENCY = 2;
 
@@ -119,7 +120,7 @@ export async function describeImage(
         timeoutMs: CAPTION_TIMEOUT_MS,
         disableThinking: true,
         purpose: 'caption',
-      }),
+      }, 0),
     );
     return text.trim() || undefined;
   } catch (error) {
