@@ -82,6 +82,22 @@ src/scripts/webhook-check.ts  webhook 端到端自检
 
 `pnpm agent:try --image <文件> "这图什么意思"` 可以本地验证整条链路。
 
+### 历史检索
+
+Kei 可以自己翻聊天记录，不是靠上下文里那 40 条缓冲。
+
+| 工具 | 用途 |
+| --- | --- |
+| `search_messages` | 关键词检索历史（可按人、按天数、按条数过滤），结果带时间和昵称 |
+| `member_profile` | 查某个群友的长期档案 |
+| `chat_stats` | 群消息总量与活跃度 |
+
+模型自己决定什么时候查（问到「上次」「还记得吗」就会触发），一轮最多 3 个回合，
+查完直接给结论，不会说「我查一下」。`AGENT_TOOLS=false` 可整体关闭。
+
+索引在 `MessageIndex` 里按「文件 mtime + size」缓存，聊天记录更新后自动重建，
+不额外维护索引文件。
+
 ### 调用审计
 
 每一次模型调用（闲聊 / 看图 / 归纳）都会往 `data/calls/YYYY-MM-DD.jsonl` 追加一行：

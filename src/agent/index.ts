@@ -11,10 +11,17 @@ import type { QQBotInboundMessage } from '@tencent-connect/qqbot-nodejs';
 import type { Bot } from '../bot.js';
 import type { AppLogger } from '../logger.js';
 import { GroupBuffer, renderBuffer } from './context.js';
-import { chatComplete, type ChatMessage, type LlmOptions } from './llm.js';
+import {
+  chatComplete,
+  chatCompleteRaw,
+  type ChatMessage,
+  type ChatResponse,
+  type LlmOptions,
+} from './llm.js';
 import { GroupMemory } from './memory.js';
 import { CONTEXT_FOOTER, CONTEXT_HEADER, PERSONA } from './persona.js';
 import { cleanQQText } from './text.js';
+import { TOOL_DEFINITIONS, executeTool, type ToolContext } from './tools.js';
 import { digestAttachments } from './vision.js';
 
 export interface AgentConfig {
@@ -34,6 +41,8 @@ export interface AgentConfig {
   ownerOpenids: string[];
   /** 私聊是否启用。 */
   directEnabled: boolean;
+  /** 是否允许模型调用工具（查历史、查档案）。 */
+  toolsEnabled: boolean;
   /** 调用审计。 */
   callLog: {
     enabled: boolean;
@@ -67,6 +76,7 @@ export function readAgentConfig(env: NodeJS.ProcessEnv): AgentConfig {
     contextSize: Number(env.AGENT_CONTEXT_SIZE ?? 40),
     ownerOpenids: list(env.AGENT_OWNER_OPENIDS),
     directEnabled: env.AGENT_DIRECT_ENABLED !== 'false',
+    toolsEnabled: env.AGENT_TOOLS !== 'false',
     callLog: {
       enabled: env.AGENT_CALL_LOG !== 'false',
       dir: env.AGENT_CALL_LOG_DIR ?? './data/calls',
@@ -110,6 +120,11 @@ export function isBotMentioned(message: QQBotInboundMessage, config: AgentConfig
 }
 
 export type CompleteFn = (messages: ChatMessage[], opts: LlmOptions, retries?: number) => Promise<string>;
+export type RawCompleteFn = (
+  messages: ChatMessage[],
+  opts: LlmOptions,
+  retries?: number,
+) => Promise<ChatResponse>;
 
 /** 单条消息上限（QQ 文本消息过长会被截断或发送失败）。 */
 export const MAX_REPLY_CHARS = 700;
@@ -186,14 +201,62 @@ export class ChatAgent {
   private readonly buffer: GroupBuffer;
   private readonly members = new Map<string, GroupMemory>();
   private readonly complete: CompleteFn;
+  private readonly completeRaw: RawCompleteFn;
   /** 同一会话串行处理，避免同一群里两条 @ 并发抢回复。 */
   private readonly chains = new Map<string, Promise<void>>();
 
-  constructor(config: AgentConfig, log: AppLogger, complete: CompleteFn = chatComplete) {
+  constructor(
+    config: AgentConfig,
+    log: AppLogger,
+    complete: CompleteFn = chatComplete,
+    completeRaw: RawCompleteFn = chatCompleteRaw,
+  ) {
     this.config = config;
     this.log = log;
     this.complete = complete;
+    this.completeRaw = completeRaw;
     this.buffer = new GroupBuffer(config.contextSize);
+  }
+
+  /**
+   * 跑一轮对话，允许模型中途调工具。
+   *
+   * 回合上限 3：查历史 / 查档案 / 再补一次，足够覆盖真实提问，
+   * 又不至于让一条群消息拖出十几秒。
+   */
+  private async converse(messages: ChatMessage[], opts: LlmOptions, chatId?: string): Promise<string> {
+    if (!this.config.toolsEnabled) {
+      return this.complete(messages, opts, 1);
+    }
+
+    const ctx: ToolContext = {
+      dataRoot: this.config.dataRoot,
+      // 私聊没有群 id，就搜全部历史，否则会一条都搜不到
+      groupId: chatId,
+      log: this.log,
+    };
+
+    let convo = [...messages];
+    for (let round = 0; round < 3; round += 1) {
+      const response = await this.completeRaw(convo, { ...opts, tools: TOOL_DEFINITIONS }, 1);
+      if (response.toolCalls.length === 0) {
+        return response.content;
+      }
+      this.log.info('工具调用', {
+        round,
+        tools: response.toolCalls.map((call) => call.function.name),
+        conversationId: opts.conversationId,
+      });
+      convo = [...convo, { role: 'assistant', content: response.content, tool_calls: response.toolCalls }];
+      for (const call of response.toolCalls) {
+        const output = await executeTool(call.function.name, call.function.arguments, ctx);
+        convo = [...convo, { role: 'tool', tool_call_id: call.id, content: output }];
+      }
+    }
+
+    // 回合用完还没收敛：要一次纯文本，别把 tool_calls 暴露给群友
+    this.log.warn('工具回合超限，强制收尾', { conversationId: opts.conversationId });
+    return this.complete(convo, { ...opts, tools: undefined }, 1);
   }
 
   private memory(groupOpenid: string): GroupMemory {
@@ -348,7 +411,7 @@ export class ChatAgent {
     ];
 
     try {
-      const reply = await this.complete(
+      const reply = await this.converse(
         messages,
         {
           ...this.config.llm,
@@ -356,7 +419,7 @@ export class ChatAgent {
           conversationId: scope.conversationId,
           speaker,
         },
-        1,
+        scope.isDirect ? undefined : scope.conversationId,
       );
       const cleaned = reply.replace(/^\s*\[SILENT\]\s*$/i, '').trim();
       if (!cleaned) {
