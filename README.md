@@ -122,7 +122,9 @@ pnpm agent:learn    # 手动跑一次档案归纳
 pnpm install
 cp .env.example .env    # 填 QQBOT_APP_ID / QQBOT_APP_SECRET / AGENT_API_KEY
 mkdir -p logs
-cp deploy/al1s-bot.service /etc/systemd/system/
+# 管理台（可选）
+(cd admin && npm install && npm run build)
+cp deploy/al1s-bot.service deploy/al1s-admin.service /etc/systemd/system/
 systemctl daemon-reload && systemctl enable --now al1s-bot
 ```
 
@@ -194,6 +196,31 @@ pnpm ci:check      # 与 GitHub Actions 相同的完整门禁
 | `CHAT_DATA_DIR` | 数据根目录，默认 `./data` |
 | `CHAT_SAVE_MEDIA` | 是否下载图片/语音/视频/文件，默认 `true` |
 | `CHAT_MEDIA_MAX_MB` | 单个媒体大小上限，默认 50 |
+
+## 管理台
+
+`admin/` 是一个只读的 Web 控制台（React 19 + Vite + Tailwind 4），
+部署在 `kei.st.mioc.cc`，走 Caddy 基础认证。
+
+| 页面 | 内容 |
+| --- | --- |
+| 概览 | 调用次数、缓存命中、p50/p95 延迟、输出速度、每日调用量、按用途拆分、最慢调用、失败清单 |
+| 消息 | 群聊记录（按时间倒序，支持搜索与分页），标注图片/富文本 |
+| 设置 | `.env` 分组展示，密钥类只显示「已设置 · N 字符」 |
+
+```bash
+cd admin
+npm install
+npm run dev      # http://127.0.0.1:5173，API 代理到 18082
+npm run build    # 产物到 admin/dist，由 API 服务直接托管
+npm start        # 只跑 API + 静态文件，监听 127.0.0.1:18082
+```
+
+接口：`/api/summary`、`/api/messages`、`/api/settings`、`/api/health`。
+服务全程只读，不写任何文件、不改机器人状态。
+
+修改配置后需要 `npm run build` 重新出静态产物；改完 `admin/` 记得
+`systemctl restart al1s-admin`。
 
 ## 日志
 

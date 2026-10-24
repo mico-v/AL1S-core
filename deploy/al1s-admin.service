@@ -1,0 +1,20 @@
+[Unit]
+Description=AL1S admin console (Kei)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=/opt/git/mico-v/al1s/admin
+Environment=NODE_ENV=production
+Environment=ADMIN_PORT=18082
+Environment=ADMIN_HOST=127.0.0.1
+# 需要读仓库根目录的 .env（0600 root）来展示设置页，故以 root 运行；只绑本地回环
+ExecStart=/usr/bin/node /opt/git/mico-v/al1s/admin/node_modules/tsx/dist/cli.mjs server.ts
+Restart=always
+RestartSec=5
+StandardOutput=append:/opt/git/mico-v/al1s/logs/admin.log
+StandardError=append:/opt/git/mico-v/al1s/logs/admin.err.log
+
+[Install]
+WantedBy=multi-user.target
