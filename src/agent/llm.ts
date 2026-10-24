@@ -16,9 +16,25 @@ export type ContentPart =
   | { type: 'text'; text: string }
   | { type: 'image_url'; image_url: { url: string } };
 
+export interface ToolCall {
+  id: string;
+  type: 'function';
+  function: { name: string; arguments: string };
+}
+
 export interface ChatMessage {
-  role: 'system' | 'user' | 'assistant';
+  role: 'system' | 'user' | 'assistant' | 'tool';
   content: string | ContentPart[];
+  /** assistant 发起工具调用时携带 */
+  tool_calls?: ToolCall[];
+  /** role=tool 时指向对应的调用 */
+  tool_call_id?: string;
+}
+
+export interface ChatResponse {
+  content: string;
+  toolCalls: ToolCall[];
+  finishReason?: string;
 }
 
 export interface LlmOptions {
@@ -41,6 +57,9 @@ export interface LlmOptions {
   speaker?: string;
   /** 模型上下文窗口，用来算占用率。 */
   contextWindow?: number;
+  /** OpenAI 风格的工具定义；给了就允许模型发起调用。 */
+  tools?: unknown[];
+  toolChoice?: 'auto' | 'none' | 'required';
 }
 
 export interface UsageLike {
@@ -62,11 +81,11 @@ export class LlmError extends Error {
 }
 
 /** 调一次 chat completions，返回纯文本。失败按退避重试。 */
-export async function chatComplete(
+export async function chatCompleteRaw(
   messages: ChatMessage[],
   opts: LlmOptions,
   retries = 2,
-): Promise<string> {
+): Promise<ChatResponse> {
   const url = `${opts.baseUrl.replace(/\/+$/, '')}/chat/completions`;
   const maxTokens = opts.maxTokens ?? 500;
   const temperature = opts.temperature ?? 0.9;
@@ -77,6 +96,9 @@ export async function chatComplete(
     max_tokens: maxTokens,
     stream: false,
     ...(opts.disableThinking ? { thinking: { type: 'disabled' } } : {}),
+    ...(opts.tools && opts.tools.length > 0
+      ? { tools: opts.tools, tool_choice: opts.toolChoice ?? 'auto' }
+      : {}),
   });
 
   const startedAt = Date.now();
@@ -148,12 +170,16 @@ export async function chatComplete(
         continue;
       }
       const data = (await res.json()) as {
-        choices?: Array<{ message?: { content?: string }; finish_reason?: string }>;
+        choices?: Array<{
+          message?: { content?: string; tool_calls?: ToolCall[] };
+          finish_reason?: string;
+        }>;
         usage?: UsageLike;
       };
       const choice = data.choices?.[0];
-      const text = choice?.message?.content;
-      if (typeof text !== 'string' || !text.trim()) {
+      const text = choice?.message?.content ?? '';
+      const toolCalls = choice?.message?.tool_calls ?? [];
+      if (!text.trim() && toolCalls.length === 0) {
         // 推理模型可能把预算全烧在 reasoning 上，content 就是空的
         lastError = new LlmError(`空回复（finish_reason=${choice?.finish_reason ?? '未知'}）`);
         continue;
@@ -173,7 +199,7 @@ export async function chatComplete(
           contextWindow: opts.contextWindow,
         }),
       );
-      return text.trim();
+      return { content: text.trim(), toolCalls, finishReason: choice?.finish_reason };
     } catch (error) {
       if (error instanceof LlmError && error.status && error.status < 500) {
         await recordFailure(error);
@@ -186,4 +212,17 @@ export async function chatComplete(
   }
   await recordFailure(lastError);
   throw lastError instanceof Error ? lastError : new LlmError(String(lastError));
+}
+
+/** 只取文本的调用方（看图、归纳、纯文本闲聊）用这个。 */
+export async function chatComplete(
+  messages: ChatMessage[],
+  opts: LlmOptions,
+  retries = 2,
+): Promise<string> {
+  const response = await chatCompleteRaw(messages, opts, retries);
+  if (!response.content) {
+    throw new LlmError('空回复');
+  }
+  return response.content;
 }

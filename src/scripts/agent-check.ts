@@ -6,7 +6,7 @@
  * 覆盖：@ 判定、群聊缓冲、记忆读写、以及「@ 才调模型」这条主链路。
  */
 
-import { mkdtemp, rm } from 'node:fs/promises';
+import { mkdir, mkdtemp, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 import { ChatAgent, isBotMentioned, readAgentConfig, splitReply } from '../agent/index.js';
@@ -15,7 +15,9 @@ import { GroupBuffer } from '../agent/context.js';
 import { GroupMemory } from '../agent/memory.js';
 import { PERSONA } from '../agent/persona.js';
 import { cleanQQText } from '../agent/text.js';
+import { MessageIndex, renderHits } from '../agent/search.js';
 import { buildRecord, summarize } from '../agent/telemetry.js';
+import type { ChatResponse } from '../agent/llm.js';
 import type { Bot } from '../bot.js';
 import type { QQBotInboundMessage } from '@tencent-connect/qqbot-nodejs';
 import type { AppLogger } from '../logger.js';
@@ -65,6 +67,9 @@ async function main(): Promise<void> {
     AGENT_GROUP_OPENIDS: GROUP,
     AGENT_GROUPS: GROUP,
     AGENT_CONTEXT_SIZE: '40',
+    // 主链路测试注入的是假 complete；关掉工具，避免走到真实网络。
+    // 工具链路在 [11] 单独测。
+    AGENT_TOOLS: 'false',
   } as NodeJS.ProcessEnv);
 
   console.log('\n[1] @ 判定');
@@ -211,6 +216,81 @@ async function main(): Promise<void> {
     check('统计: p50', sum.p50Ms === 5000, `实际 ${sum.p50Ms}`);
     check('统计: 平均耗时', sum.avgMs === 4500, `实际 ${sum.avgMs}`);
     check('统计: 缓存率', sum.cacheRate === 0.4, `实际 ${sum.cacheRate}`);
+
+    console.log('\n[10] 历史检索');
+    const tmp2 = await mkdtemp(path.join(tmpdir(), 'al1s-search-'));
+    const chatDir = path.join(tmp2, 'chats', 'group', GROUP);
+    await mkdir(chatDir, { recursive: true });
+    const rows = [
+      { timestamp: new Date(Date.now() - 3600_000).toISOString(), senderId: 'A1', senderName: '小明', content: '我决定退坑了 实在打不动', groupOpenid: GROUP },
+      { timestamp: new Date(Date.now() - 7200_000).toISOString(), senderId: 'A2', senderName: '小红', content: '今天晚饭吃什么', groupOpenid: GROUP },
+      { timestamp: new Date(Date.now() - 40 * 86_400_000).toISOString(), senderId: 'A1', senderName: '小明', content: '远古时期的退坑宣言', groupOpenid: GROUP },
+    ];
+    await writeFile(
+      path.join(chatDir, 'messages.jsonl'),
+      rows.map((r) => JSON.stringify(r)).join('\n') + '\n',
+      'utf8',
+    );
+
+    const index = new MessageIndex(tmp2);
+    const hits = await index.search({ query: '退坑' });
+    check('检索命中全部', hits.length === 2, `实际 ${hits.length}`);
+    check('按天数过滤', (await index.search({ query: '退坑', days: 7 })).length === 1);
+    check('按人过滤命中 0', (await index.search({ query: '退坑', sender: '小红' })).length === 0);
+    check('按人过滤命中 1', (await index.search({ query: '退坑', sender: '小明' })).length === 2);
+    check('多词需同时命中', (await index.search({ query: '退坑 晚饭' })).length === 0);
+    check('结果带时间与昵称', renderHits(hits).includes('小明') && renderHits(hits).includes('['));
+    check('空结果有兜底文案', renderHits([]).includes('没有找到'));
+
+    console.log('\n[11] 工具调用链路');
+    let round = 0;
+    const fakeRaw = async (): Promise<ChatResponse> => {
+      round += 1;
+      if (round === 1) {
+        return {
+          content: '',
+          finishReason: 'tool_calls',
+          toolCalls: [
+            { id: 'c1', type: 'function', function: { name: 'search_messages', arguments: '{"query":"退坑"}' } },
+          ],
+        };
+      }
+      return { content: '查到了 小明说要退坑', toolCalls: [], finishReason: 'stop' };
+    };
+    const toolAgent = new ChatAgent(
+      { ...config, dataRoot: tmp2, toolsEnabled: true },
+      quietLogger,
+      async () => {
+        throw new Error('不该走纯文本路径');
+      },
+      fakeRaw,
+    );
+    const toolReplies: string[] = [];
+    await toolAgent.handle(
+      makeMessage({ content: '谁说要退坑啊', mentions: [{ member_openid: BOT_OPENID, bot: true }] }),
+      {
+        replyText: async (_t: unknown, reply: string) => {
+          toolReplies.push(reply);
+        },
+      } as unknown as Bot,
+    );
+    check('工具轮次后仍回复', toolReplies.length === 1, `实际 ${toolReplies.length}`);
+    check('回复内容正确', (toolReplies[0] ?? '').includes('退坑'));
+    check('确实跑了两轮', round === 2, `实际 ${round}`);
+
+    const noToolAgent = new ChatAgent(
+      { ...config, dataRoot: tmp2, toolsEnabled: false },
+      quietLogger,
+      async () => '直接回',
+    );
+    const plain: string[] = [];
+    await noToolAgent.handle(
+      makeMessage({ content: '在吗', mentions: [{ member_openid: BOT_OPENID, bot: true }] }),
+      { replyText: async (_t: unknown, reply: string) => { plain.push(reply); } } as unknown as Bot,
+    );
+    check('关掉工具走纯文本', plain[0] === '直接回');
+
+    await rm(tmp2, { recursive: true, force: true });
   } finally {
     await rm(tmp, { recursive: true, force: true });
   }
