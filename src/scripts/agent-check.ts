@@ -139,6 +139,11 @@ async function main(): Promise<void> {
 
     console.log('\n[5] 长回复分片');
     check('短回复不切', splitReply('诶 累就早点歇').length === 1);
+    check('空行切成两条', splitReply('第一段\n\n第二段').length === 2);
+    check('单换行不切', splitReply('第一行\n第二行').length === 1);
+    check('多个空行只切一次', splitReply('甲\n\n\n\n乙').length === 2);
+    check('空行分段内容正确', splitReply('甲\n\n乙')[1] === '乙', JSON.stringify(splitReply('甲\n\n乙')));
+    check('超过上限会合并', splitReply('一\n\n二\n\n三\n\n四\n\n五').length === 3);
     const long = '第一段内容'.repeat(200) + '\n\n' + '第二段内容'.repeat(200);
     const parts = splitReply(long);
     check('长回复被切开', parts.length >= 2, `实际 ${parts.length}`);

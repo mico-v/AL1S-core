@@ -114,35 +114,63 @@ export type CompleteFn = (messages: ChatMessage[], opts: LlmOptions, retries?: n
 /** 单条消息上限（QQ 文本消息过长会被截断或发送失败）。 */
 export const MAX_REPLY_CHARS = 700;
 
-/** 长回复切成多条：优先在空行/换行/句末断开，避免劈开句子。 */
+/** 一条回复最多拆成几条消息。QQ 群被动回复 5 分钟内最多 5 次，留余量。 */
+export const MAX_REPLY_CHUNKS = 3;
+
+/**
+ * 把模型输出切成要发送的消息。
+ *
+ * 空行（两个以上换行）= 换一条消息 —— 人格提示词里就是用空行表示「分开说」。
+ * 单个换行只是行内换行，仍算同一条。
+ * 单段超长再按句末/逗号切，避免一条撑爆 QQ 的长度限制。
+ */
 export function splitReply(text: string, limit: number = MAX_REPLY_CHARS): string[] {
   const trimmed = text.trim();
   if (!trimmed) {
     return [];
   }
-  if (trimmed.length <= limit) {
-    return [trimmed];
-  }
+
+  const paragraphs = trimmed
+    .split(/\n{2,}/)
+    .map((part) => part.trim())
+    .filter(Boolean);
+
   const chunks: string[] = [];
-  let rest = trimmed;
-  while (rest.length > limit) {
-    const window = rest.slice(0, limit);
-    const breakAt = Math.max(
-      window.lastIndexOf('\n\n'),
-      window.lastIndexOf('\n'),
-      window.lastIndexOf('。'),
-      window.lastIndexOf('！'),
-      window.lastIndexOf('？'),
-      window.lastIndexOf('，'),
-    );
-    const cut = breakAt > limit * 0.5 ? breakAt + 1 : limit;
-    chunks.push(rest.slice(0, cut).trim());
-    rest = rest.slice(cut).trimStart();
+  for (const paragraph of paragraphs) {
+    if (paragraph.length <= limit) {
+      chunks.push(paragraph);
+      continue;
+    }
+    let rest = paragraph;
+    while (rest.length > limit) {
+      const window = rest.slice(0, limit);
+      const breakAt = Math.max(
+        window.lastIndexOf('\n'),
+        window.lastIndexOf('。'),
+        window.lastIndexOf('！'),
+        window.lastIndexOf('？'),
+        window.lastIndexOf('，'),
+      );
+      const cut = breakAt > limit * 0.5 ? breakAt + 1 : limit;
+      chunks.push(rest.slice(0, cut).trim());
+      rest = rest.slice(cut).trimStart();
+    }
+    if (rest) {
+      chunks.push(rest);
+    }
   }
-  if (rest) {
-    chunks.push(rest);
+
+  const nonEmpty = chunks.filter(Boolean);
+  if (nonEmpty.length <= MAX_REPLY_CHUNKS) {
+    return nonEmpty;
   }
-  return chunks.filter(Boolean);
+
+  // 条数超限时把尾巴并成一条；并完还是太长就宁可多发，也不截断内容
+  const merged = nonEmpty.slice(MAX_REPLY_CHUNKS - 1).join('\n');
+  if (merged.length <= limit) {
+    return [...nonEmpty.slice(0, MAX_REPLY_CHUNKS - 1), merged];
+  }
+  return nonEmpty;
 }
 
 interface Scope {
