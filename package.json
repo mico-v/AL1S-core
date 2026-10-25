@@ -17,6 +17,7 @@
     "agent:try": "tsx src/scripts/agent-try.ts",
     "agent:learn": "tsx --env-file=.env src/scripts/agent-learn.ts",
     "agent:stats": "tsx --env-file=.env src/scripts/agent-stats.ts",
+    "agent:digest": "tsx --env-file=.env src/scripts/agent-digest.ts",
     "qq:check": "tsx src/scripts/qq-check.ts",
     "deploy:server": "bash deploy/deploy-server.sh",
     "webhook:check": "tsx src/scripts/webhook-check.ts",

@@ -11,6 +11,7 @@ import type { QQBotInboundMessage } from '@tencent-connect/qqbot-nodejs';
 import type { Bot } from '../bot.js';
 import type { AppLogger } from '../logger.js';
 import { GroupBuffer, renderBuffer } from './context.js';
+import { DigestEngine } from './digest.js';
 import {
   chatComplete,
   chatCompleteRaw,
@@ -43,6 +44,10 @@ export interface AgentConfig {
   directEnabled: boolean;
   /** 是否允许模型调用工具（查历史、查档案）。 */
   toolsEnabled: boolean;
+  /** 对话摘要：累积到多少条归档一次；0 表示关闭。 */
+  digestThreshold: number;
+  /** 单次摘要最多喂多少条。 */
+  digestMaxBatch: number;
   /** 调用审计。 */
   callLog: {
     enabled: boolean;
@@ -77,6 +82,8 @@ export function readAgentConfig(env: NodeJS.ProcessEnv): AgentConfig {
     ownerOpenids: list(env.AGENT_OWNER_OPENIDS),
     directEnabled: env.AGENT_DIRECT_ENABLED !== 'false',
     toolsEnabled: env.AGENT_TOOLS !== 'false',
+    digestThreshold: Number(env.AGENT_DIGEST_THRESHOLD ?? 40),
+    digestMaxBatch: Number(env.AGENT_DIGEST_MAX_BATCH ?? 120),
     callLog: {
       enabled: env.AGENT_CALL_LOG !== 'false',
       dir: env.AGENT_CALL_LOG_DIR ?? './data/calls',
@@ -202,6 +209,7 @@ export class ChatAgent {
   private readonly members = new Map<string, GroupMemory>();
   private readonly complete: CompleteFn;
   private readonly completeRaw: RawCompleteFn;
+  private readonly digest: DigestEngine;
   /** 同一会话串行处理，避免同一群里两条 @ 并发抢回复。 */
   private readonly chains = new Map<string, Promise<void>>();
 
@@ -210,12 +218,40 @@ export class ChatAgent {
     log: AppLogger,
     complete: CompleteFn = chatComplete,
     completeRaw: RawCompleteFn = chatCompleteRaw,
+    hooks: { onMemoryWorthy?: (chatId: string, note: string) => void } = {},
   ) {
     this.config = config;
     this.log = log;
     this.complete = complete;
     this.completeRaw = completeRaw;
     this.buffer = new GroupBuffer(config.contextSize);
+    this.digest = new DigestEngine({
+      dataRoot: config.dataRoot,
+      llm: config.llm,
+      log,
+      threshold: config.digestThreshold > 0 ? config.digestThreshold : 40,
+      maxBatch: config.digestMaxBatch,
+      onMemoryWorthy: hooks.onMemoryWorthy,
+    });
+  }
+
+  /** 定时兜底：群里安静下来、没到阈值时也把已有的对话归档掉。 */
+  async runDigestSweep(chatIds: string[]): Promise<number> {
+    let count = 0;
+    for (const chatId of chatIds) {
+      try {
+        const due = await this.digest.dueCount(chatId);
+        if (due >= this.config.digestThreshold) {
+          const record = await this.digest.digest(chatId);
+          if (record) {
+            count += 1;
+          }
+        }
+      } catch (error) {
+        this.log.warn('摘要巡检失败', { chatId, error });
+      }
+    }
+    return count;
   }
 
   /**
@@ -322,6 +358,11 @@ export class ChatAgent {
     if (withoutMentions.startsWith('/')) {
       this.log.debug('忽略命令类消息', { conversationId: scope.conversationId, text: withoutMentions.slice(0, 40) });
       return;
+    }
+
+    // 每条群消息都计数，累积到阈值就后台归档（不阻塞回复）
+    if (!scope.isDirect && this.config.digestThreshold > 0) {
+      this.digest.observe(scope.conversationId);
     }
 
     const called = scope.isDirect || isBotMentioned(message, this.config);

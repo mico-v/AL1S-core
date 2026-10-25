@@ -5,9 +5,11 @@
  * 在 `bot.onMessage` 之上叠加，不修改这里的连接层。
  */
 
+import { readdir } from 'node:fs/promises';
+import path from 'node:path';
 import { ChatAgent, readAgentConfig } from './agent/index.js';
 import { configureTelemetry } from './agent/telemetry.js';
-import { learnAllGroups } from './agent/updater.js';
+import { learnAllGroups, learnGroup } from './agent/updater.js';
 import { Bot } from './bot.js';
 import { ConfigError, loadConfig } from './config.js';
 import { createLogger } from './logger.js';
@@ -27,7 +29,18 @@ try {
     contextWindow: agentConfig.callLog.contextWindow,
     log,
   });
-  agent = new ChatAgent(agentConfig, log);
+  agent = new ChatAgent(agentConfig, log, undefined, undefined, {
+    // 归档时发现值得长期记住的事 → 顺手更新这个群的成员档案
+    onMemoryWorthy: (chatId) => {
+      void learnGroup({ dataRoot: agentConfig.dataRoot, llm: agentConfig.llm }, chatId, log)
+        .then((result) => {
+          if (result.written > 0) {
+            log.info('归档触发档案更新', { chatId, written: result.written });
+          }
+        })
+        .catch((error: unknown) => log.warn('归档触发档案更新失败', { chatId, error }));
+    },
+  });
   log.info('聊天 agent', {
     enabled: agentConfig.enabled,
     model: agentConfig.llm.model,
@@ -57,6 +70,32 @@ try {
       }, learnEveryMs);
       timer.unref();
       log.info('已开启档案定时归纳', { intervalMs: learnEveryMs });
+    }
+  }
+
+  // 群里安静下来、没到阈值时兜底归档一次
+  if (agentConfig.enabled && agentConfig.digestThreshold > 0) {
+    const sweepMs = Number(process.env.AGENT_DIGEST_SWEEP_MS ?? 10 * 60 * 1000);
+    if (sweepMs > 0) {
+      const timer = setInterval(() => {
+        void (async () => {
+          try {
+            let groups = agentConfig.groupAllowlist;
+            if (groups.length === 0) {
+              const dir = path.join(agentConfig.dataRoot, 'memory');
+              groups = await readdir(dir).catch(() => [] as string[]);
+            }
+            const done = await agent.runDigestSweep(groups);
+            if (done > 0) {
+              log.info('摘要巡检完成', { digested: done });
+            }
+          } catch (error) {
+            log.warn('摘要巡检失败', { error });
+          }
+        })();
+      }, sweepMs);
+      timer.unref();
+      log.info('已开启对话归档巡检', { intervalMs: sweepMs, threshold: agentConfig.digestThreshold });
     }
   }
 

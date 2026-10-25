@@ -53,6 +53,34 @@ export const TOOL_DEFINITIONS: unknown[] = [
   {
     type: 'function',
     function: {
+      name: 'search_topics',
+      description:
+        '在「话题索引」里检索：每轮群聊归档时生成的话题条目（标题+关键词+一句话）。问「之前聊过什么」「有没有聊过 X」时先查这里，比逐条翻消息快。',
+      parameters: {
+        type: 'object',
+        properties: {
+          query: { type: 'string', description: '话题关键词，留空则返回最近所有话题' },
+        },
+      },
+    },
+  },
+  {
+    type: 'function',
+    function: {
+      name: 'recent_digests',
+      description: '读最近的对话摘要：每一段群聊聊了什么、气氛如何。适合回答「昨天群里聊了啥」。',
+      parameters: {
+        type: 'object',
+        properties: {
+          days: { type: 'number', description: '最近几天，默认 7' },
+          limit: { type: 'number', description: '最多几条，默认 5' },
+        },
+      },
+    },
+  },
+  {
+    type: 'function',
+    function: {
       name: 'chat_stats',
       description: '群聊整体统计：消息总数、时间跨度、谁说话最多。适合回答「群里最近活跃吗」这类问题。',
       parameters: { type: 'object', properties: {} },
@@ -142,6 +170,126 @@ async function chatStats(ctx: ToolContext): Promise<string> {
     .join('\n');
 }
 
+
+interface TopicEntry {
+  title: string;
+  keywords: string[];
+  summary?: string;
+  count: number;
+  firstAt: string;
+  lastAt: string;
+}
+
+interface DigestEntry {
+  day: string;
+  from: string;
+  to: string;
+  count: number;
+  participants: string[];
+  summary: string;
+  topics?: Array<{ title: string }>;
+}
+
+/** 列出可用的摘要目录（指定群，或全部群）。 */
+async function digestDirs(ctx: ToolContext): Promise<string[]> {
+  const memory = path.join(ctx.dataRoot, 'memory');
+  if (!existsSync(memory)) {
+    return [];
+  }
+  const groups = ctx.groupId ? [ctx.groupId] : await readdir(memory);
+  const dirs: string[] = [];
+  for (const group of groups) {
+    const dir = path.join(memory, group, 'digest');
+    if (existsSync(dir)) {
+      dirs.push(dir);
+    }
+  }
+  return dirs;
+}
+
+async function searchTopics(ctx: ToolContext, query: string): Promise<string> {
+  const dirs = await digestDirs(ctx);
+  const wanted = query.trim().toLowerCase();
+  const hits: TopicEntry[] = [];
+
+  for (const dir of dirs) {
+    const file = path.join(dir, 'topics.json');
+    if (!existsSync(file)) {
+      continue;
+    }
+    let list: TopicEntry[] = [];
+    try {
+      list = JSON.parse(await readFile(file, 'utf8')) as TopicEntry[];
+    } catch {
+      continue;
+    }
+    for (const topic of list) {
+      if (!wanted) {
+        hits.push(topic);
+        continue;
+      }
+      const haystack = `${topic.title} ${topic.keywords.join(' ')} ${topic.summary ?? ''}`.toLowerCase();
+      if (haystack.includes(wanted)) {
+        hits.push(topic);
+      }
+    }
+  }
+
+  if (hits.length === 0) {
+    return wanted ? '话题索引里没有匹配的条目。' : '还没有任何话题归档。';
+  }
+  hits.sort((a, b) => b.lastAt.localeCompare(a.lastAt));
+  return hits
+    .slice(0, 10)
+    .map((t) => {
+      const span = `${t.firstAt.slice(5, 10)}~${t.lastAt.slice(5, 10)}`;
+      const kw = t.keywords.length > 0 ? ` · 关键词 ${t.keywords.join('、')}` : '';
+      return `「${t.title}」${t.count} 次 · ${span}${kw}${t.summary ? ` · ${t.summary}` : ''}`;
+    })
+    .join('\n');
+}
+
+async function recentDigests(ctx: ToolContext, days: number, limit: number): Promise<string> {
+  const dirs = await digestDirs(ctx);
+  const since = Date.now() - Math.max(1, days) * 86_400_000;
+  const rows: DigestEntry[] = [];
+
+  for (const dir of dirs) {
+    const file = path.join(dir, 'records.jsonl');
+    if (!existsSync(file)) {
+      continue;
+    }
+    const raw = await readFile(file, 'utf8');
+    for (const line of raw.split('\n')) {
+      if (!line.trim()) {
+        continue;
+      }
+      try {
+        const record = JSON.parse(line) as DigestEntry;
+        if (Date.parse(record.to) >= since) {
+          rows.push(record);
+        }
+      } catch {
+        // 坏行跳过
+      }
+    }
+  }
+
+  if (rows.length === 0) {
+    return `最近 ${days} 天没有对话归档。`;
+  }
+  rows.sort((a, b) => b.to.localeCompare(a.to));
+  return rows
+    .slice(0, Math.max(1, limit))
+    .map((r) => {
+      const span = `${r.from.slice(5, 16).replace('T', ' ')} → ${r.to.slice(11, 16)}`;
+      const who = r.participants.slice(0, 4).join('、');
+      const topics = (r.topics ?? []).map((t) => t.title).join(' / ');
+      return `[${span}] ${r.summary}${topics ? `\n  话题：${topics}` : ''}${who ? `\n  在场：${who}` : ''}`;
+    })
+    .join('\n\n');
+}
+
 export async function executeTool(name: string, rawArgs: string, ctx: ToolContext): Promise<string> {
   const args = safeParse(rawArgs);
   try {
@@ -162,6 +310,12 @@ export async function executeTool(name: string, rawArgs: string, ctx: ToolContex
     }
     if (name === 'member_profile') {
       return await memberProfile(ctx, asString(args.name));
+    }
+    if (name === 'search_topics') {
+      return await searchTopics(ctx, asString(args.query));
+    }
+    if (name === 'recent_digests') {
+      return await recentDigests(ctx, asNumber(args.days) ?? 7, asNumber(args.limit) ?? 5);
     }
     if (name === 'chat_stats') {
       return await chatStats(ctx);

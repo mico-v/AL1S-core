@@ -15,7 +15,9 @@ import { GroupBuffer } from '../agent/context.js';
 import { GroupMemory } from '../agent/memory.js';
 import { PERSONA } from '../agent/persona.js';
 import { cleanQQText } from '../agent/text.js';
+import { DigestEngine } from '../agent/digest.js';
 import { MessageIndex, renderHits } from '../agent/search.js';
+import { executeTool } from '../agent/tools.js';
 import { buildRecord, summarize } from '../agent/telemetry.js';
 import type { ChatResponse } from '../agent/llm.js';
 import type { Bot } from '../bot.js';
@@ -291,6 +293,106 @@ async function main(): Promise<void> {
     check('关掉工具走纯文本', plain[0] === '直接回');
 
     await rm(tmp2, { recursive: true, force: true });
+
+    console.log('\n[12] 对话归档与话题索引');
+    const tmp3 = await mkdtemp(path.join(tmpdir(), 'al1s-digest-'));
+    const digestChat = path.join(tmp3, 'chats', 'group', GROUP);
+    await mkdir(digestChat, { recursive: true });
+    const base = Date.parse('2026-10-20T20:00:00+08:00');
+    const conversation = Array.from({ length: 12 }, (_, i) =>
+      JSON.stringify({
+        messageId: `d${i}`,
+        timestamp: new Date(base + i * 60_000).toISOString(),
+        senderId: i % 2 === 0 ? 'A1' : 'A2',
+        senderName: i % 2 === 0 ? '小明' : '小红',
+        content: i === 3 ? '我们周末去爬泰山吧' : `闲聊第 ${i + 1} 句`,
+        groupOpenid: GROUP,
+      }),
+    ).join('\n') + '\n';
+    await writeFile(path.join(digestChat, 'messages.jsonl'), conversation, 'utf8');
+
+    let digestCalls = 0;
+    const fakeDigest = async (): Promise<string> => {
+      digestCalls += 1;
+      return JSON.stringify({
+        summary: '一群人在闲聊，中途说起周末去爬泰山。',
+        topics: [
+          { title: '周末爬泰山', keywords: ['泰山', '周末'], summary: '定了周六出发' },
+          { title: '日常闲聊', keywords: ['闲聊'], summary: '没什么正事' },
+        ],
+        note: '约好周六爬泰山',
+      });
+    };
+
+    const notes: string[] = [];
+    const engine = new DigestEngine({
+      dataRoot: tmp3,
+      llm: config.llm,
+      log: quietLogger,
+      threshold: 10,
+      maxBatch: 120,
+      complete: fakeDigest,
+      onMemoryWorthy: (_chatId, note) => notes.push(note),
+    });
+
+    const due = await engine.dueCount(GROUP);
+    check('水位线统计新消息', due === 12, `实际 ${due}`);
+
+    const record = await engine.digest(GROUP);
+    check('产出摘要', !!record && record.count === 12, `count=${record?.count}`);
+    check('摘要非空', (record?.summary ?? '').includes('泰山'));
+    check('话题数量正确', record?.topics.length === 2, `实际 ${record?.topics.length}`);
+    check('值得记的事触发回调', notes.length === 1 && (notes[0] ?? '').includes('泰山'));
+    check('只调用一次模型', digestCalls === 1, `实际 ${digestCalls}`);
+
+    const again = await engine.dueCount(GROUP);
+    check('归档后水位线推进', again === 0, `实际 ${again}`);
+    check('重复触发无新摘要', (await engine.digest(GROUP)) === undefined);
+
+    const topics = await engine.readTopics(GROUP);
+    check('话题写入索引', topics.length === 2, `实际 ${topics.length}`);
+    check('话题带次数与时间', topics[0]?.count === 1 && !!topics[0]?.lastAt);
+
+    const recent = await engine.readDigests(GROUP, 5);
+    check('摘要可回读', recent.length === 1 && (recent[0]?.summary ?? '').includes('泰山'));
+
+    // 第二轮：同一话题应合并计数，而不是新增
+    await writeFile(
+      path.join(digestChat, 'messages.jsonl'),
+      conversation +
+        Array.from({ length: 10 }, (_, i) =>
+          JSON.stringify({
+            messageId: `e${i}`,
+            timestamp: new Date(base + (20 + i) * 60_000).toISOString(),
+            senderId: 'A1',
+            senderName: '小明',
+            content: `泰山装备第 ${i + 1} 条`,
+            groupOpenid: GROUP,
+          }),
+        ).join('\n') + '\n',
+      'utf8',
+    );
+    await engine.digest(GROUP);
+    const merged = await engine.readTopics(GROUP);
+    const taishan = merged.find((t) => t.title === '周末爬泰山');
+    check('同话题合并计数', taishan?.count === 2, `实际 ${taishan?.count}`);
+    check('索引不重复', merged.length === 2, `实际 ${merged.length}`);
+
+    // 话题检索
+    const topicTool = await executeTool('search_topics', '{"query":"泰山"}', {
+      dataRoot: tmp3,
+      groupId: GROUP,
+      log: quietLogger,
+    });
+    check('工具能搜到话题', topicTool.includes('周末爬泰山'));
+    const digestTool = await executeTool('recent_digests', '{"days":30}', {
+      dataRoot: tmp3,
+      groupId: GROUP,
+      log: quietLogger,
+    });
+    check('工具能读摘要', digestTool.includes('泰山'));
+
+    await rm(tmp3, { recursive: true, force: true });
   } finally {
     await rm(tmp, { recursive: true, force: true });
   }
