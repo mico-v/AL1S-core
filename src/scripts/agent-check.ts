@@ -15,6 +15,7 @@ import { GroupBuffer } from '../agent/context.js';
 import { GroupMemory } from '../agent/memory.js';
 import { PERSONA } from '../agent/persona.js';
 import { cleanQQText } from '../agent/text.js';
+import { matchCommand, renderStatus } from '../agent/commands.js';
 import { DigestEngine } from '../agent/digest.js';
 import { MessageIndex, renderHits } from '../agent/search.js';
 import { executeTool } from '../agent/tools.js';
@@ -393,6 +394,40 @@ async function main(): Promise<void> {
     check('工具能读摘要', digestTool.includes('泰山'));
 
     await rm(tmp3, { recursive: true, force: true });
+
+    console.log('\n[13] 指令 /status');
+    check('识别 /status', matchCommand('/status') === 'status');
+    check('识别裸 status', matchCommand('status') === 'status');
+    check('大小写不敏感', matchCommand(' /STATUS ') === 'status');
+    check('不误伤别家命令', matchCommand('/课表') === undefined);
+    check('不误伤聊天', matchCommand('今天状态不好') === undefined);
+
+    const statusText = await renderStatus({
+      chatId: GROUP,
+      dataRoot: tmp3,
+      bufferLines: 12,
+      bufferLimit: 40,
+      model: 'deepseek-v4.1-flash',
+      contextWindow: 128000,
+      startedAt: Date.now() - 3660_000,
+    });
+    check('状态含模型名', statusText.includes('deepseek-v4.1-flash'));
+    check('状态含缓冲用量', statusText.includes('12/40'));
+    check('状态含消息数', /本群消息 [\d,]+ 条/.test(statusText));
+    check('状态含运行时长', statusText.includes('小时'));
+    check('状态含缓存命中', statusText.includes('缓存命中'));
+
+    // 指令必须绕开模型
+    const cmdAgent = new ChatAgent({ ...config, dataRoot: tmp3 }, quietLogger, async () => {
+      throw new Error('指令不该调模型');
+    });
+    const cmdReplies: string[] = [];
+    await cmdAgent.handle(
+      makeMessage({ content: '/status' }),
+      { replyText: async (_t: unknown, reply: string) => { cmdReplies.push(reply); } } as unknown as Bot,
+    );
+    check('指令有回复', cmdReplies.length === 1, `实际 ${cmdReplies.length}`);
+    check('指令回复是状态', (cmdReplies[0] ?? '').includes('buff') === false && (cmdReplies[0] ?? '').includes('模型'));
   } finally {
     await rm(tmp, { recursive: true, force: true });
   }

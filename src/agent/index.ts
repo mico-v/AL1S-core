@@ -10,6 +10,7 @@
 import type { QQBotInboundMessage } from '@tencent-connect/qqbot-nodejs';
 import type { Bot } from '../bot.js';
 import type { AppLogger } from '../logger.js';
+import { matchCommand, renderStatus } from './commands.js';
 import { GroupBuffer, renderBuffer } from './context.js';
 import { DigestEngine } from './digest.js';
 import {
@@ -210,6 +211,7 @@ export class ChatAgent {
   private readonly complete: CompleteFn;
   private readonly completeRaw: RawCompleteFn;
   private readonly digest: DigestEngine;
+  private readonly startedAt = Date.now();
   /** 同一会话串行处理，避免同一群里两条 @ 并发抢回复。 */
   private readonly chains = new Map<string, Promise<void>>();
 
@@ -354,6 +356,23 @@ export class ChatAgent {
     if (message.senderIsBot || (!text && !hasAttachments)) {
       return;
     }
+    // 自己的指令：不走模型，立刻回
+    const command = matchCommand(withoutMentions);
+    if (command !== undefined) {
+      const body = await renderStatus({
+        chatId: scope.conversationId,
+        dataRoot: this.config.dataRoot,
+        bufferLines: scope.isDirect ? 0 : this.buffer.peek(scope.conversationId).length,
+        bufferLimit: this.config.contextSize,
+        model: this.config.llm.model,
+        contextWindow: this.config.callLog.contextWindow,
+        startedAt: this.startedAt,
+      });
+      await bot.replyText(scope.replyTarget, body);
+      this.log.info('指令', { command, conversationId: scope.conversationId });
+      return;
+    }
+
     // 别的机器人的命令（@课表Bot /课表 也算）
     if (withoutMentions.startsWith('/')) {
       this.log.debug('忽略命令类消息', { conversationId: scope.conversationId, text: withoutMentions.slice(0, 40) });

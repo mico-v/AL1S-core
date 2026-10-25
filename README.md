@@ -82,6 +82,24 @@ src/scripts/webhook-check.ts  webhook 端到端自检
 
 `pnpm agent:try --image <文件> "这图什么意思"` 可以本地验证整条链路。
 
+### 指令
+
+注册了官方群聊**指令面板**（`/v2/panels`，`scope=group`），点一下就把指令填进输入框。
+
+| 指令 | 返回 |
+| --- | --- |
+| `/status` | 模型名、本群消息数、缓冲与上轮上下文占用、调用次数与 token、缓存命中、平均/p95 延迟、话题数、运行时长 |
+
+- 指令**不走模型**，本地读数据，0.2 秒内应答；
+- 其他 `/` 开头的消息仍按「别人的机器人命令」忽略，只有白名单里的才执行；
+- 面板里 QQ 会把元素名规范成不带斜杠的 `status`，所以两种写法都识别。
+
+```bash
+pnpm qq:panel          # 注册/更新，作用于 AGENT_GROUPS
+pnpm qq:panel --all    # 对所有群生效
+pnpm qq:panel --list   # 查看现有面板
+```
+
 ### 对话归档
 
 群聊不是只靠 40 条缓冲 —— 累积到 `AGENT_DIGEST_THRESHOLD`（默认 40 条）就压缩一次：
