@@ -99,6 +99,36 @@ try {
     }
   }
 
+  // 主动参与：默认关；开启后按冷却与断裂判据决定要不要接一句
+  if (agentConfig.enabled && agentConfig.proactive.enabled) {
+    const proactiveMs = Number(process.env.AGENT_PROACTIVE_INTERVAL_MS ?? 5 * 60 * 1000);
+    if (proactiveMs > 0) {
+      const timer = setInterval(() => {
+        void (async () => {
+          try {
+            let groups = agentConfig.groupAllowlist;
+            if (groups.length === 0) {
+              const dir = path.join(agentConfig.dataRoot, 'memory');
+              groups = await readdir(dir).catch(() => [] as string[]);
+            }
+            const spoken = await agent.runProactiveSweep(bot, groups);
+            if (spoken > 0) {
+              log.info('主动巡检：已发言', { spoken });
+            }
+          } catch (error) {
+            log.warn('主动巡检失败', { error });
+          }
+        })();
+      }, proactiveMs);
+      timer.unref();
+      log.info('已开启主动参与', {
+        intervalMs: proactiveMs,
+        cooldownMs: agentConfig.proactive.cooldownMs,
+        groups: agentConfig.proactive.groups.length,
+      });
+    }
+  }
+
   log.info('配置已加载', {
     appId: config.appId,
     accountId: config.accountId,

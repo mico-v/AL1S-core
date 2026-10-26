@@ -13,6 +13,7 @@ import type { AppLogger } from '../logger.js';
 import { matchCommand, renderStatus } from './commands.js';
 import { GroupBuffer, renderBuffer } from './context.js';
 import { DigestEngine } from './digest.js';
+import { judgeProactive } from './proactive.js';
 import {
   chatComplete,
   chatCompleteRaw,
@@ -49,6 +50,18 @@ export interface AgentConfig {
   digestThreshold: number;
   /** 单次摘要最多喂多少条。 */
   digestMaxBatch: number;
+  /** 主动参与（默认为关）。 */
+  proactive: {
+    enabled: boolean;
+    /** 只在哪些群主动；空数组表示跟随 groupAllowlist。 */
+    groups: string[];
+    /** 两次主动发言之间至少隔多久。 */
+    cooldownMs: number;
+    /** 至少积累多少条再判断。 */
+    minLines: number;
+    /** 最后一条消息距今超过这个时间就不接（话题已经凉了）。 */
+    staleMs: number;
+  };
   /** 调用审计。 */
   callLog: {
     enabled: boolean;
@@ -85,6 +98,13 @@ export function readAgentConfig(env: NodeJS.ProcessEnv): AgentConfig {
     toolsEnabled: env.AGENT_TOOLS !== 'false',
     digestThreshold: Number(env.AGENT_DIGEST_THRESHOLD ?? 40),
     digestMaxBatch: Number(env.AGENT_DIGEST_MAX_BATCH ?? 120),
+    proactive: {
+      enabled: env.AGENT_PROACTIVE === 'true',
+      groups: list(env.AGENT_PROACTIVE_GROUPS),
+      cooldownMs: Number(env.AGENT_PROACTIVE_COOLDOWN_MS ?? 30 * 60 * 1000),
+      minLines: Number(env.AGENT_PROACTIVE_MIN_LINES ?? 8),
+      staleMs: Number(env.AGENT_PROACTIVE_STALE_MS ?? 15 * 60 * 1000),
+    },
     callLog: {
       enabled: env.AGENT_CALL_LOG !== 'false',
       dir: env.AGENT_CALL_LOG_DIR ?? './data/calls',
@@ -255,6 +275,8 @@ export class ChatAgent {
   private readonly startedAt = Date.now();
   /** 处理门分状态计数：drop / store / process */
   private readonly modes = { drop: 0, store: 0, process: 0 };
+  /** 每个群上次主动发言的时间（冷却用） */
+  private readonly lastProactiveAt = new Map<string, number>();
   /** 同一会话串行处理，避免同一群里两条 @ 并发抢回复。 */
   private readonly chains = new Map<string, Promise<void>>();
 
@@ -302,6 +324,67 @@ export class ChatAgent {
   }
 
   /**
+   * 主动参与巡检：判断有没有群聊卡住、值不值得接一句。
+   *
+   * 默认关闭（config.proactive.enabled）；开启后也受冷却与最小条数约束。
+   * 判断失败、理由为空、内容为空，一律不发言。
+   */
+  async runProactiveSweep(bot: Bot, chatIds: string[]): Promise<number> {
+    if (!this.config.proactive.enabled) {
+      return 0;
+    }
+    let spoken = 0;
+    for (const chatId of chatIds) {
+      const allowed =
+        this.config.proactive.groups.length === 0
+          ? true
+          : this.config.proactive.groups.includes(chatId);
+      if (!allowed) {
+        continue;
+      }
+      const lines = this.buffer.peek(chatId);
+      if (lines.length < this.config.proactive.minLines) {
+        continue;
+      }
+      const lastAt = this.buffer.lastMessageAt(chatId) ?? 0;
+      if (Date.now() - lastAt > this.config.proactive.staleMs) {
+        continue;
+      }
+      const lastSpoke = this.lastProactiveAt.get(chatId) ?? 0;
+      if (Date.now() - lastSpoke < this.config.proactive.cooldownMs) {
+        continue;
+      }
+
+      const decision = await judgeProactive(
+        { groupId: chatId, lines },
+        { complete: this.complete, llm: this.config.llm, log: this.log },
+      );
+      if (!decision.speak || !decision.text) {
+        this.log.debug('主动判断：不说话', { chatId, reason: decision.reason });
+        continue;
+      }
+      try {
+        const chunks = splitReply(decision.text);
+        for (let i = 0; i < chunks.length; i += 1) {
+          await bot.replyText(
+            { scope: 'group', targetId: chatId } as unknown as Parameters<Bot['replyText']>[0],
+            chunks[i] as string,
+          );
+          if (i < chunks.length - 1) {
+            await new Promise((resolve) => setTimeout(resolve, 350));
+          }
+        }
+        this.lastProactiveAt.set(chatId, Date.now());
+        spoken += 1;
+        this.log.info('主动发言', { chatId, reason: decision.reason, chars: decision.text.length });
+      } catch (error) {
+        this.log.warn('主动发言失败', { chatId, error });
+      }
+    }
+    return spoken;
+  }
+
+  /**
    * 跑一轮对话，允许模型中途调工具。
    *
    * 回合上限 3：查历史 / 查档案 / 再补一次，足够覆盖真实提问，
@@ -317,6 +400,8 @@ export class ChatAgent {
       // 私聊没有群 id，就搜全部历史，否则会一条都搜不到
       groupId: chatId,
       log: this.log,
+      complete: this.complete,
+      llm: { ...this.config.llm, purpose: 'expand' },
     };
 
     let convo = [...messages];

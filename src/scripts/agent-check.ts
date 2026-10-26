@@ -18,7 +18,9 @@ import { cleanQQText } from '../agent/text.js';
 import { matchCommand, renderStatus } from '../agent/commands.js';
 import { DigestEngine, DRIFT_THRESHOLD, topicDrift } from '../agent/digest.js';
 import { MessageIndex, renderHits } from '../agent/search.js';
-import { executeTool } from '../agent/tools.js';
+import { executeTool, expandQuery } from '../agent/tools.js';
+import { buildProactiveMessages, judgeProactive, parseProactive } from '../agent/proactive.js';
+import { learnSystem } from '../agent/updater.js';
 import { buildRecord, summarize } from '../agent/telemetry.js';
 import type { ChatResponse } from '../agent/llm.js';
 import type { Bot } from '../bot.js';
@@ -450,6 +452,86 @@ async function main(): Promise<void> {
   } finally {
     await rm(tmp, { recursive: true, force: true });
   }
+
+  console.log('\n[14] 主动参与的判断');
+  check('解析正常 JSON', parseProactive('{"speak":true,"reason":"有人提问没人接","text":"八点开吗"}').speak);
+  const silent = parseProactive('{"speak":false,"reason":"聊得正热闹","text":""}');
+  check('不说话时不带文本', !silent.speak && silent.reason.includes('热闹'));
+  check('说话但没内容 → 沉默', !parseProactive('{"speak":true,"reason":"x","text":""}').speak);
+  check('带围栏也能解析', parseProactive('```json\n{"speak":true,"reason":"r","text":"来看看"}\n```').speak);
+  check('乱码 → 沉默', !parseProactive('我觉得可以说两句').speak);
+  const proactivePrompt = JSON.stringify(buildProactiveMessages({
+    groupId: GROUP,
+    lines: [
+      { senderName: '甲', text: '今晚打本吗', timestamp: Date.now() },
+      { senderName: '乙', text: '谁有钥匙', timestamp: Date.now() },
+      { senderName: '丙', text: '我没有', timestamp: Date.now() },
+      { senderName: '甲', text: '那算了', timestamp: Date.now() },
+    ],
+  }));
+  check('提示词含断裂判据', proactivePrompt.includes('没人回答'));
+  check('提示词要求不当主持人', proactivePrompt.includes('主持人'));
+  let proactiveCalls = 0;
+  const quiet = await judgeProactive(
+    { groupId: GROUP, lines: [{ senderName: '甲', text: '在', timestamp: Date.now() }] },
+    {
+      complete: async () => {
+        proactiveCalls += 1;
+        return '{"speak":true,"reason":"x","text":"我来了"}';
+      },
+      llm: config.llm,
+      log: quietLogger,
+    },
+  );
+  check('发言太少不调模型', !quiet.speak && proactiveCalls === 0);
+
+  console.log('\n[15] 检索同义扩展');
+  const expandTmp = await mkdtemp(path.join(tmpdir(), 'al1s-expand-'));
+  try {
+    const group = 'expand-group';
+    const dir = path.join(expandTmp, 'chats', 'group', group);
+    await mkdir(dir, { recursive: true });
+    await writeFile(
+      path.join(dir, 'messages.jsonl'),
+      [
+        JSON.stringify({ messageId: 'h1', timestamp: '2026-10-20T10:00:00Z', senderId: 'u1', senderName: '星落夕', content: '我下周就不玩了，afk 一段时间' }),
+        JSON.stringify({ messageId: 'h2', timestamp: '2026-10-20T10:01:00Z', senderId: 'u2', senderName: '落樱', content: '好的 等你回来' }),
+      ].join('\n') + '\n',
+      'utf8',
+    );
+    const ctx = {
+      dataRoot: expandTmp,
+      groupId: group,
+      log: quietLogger,
+      llm: config.llm,
+      complete: async () => '不玩了、弃游、afk',
+    };
+    const miss = await executeTool('search_messages', '{"query":"退坑"}', ctx);
+    check('原词没命中时走扩展', miss.includes('afk') && miss.includes('近义说法'));
+    check('扩展后能捞到真消息', miss.includes('星落夕'));
+    check('缓存后不再问模型', (await expandQuery(ctx, '退坑')).length > 0);
+    const direct = await executeTool('search_messages', '{"query":"afk"}', {
+      ...ctx,
+      complete: async () => {
+        throw new Error('命中就不该扩展');
+      },
+    });
+    check('直接命中不扩展', direct.includes('星落夕') && !direct.includes('近义说法'));
+    const nothing = await executeTool('search_messages', '{"query":"量子力学"}', {
+      ...ctx,
+      complete: async () => '量子物理、波函数',
+    });
+    check('扩展也没命中就如实说', nothing.includes('没有命中'));
+  } finally {
+    await rm(expandTmp, { recursive: true, force: true });
+  }
+
+  console.log('\n[16] 记忆带时间');
+  const today = '2026-10-26';
+  const learnPrompt = learnSystem(today);
+  check('提示词带今天日期', learnPrompt.includes(today));
+  check('要求标时间区间', learnPrompt.includes('~ )') || learnPrompt.includes('~ ）'));
+  check('不删旧条目', learnPrompt.includes('不要删旧条目'));
 
   console.log(failures === 0 ? '\n全部通过\n' : `\n${failures} 项失败\n`);
   process.exit(failures === 0 ? 0 : 1);

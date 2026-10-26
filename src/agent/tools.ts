@@ -8,6 +8,7 @@ import { existsSync } from 'node:fs';
 import { readdir, readFile } from 'node:fs/promises';
 import path from 'node:path';
 import type { AppLogger } from '../logger.js';
+import type { ChatMessage, LlmOptions } from './llm.js';
 import { MessageIndex, renderHits } from './search.js';
 
 export interface ToolContext {
@@ -15,6 +16,9 @@ export interface ToolContext {
   /** 当前会话（群 openid）；搜历史时默认只看这个群 */
   groupId?: string;
   log: AppLogger;
+  /** 用来做同义扩展；没有就退回纯子串匹配 */
+  complete?: (messages: ChatMessage[], opts: LlmOptions) => Promise<string>;
+  llm?: LlmOptions;
 }
 
 export const TOOL_DEFINITIONS: unknown[] = [
@@ -290,6 +294,46 @@ async function recentDigests(ctx: ToolContext, days: number, limit: number): Pro
     .join('\n\n');
 }
 
+/** 同义扩展缓存：同一个查询只问一次模型。 */
+const expansionCache = new Map<string, string[]>();
+
+const EXPAND_PROMPT = `把用户给的中文关键词扩展成群里可能用的其他说法（同义词、别称、口语、黑话）。
+只输出词组，用顿号分隔，2~4 个，不要解释，不要重复原词。
+例：退坑 → 不玩了、弃游、afk`;
+
+/**
+ * 中文同义扩展：子串匹配搜不到「不玩了」，但人问的是「退坑」。
+ * 只在第一次没命中时才调用，控制成本。
+ */
+export async function expandQuery(ctx: ToolContext, query: string): Promise<string[]> {
+  const cached = expansionCache.get(query);
+  if (cached) {
+    return cached;
+  }
+  if (!ctx.complete || !ctx.llm) {
+    return [];
+  }
+  try {
+    const raw = await ctx.complete(
+      [
+        { role: 'system', content: EXPAND_PROMPT },
+        { role: 'user', content: query },
+      ],
+      { ...ctx.llm, temperature: 0.2, maxTokens: 60, disableThinking: true, purpose: 'expand' },
+    );
+    const list = raw
+      .split(/[、,，\n/]/)
+      .map((s) => s.trim().replace(/^[-*\d.\s]+/, ''))
+      .filter((s) => s.length > 0 && s !== query && s.length <= 12)
+      .slice(0, 4);
+    expansionCache.set(query, list);
+    return list;
+  } catch (error) {
+    ctx.log.warn('同义扩展失败', { query, error });
+    return [];
+  }
+}
+
 export async function executeTool(name: string, rawArgs: string, ctx: ToolContext): Promise<string> {
   const args = safeParse(rawArgs);
   try {
@@ -298,15 +342,44 @@ export async function executeTool(name: string, rawArgs: string, ctx: ToolContex
       if (!query) {
         return '需要提供关键词 query。';
       }
-      const hits = await indexFor(ctx.dataRoot).search({
+      const sender = asString(args.sender) || undefined;
+      const days = asNumber(args.days);
+      const limit = asNumber(args.limit);
+      const index = indexFor(ctx.dataRoot);
+      const hits = await index.search({ query, sender, days, limit, chatId: ctx.groupId });
+
+      if (hits.length > 0) {
+        ctx.log.info('检索历史', { query, hits: hits.length });
+        return renderHits(hits);
+      }
+
+      // 没命中：中文同义改写很常见（退坑 ↔ 不玩了），扩展一次再搜
+      const alternatives = await expandQuery(ctx, query);
+      if (alternatives.length === 0) {
+        ctx.log.info('检索历史', { query, hits: 0 });
+        return renderHits(hits);
+      }
+
+      const merged = new Map<string, (typeof hits)[number]>();
+      for (const alt of alternatives) {
+        const found = await index.search({ query: alt, sender, days, limit, chatId: ctx.groupId });
+        for (const hit of found) {
+          merged.set(`${hit.at}|${hit.senderId}|${hit.content.slice(0, 40)}`, hit);
+        }
+        if (merged.size >= (limit ?? 8)) {
+          break;
+        }
+      }
+      const expanded = [...merged.values()].slice(0, limit ?? 8);
+      ctx.log.info('检索历史（同义扩展）', {
         query,
-        sender: asString(args.sender) || undefined,
-        days: asNumber(args.days),
-        limit: asNumber(args.limit),
-        chatId: ctx.groupId,
+        alternatives,
+        hits: expanded.length,
       });
-      ctx.log.info('检索历史', { query, hits: hits.length });
-      return renderHits(hits);
+      if (expanded.length === 0) {
+        return `「${query}」和它的近义说法（${alternatives.join('、')}）都没有命中。可能是真没聊过，别编。`;
+      }
+      return `（原词没命中，按近义说法 ${alternatives.join('、')} 搜到这些）\n${renderHits(expanded)}`;
     }
     if (name === 'member_profile') {
       return await memberProfile(ctx, asString(args.name));
