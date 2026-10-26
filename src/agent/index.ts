@@ -134,6 +134,47 @@ export type RawCompleteFn = (
   retries?: number,
 ) => Promise<ChatResponse>;
 
+/** 一条消息的处理方式。三态显式化：可观测、可扩展。 */
+export type InboundMode = 'drop' | 'store' | 'process';
+
+interface Addressee {
+  to?: string;
+  toBot: boolean;
+}
+
+/** 从 mentions 推断「这句在跟谁说话」。多人对话里这层结构必须由系统给，别让模型猜。 */
+export function addresseeOf(message: QQBotInboundMessage, config: AgentConfig): Addressee {
+  const mentions = (message as unknown as { mentions?: unknown }).mentions;
+  if (!Array.isArray(mentions)) {
+    return { toBot: false };
+  }
+  const names: string[] = [];
+  let toBot = false;
+  for (const raw of mentions) {
+    if (!raw || typeof raw !== 'object') {
+      continue;
+    }
+    const m = raw as MentionLike;
+    const openid = [m.member_openid, m.user_openid, m.union_openid, m.id].find(
+      (v): v is string => typeof v === 'string',
+    );
+    const name = typeof m.username === 'string' ? m.username.trim() : '';
+    const isSelf =
+      (openid !== undefined && config.botOpenids.includes(openid)) ||
+      (m.bot === true && name !== '' && config.botUsernames.includes(name));
+    if (isSelf) {
+      toBot = true;
+    } else if (name !== '') {
+      names.push(name);
+    }
+  }
+  const result: Addressee = { toBot };
+  if (names.length > 0) {
+    result.to = names.join('、');
+  }
+  return result;
+}
+
 /** 单条消息上限（QQ 文本消息过长会被截断或发送失败）。 */
 export const MAX_REPLY_CHARS = 700;
 
@@ -212,6 +253,8 @@ export class ChatAgent {
   private readonly completeRaw: RawCompleteFn;
   private readonly digest: DigestEngine;
   private readonly startedAt = Date.now();
+  /** 处理门分状态计数：drop / store / process */
+  private readonly modes = { drop: 0, store: 0, process: 0 };
   /** 同一会话串行处理，避免同一群里两条 @ 并发抢回复。 */
   private readonly chains = new Map<string, Promise<void>>();
 
@@ -240,6 +283,8 @@ export class ChatAgent {
   /** 定时兜底：群里安静下来、没到阈值时也把已有的对话归档掉。 */
   async runDigestSweep(chatIds: string[]): Promise<number> {
     let count = 0;
+    // 冷场的话题先归档：没人再说话也必须落盘，不能等下一句。
+    this.digest.sweepIdle();
     for (const chatId of chatIds) {
       try {
         const due = await this.digest.dueCount(chatId);
@@ -354,6 +399,7 @@ export class ChatAgent {
     const hasAttachments = attachments.length > 0;
 
     if (message.senderIsBot || (!text && !hasAttachments)) {
+      this.modes.drop += 1;
       return;
     }
     // 自己的指令：不走模型，立刻回
@@ -367,6 +413,7 @@ export class ChatAgent {
         model: this.config.llm.model,
         contextWindow: this.config.callLog.contextWindow,
         startedAt: this.startedAt,
+        modes: this.modes,
       });
       await bot.replyText(scope.replyTarget, body);
       this.log.info('指令', { command, conversationId: scope.conversationId });
@@ -375,13 +422,14 @@ export class ChatAgent {
 
     // 别的机器人的命令（@课表Bot /课表 也算）
     if (withoutMentions.startsWith('/')) {
+      this.modes.drop += 1;
       this.log.debug('忽略命令类消息', { conversationId: scope.conversationId, text: withoutMentions.slice(0, 40) });
       return;
     }
 
     // 每条群消息都计数，累积到阈值就后台归档（不阻塞回复）
     if (!scope.isDirect && this.config.digestThreshold > 0) {
-      this.digest.observe(scope.conversationId);
+      this.digest.observe(scope.conversationId, text, Date.now());
     }
 
     const called = scope.isDirect || isBotMentioned(message, this.config);
@@ -390,8 +438,10 @@ export class ChatAgent {
         senderName: message.senderName ?? message.senderId.slice(0, 8),
         text,
         timestamp: Date.now(),
+        ...addresseeOf(message, this.config),
       };
       this.buffer.push(scope.conversationId, line);
+      this.modes.store += 1;
       if (hasAttachments) {
         // 后台看懂，看懂后原地补进这一行，别挡住后续消息
         void this.enrich(message, attachments).then((extra) => {
@@ -402,6 +452,8 @@ export class ChatAgent {
       }
       return;
     }
+
+    this.modes.process += 1;
 
     // 被 @ 了：先把图看懂，再回
     const extra = hasAttachments ? await this.enrich(message, attachments) : '';
@@ -461,9 +513,12 @@ export class ChatAgent {
 
     const system = [PERSONA, ...parts].join('\n\n---\n\n');
     const history = renderBuffer(pending);
+    const now = new Date();
+    const stamp = `${String(now.getHours()).padStart(2, '0')}:${String(now.getMinutes()).padStart(2, '0')}`;
+    const current = `[${stamp}] ${speaker}${scope.isDirect ? '' : ' → Kei'}：${text}`;
     const userText = history
-      ? `${CONTEXT_HEADER}\n${history}\n${CONTEXT_FOOTER}\n\n${speaker}：${text}`
-      : `${speaker}：${text}`;
+      ? `${CONTEXT_HEADER}\n${history}\n${CONTEXT_FOOTER}\n\n${current}`
+      : current;
 
     const messages: ChatMessage[] = [
       { role: 'system', content: system },

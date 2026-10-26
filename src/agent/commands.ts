@@ -37,6 +37,8 @@ export interface StatusInput {
   contextWindow: number;
   /** 进程启动时间戳 */
   startedAt: number;
+  /** 处理门分状态计数 */
+  modes?: { drop: number; store: number; process: number };
 }
 
 function fmtNum(value: number): string {
@@ -143,6 +145,9 @@ export async function renderStatus(input: StatusInput): Promise<string> {
     `调用 ${fmtNum(all.calls)} 次（今天 ${todayCalls.length} 次）· token ${fmtNum(all.totalTokens)}`,
     `缓存命中 ${(cacheRate * 100).toFixed(1)}% · 平均 ${fmtMs(all.avgMs)} · p95 ${fmtMs(all.p95Ms)}`,
     `话题 ${topics} 个 · 最近归档 ${lastDigest}`,
+    ...(input.modes
+      ? [`本轮 存 ${input.modes.store} · 处理 ${input.modes.process} · 丢弃 ${input.modes.drop}`]
+      : []),
     `已连续运行 ${fmtDuration(Date.now() - input.startedAt)}`,
   ].join('\n');
 }

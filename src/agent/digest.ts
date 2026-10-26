@@ -112,25 +112,127 @@ function renderRecords(records: RawRecord[]): string {
     .join('\n');
 }
 
+/** 冷场多久算一个话题结束。 */
+export const IDLE_GAP_MS = 30 * 60 * 1000;
+
+/** 冷场归档的最小消息数：太短的寒暄不值得单独存一条摘要。 */
+export const MIN_TOPIC_MESSAGES = 8;
+
+/** 话题漂移触发的最小消息数。 */
+export const MIN_DRIFT_MESSAGES = 12;
+
+/** 中文按双字组切，英文按词切；过滤标点与语气词，只留有信息量的部分。 */
+function shingles(text: string): Set<string> {
+  const clean = text.replace(/[<@#\s]+/g, ' ').replace(/[，。！？、,.!?~…：:；;"'（）()\[\]]/g, ' ');
+  const grams = new Set<string>();
+  for (const piece of clean.split(' ')) {
+    if (!piece) {
+      continue;
+    }
+    if (/^[\x00-\x7f]+$/.test(piece)) {
+      if (piece.length > 1) {
+        grams.add(piece.toLowerCase());
+      }
+      continue;
+    }
+    for (let i = 0; i + 2 <= piece.length; i += 1) {
+      grams.add(piece.slice(i, i + 2));
+    }
+  }
+  return grams;
+}
+
+function jaccard(a: Set<string>, b: Set<string>): number {
+  if (a.size === 0 || b.size === 0) {
+    return 0;
+  }
+  let shared = 0;
+  for (const item of a) {
+    if (b.has(item)) {
+      shared += 1;
+    }
+  }
+  return shared / (a.size + b.size - shared);
+}
+
+/**
+ * 话题漂移程度：把最近一段切成前后两半，比相似度。
+ * 相似度越低说明「话题换了」，是比「攒够 N 条」更合理的切分点。
+ */
+export function topicDrift(texts: string[]): number {
+  if (texts.length < 6) {
+    return 0;
+  }
+  const half = Math.floor(texts.length / 2);
+  const before = shingles(texts.slice(0, half).join(' '));
+  const after = shingles(texts.slice(half).join(' '));
+  return 1 - jaccard(before, after);
+}
+
+/** 低于这个相似度就认为换话题了。 */
+export const DRIFT_THRESHOLD = 0.88;
+
 export class DigestEngine {
   private readonly opts: DigestOptions;
   /** 自上次摘要以来观察到的新消息数 */
   private readonly pending = new Map<string, number>();
   private readonly running = new Set<string>();
+  /** 每个会话最近的消息文本（判话题漂移用，只留一小段） */
+  private readonly recent = new Map<string, string[]>();
+  /** 每个会话最后一条消息的时间 */
+  private readonly lastAt = new Map<string, number>();
 
   constructor(opts: DigestOptions) {
     this.opts = opts;
   }
 
-  /** 每收到一条消息调用一次；到阈值就后台摘要，不阻塞回复。 */
-  observe(chatId: string): void {
+  /**
+   * 每收到一条消息调用一次；满足任一条件就后台摘要，不阻塞回复：
+   *   1. 攒够 threshold 条；
+   *   2. 冷场超过 IDLE_GAP_MS（话题结束）；
+   *   3. 话题漂移（相似度骤降），且积累够 MIN_DRIFT_MESSAGES 条。
+   */
+  observe(chatId: string, text = '', at = Date.now()): void {
+    const prevAt = this.lastAt.get(chatId);
+    this.lastAt.set(chatId, at);
+
+    const window = this.recent.get(chatId) ?? [];
+    if (text) {
+      window.push(text);
+      if (window.length > 12) {
+        window.splice(0, window.length - 12);
+      }
+      this.recent.set(chatId, window);
+    }
+
     const next = (this.pending.get(chatId) ?? 0) + 1;
     this.pending.set(chatId, next);
-    if (next >= this.opts.threshold) {
+
+    const idle = prevAt !== undefined && at - prevAt >= IDLE_GAP_MS;
+    const drifted =
+      next >= MIN_DRIFT_MESSAGES && window.length >= 6 && topicDrift(window) >= DRIFT_THRESHOLD;
+    const enough = next >= this.opts.threshold;
+
+    if (enough || drifted || (idle && next >= MIN_TOPIC_MESSAGES)) {
+      this.recent.delete(chatId);
       void this.digest(chatId).catch((error: unknown) => {
         this.opts.log.warn('对话摘要失败', { chatId, error });
       });
     }
+  }
+
+  /** 定时巡检：冷场的话题即使没人再说话也要归档。 */
+  sweepIdle(now = Date.now()): string[] {
+    const due: string[] = [];
+    for (const [chatId, at] of this.lastAt) {
+      if (now - at >= IDLE_GAP_MS && (this.pending.get(chatId) ?? 0) >= MIN_TOPIC_MESSAGES) {
+        due.push(chatId);
+        void this.digest(chatId).catch((error: unknown) => {
+          this.opts.log.warn('冷场归档失败', { chatId, error });
+        });
+      }
+    }
+    return due;
   }
 
   /** 手动/定时触发：按 chat-log 水位线看看够不够。 */

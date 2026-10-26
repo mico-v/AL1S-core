@@ -3,16 +3,24 @@
  *
  * 群里没人 @ 机器人时，消息不进模型（省钱也不刷屏），但留在这里；
  * 等下次有人 @，把「上次说话之后群里聊了什么」一起喂进去。
+ *
+ * 每行都带时间与收件人：多人对话里「谁在跟谁说话」是模型最容易搞错的信息，
+ * 必须由系统提供 —— 让模型从一堆「昵称: 内容」里自己推断是行不通的。
  */
 
 export interface BufferedLine {
   senderName: string;
   text: string;
   timestamp: number;
+  /** 这句话点名了谁（@ 或引用回复）；没有就是群发 */
+  to?: string;
+  /** 是否点名了机器人自己 */
+  toBot?: boolean;
 }
 
 export class GroupBuffer {
   private readonly byGroup = new Map<string, BufferedLine[]>();
+  private readonly lastAt = new Map<string, number>();
   private readonly limit: number;
 
   constructor(limit = 40) {
@@ -20,6 +28,7 @@ export class GroupBuffer {
   }
 
   push(groupOpenid: string, line: BufferedLine): void {
+    this.lastAt.set(groupOpenid, line.timestamp);
     if (this.limit === 0) {
       return;
     }
@@ -42,21 +51,38 @@ export class GroupBuffer {
     return [...(this.byGroup.get(groupOpenid) ?? [])];
   }
 
+  /** 这个群最后一条消息的时间（判断是否已经冷场）。 */
+  lastMessageAt(groupOpenid: string): number | undefined {
+    return this.lastAt.get(groupOpenid);
+  }
+
   clear(groupOpenid?: string): void {
     if (groupOpenid) {
       this.byGroup.delete(groupOpenid);
+      this.lastAt.delete(groupOpenid);
     } else {
       this.byGroup.clear();
+      this.lastAt.clear();
     }
   }
 }
 
-/** 把缓冲渲染成可注入的文本块。 */
+function hhmm(timestamp: number): string {
+  const d = new Date(timestamp);
+  const pad = (n: number): string => String(n).padStart(2, '0');
+  return `${pad(d.getHours())}:${pad(d.getMinutes())}`;
+}
+
+/** 把缓冲渲染成可注入的文本块：`[20:14] 小明 → 小红: 内容`。 */
 export function renderBuffer(lines: BufferedLine[]): string {
   if (lines.length === 0) {
     return '';
   }
   return lines
-    .map((line) => `${line.senderName}: ${line.text.replace(/\s+/g, ' ').trim()}`)
+    .map((line) => {
+      const text = line.text.replace(/\s+/g, ' ').trim();
+      const arrow = line.toBot ? ' → Kei' : line.to ? ` → ${line.to}` : '';
+      return `[${hhmm(line.timestamp)}] ${line.senderName}${arrow}: ${text}`;
+    })
     .join('\n');
 }

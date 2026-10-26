@@ -11,12 +11,12 @@ import { tmpdir } from 'node:os';
 import path from 'node:path';
 import { ChatAgent, isBotMentioned, readAgentConfig, splitReply } from '../agent/index.js';
 import type { ChatMessage } from '../agent/llm.js';
-import { GroupBuffer } from '../agent/context.js';
+import { GroupBuffer, renderBuffer } from '../agent/context.js';
 import { GroupMemory } from '../agent/memory.js';
 import { PERSONA } from '../agent/persona.js';
 import { cleanQQText } from '../agent/text.js';
 import { matchCommand, renderStatus } from '../agent/commands.js';
-import { DigestEngine } from '../agent/digest.js';
+import { DigestEngine, DRIFT_THRESHOLD, topicDrift } from '../agent/digest.js';
 import { MessageIndex, renderHits } from '../agent/search.js';
 import { executeTool } from '../agent/tools.js';
 import { buildRecord, summarize } from '../agent/telemetry.js';
@@ -95,6 +95,25 @@ async function main(): Promise<void> {
   check('按上限截断', drained.length === 3, `实际 ${drained.length}`);
   check('保留最新的', drained[drained.length - 1]?.text === '话4');
   check('drain 后清空', buf.drain(GROUP).length === 0);
+
+  console.log('\n[2.1] 缓冲带时间与收件人');
+  const at = new Date(2026, 9, 26, 20, 14, 30).getTime();
+  const rendered = renderBuffer([
+    { senderName: '小明', text: '今天吃什么', timestamp: at, to: '小红' },
+    { senderName: '小红', text: '随便', timestamp: at + 60_000 },
+    { senderName: '小明', text: 'Kei 你说呢', timestamp: at + 120_000, toBot: true },
+  ]);
+  check('带时间戳', rendered.startsWith('[20:14] 小明 → 小红: 今天吃什么'), rendered.split('\n')[0]);
+  check('群发不画箭头', rendered.split('\n')[1] === '[20:15] 小红: 随便');
+  check('点名机器人标 → Kei', (rendered.split('\n')[2] ?? '').includes('小明 → Kei'));
+  check('空缓冲渲染成空串', renderBuffer([]) === '');
+
+  console.log('\n[2.2] 话题漂移');
+  const oneTopic = ['今天打本吗', '打本打本', '几点开打', '八点吧', '那我去准备药'];
+  const shifted = [...oneTopic, '话说那个新显卡多少钱', '好像要五千多', '太贵了算了', '等等双十一'];
+  check('同话题漂移低', topicDrift(oneTopic) < DRIFT_THRESHOLD, `drift=${topicDrift(oneTopic).toFixed(2)}`);
+  check('换话题漂移高', topicDrift(shifted) >= DRIFT_THRESHOLD, `drift=${topicDrift(shifted).toFixed(2)}`);
+  check('太短不判漂移', topicDrift(['在吗', '在']) === 0);
 
   console.log('\n[3] 记忆读写');
   const tmp = await mkdtemp(path.join(tmpdir(), 'al1s-agent-'));
