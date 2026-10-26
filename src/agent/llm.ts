@@ -87,13 +87,14 @@ export async function chatCompleteRaw(
   retries = 2,
 ): Promise<ChatResponse> {
   const url = `${opts.baseUrl.replace(/\/+$/, '')}/chat/completions`;
-  const maxTokens = opts.maxTokens ?? 500;
+  // 不传就不设上限：由模型自己决定生成多长
+  const maxTokens = opts.maxTokens && opts.maxTokens > 0 ? opts.maxTokens : undefined;
   const temperature = opts.temperature ?? 0.9;
   const body = JSON.stringify({
     model: opts.model,
     messages,
     temperature,
-    max_tokens: maxTokens,
+    ...(maxTokens ? { max_tokens: maxTokens } : {}),
     stream: false,
     ...(opts.disableThinking ? { thinking: { type: 'disabled' } } : {}),
     ...(opts.tools && opts.tools.length > 0
@@ -115,7 +116,7 @@ export async function chatCompleteRaw(
       }
       return acc + m.content.filter((part) => part.type === 'image_url').length;
     }, 0),
-    maxTokens,
+    maxTokens: maxTokens ?? 0,
     temperature,
   };
 

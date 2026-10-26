@@ -85,7 +85,8 @@ export function readAgentConfig(env: NodeJS.ProcessEnv): AgentConfig {
       apiKey: env.AGENT_API_KEY ?? '',
       model: env.AGENT_MODEL ?? 'deepseek-v4.1-flash',
       temperature: Number(env.AGENT_TEMPERATURE ?? 0.95),
-      maxTokens: Number(env.AGENT_MAX_TOKENS ?? 400),
+      // 0 或未设 → 不传 max_tokens，长度交给模型
+      maxTokens: Number(env.AGENT_MAX_TOKENS ?? 0) || undefined,
       timeoutMs: Number(env.AGENT_TIMEOUT_MS ?? 45_000),
       disableThinking: env.AGENT_DISABLE_THINKING !== 'false',
     },
