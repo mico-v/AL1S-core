@@ -16,6 +16,11 @@ export interface BufferedLine {
   to?: string;
   /** 是否点名了机器人自己 */
   toBot?: boolean;
+  /**
+   * 这行带的图片地址。不存字节：群里可能刷几十张图，存原图会把内存吃光；
+   * 真被问到（有人 @）时再按需下载，这个时间差内 QQ 的 URL 还有效。
+   */
+  imageUrls?: string[];
 }
 
 export class GroupBuffer {
@@ -54,6 +59,24 @@ export class GroupBuffer {
   /** 这个群最后一条消息的时间（判断是否已经冷场）。 */
   lastMessageAt(groupOpenid: string): number | undefined {
     return this.lastAt.get(groupOpenid);
+  }
+
+  /** 取最近几条消息里的图片 URL（新的在前），用于「刚才那张图」这种追问。 */
+  recentImageUrls(groupOpenid: string, limit = 2): string[] {
+    const list = this.byGroup.get(groupOpenid) ?? [];
+    const urls: string[] = [];
+    for (let i = list.length - 1; i >= 0 && urls.length < limit; i -= 1) {
+      const line = list[i];
+      if (!line?.imageUrls?.length) {
+        continue;
+      }
+      for (const url of line.imageUrls) {
+        if (urls.length < limit) {
+          urls.push(url);
+        }
+      }
+    }
+    return urls;
   }
 
   clear(groupOpenid?: string): void {

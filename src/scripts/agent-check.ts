@@ -19,6 +19,7 @@ import { matchCommand, renderStatus } from '../agent/commands.js';
 import { DigestEngine, DRIFT_THRESHOLD, topicDrift } from '../agent/digest.js';
 import { MessageIndex, renderHits } from '../agent/search.js';
 import { executeTool, expandQuery } from '../agent/tools.js';
+import { digestAttachments, loadImageParts, prepareImage } from '../agent/vision.js';
 import { buildProactiveMessages, judgeProactive, parseProactive } from '../agent/proactive.js';
 import { learnSystem } from '../agent/updater.js';
 import { buildRecord, summarize } from '../agent/telemetry.js';
@@ -109,6 +110,18 @@ async function main(): Promise<void> {
   check('群发不画箭头', rendered.split('\n')[1] === '[20:15] 小红: 随便');
   check('点名机器人标 → Kei', (rendered.split('\n')[2] ?? '').includes('小明 → Kei'));
   check('空缓冲渲染成空串', renderBuffer([]) === '');
+
+  console.log('\n[2.15] 缓冲里的图片引用');
+  {
+    const ib = new GroupBuffer(10);
+    ib.push(GROUP, { senderName: '甲', text: '看图', timestamp: at, imageUrls: ['u1', 'u2'] });
+    ib.push(GROUP, { senderName: '乙', text: '哦', timestamp: at + 1000 });
+    ib.push(GROUP, { senderName: '丙', text: '又一张', timestamp: at + 2000, imageUrls: ['u3'] });
+    const recent = ib.recentImageUrls(GROUP, 3);
+    check('取最近的图，新的在前', recent[0] === 'u3', recent.join(','));
+    check('按上限截断', ib.recentImageUrls(GROUP, 2).length === 2);
+    check('没图返回空', new GroupBuffer(5).recentImageUrls('nope').length === 0);
+  }
 
   console.log('\n[2.2] 话题漂移');
   const oneTopic = ['今天打本吗', '打本打本', '几点开打', '八点吧', '那我去准备药'];
@@ -484,6 +497,29 @@ async function main(): Promise<void> {
     },
   );
   check('发言太少不调模型', !quiet.speak && proactiveCalls === 0);
+
+  console.log('\n[14.5] 图片直接进上下文');
+  {
+    const tiny = new Uint8Array([0xff, 0xd8, 0xff, 0xe0, 0, 0, 0, 0]);
+    const kept = await prepareImage(tiny, 'image/jpeg', quietLogger);
+    check('小图不压缩原样用', kept.data.byteLength === tiny.byteLength && kept.mime === 'image/jpeg');
+
+    const ghost = await loadImageParts(
+      [{ content_type: 'image/jpeg', url: 'http://127.0.0.1:1/none' }],
+      quietLogger,
+    );
+    check('加载失败只记标记', ghost.parts.length === 0 && ghost.failed === 1);
+    check('失败标记可读', ghost.markers[0]?.includes('没加载出来') === true);
+
+    const voice = await digestAttachments(
+      [{ content_type: 'image/jpeg', url: 'http://127.0.0.1:1/x' }, { content_type: 'audio/silk', asr_refer_text: '今天好累' }],
+      config.llm,
+      quietLogger,
+      { skipImages: true },
+    );
+    check('跳图后不再写图描述', !voice.text.includes('[图'));
+    check('跳图不影响语音转写', voice.text.includes('今天好累'));
+  }
 
   console.log('\n[15] 检索同义扩展');
   const expandTmp = await mkdtemp(path.join(tmpdir(), 'al1s-expand-'));

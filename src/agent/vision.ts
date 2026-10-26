@@ -7,11 +7,23 @@
  * 再把描述当成文本注入主对话 —— 主对话因此始终保持纯文本、便宜、快。
  */
 
+import { execFile } from 'node:child_process';
+import { constants } from 'node:fs';
+import { access, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
+import { tmpdir } from 'node:os';
+import path from 'node:path';
+import { promisify } from 'node:util';
 import type { AppLogger } from '../logger.js';
 import { chatComplete, type ContentPart, type LlmOptions } from './llm.js';
 
-/** 超过这个大小的图不看了（QQ 表情包一般 20–300KB）。 */
-const MAX_IMAGE_BYTES = 4 * 1024 * 1024;
+const execFileAsync = promisify(execFile);
+
+/** 原图下载上限。QQ 截图动辄几 MB，压缩交给 prepareImage。 */
+const MAX_IMAGE_BYTES = 12 * 1024 * 1024;
+/** 压缩后的目标：长边 1400、JPEG 质量 4，一般落到 150–300KB。 */
+const MAX_EDGE = 1400;
+/** 低于这个大小且不是 GIF 就直接用原图，省一次转码。 */
+const PASSTHROUGH_BYTES = 900_000;
 /** 一条消息最多看几张，防刷。 */
 const MAX_IMAGES_PER_MESSAGE = 3;
 /** 看图的 token 预算。关掉推理后 600 足够，留点余量防止截断。 */
@@ -100,6 +112,131 @@ async function download(url: string, timeoutMs = 30_000): Promise<Uint8Array> {
   }
 }
 
+/** ffmpeg 在哪。找不到就跳过压缩，宁可发原图也不丢内容。 */
+async function findFfmpeg(): Promise<string | undefined> {
+  const candidates = [
+    process.env.FFMPEG_PATH,
+    '/root/.hermes/tools/ffmpeg-9.0.1-linux-x64/bin/ffmpeg',
+    '/usr/bin/ffmpeg',
+    '/usr/local/bin/ffmpeg',
+  ].filter((x): x is string => Boolean(x));
+  for (const candidate of candidates) {
+    try {
+      await access(candidate, constants.X_OK);
+      return candidate;
+    } catch {
+      // 试下一个
+    }
+  }
+  return undefined;
+}
+
+/**
+ * 把图压到模型能痛快吃的尺寸。
+ *
+ * 原图动辄 1280x2774 / 9MB，base64 之后请求体十几 MB，又慢又容易被网关拒。
+ * 长边 1400 + JPEG q4 对「看懂梗图/截图文字」绰绰有余。
+ */
+export async function prepareImage(
+  bytes: Uint8Array,
+  mime: string,
+  log: AppLogger,
+): Promise<{ data: Uint8Array; mime: string }> {
+  if (bytes.byteLength <= PASSTHROUGH_BYTES && mime !== 'image/gif') {
+    return { data: bytes, mime };
+  }
+  const ffmpeg = await findFfmpeg();
+  if (!ffmpeg) {
+    log.warn('没有 ffmpeg，原图直传', { bytes: bytes.byteLength });
+    return { data: bytes, mime };
+  }
+
+  const dir = await mkdtemp(path.join(tmpdir(), 'al1s-img-'));
+  const input = path.join(dir, 'in');
+  const output = path.join(dir, 'out.jpg');
+  try {
+    await writeFile(input, bytes);
+    await execFileAsync(
+      ffmpeg,
+      [
+        '-hide_banner',
+        '-loglevel', 'error',
+        '-y',
+        '-i', input,
+        // 长边压到 1400，短边按比例；已经是小图的就不放大
+        '-vf', `scale='min(${MAX_EDGE},iw)':-2`,
+        '-q:v', '4',
+        '-frames:v', '1',
+        output,
+      ],
+      { timeout: 20_000 },
+    );
+    const compressed = new Uint8Array(await readFile(output));
+    if (compressed.byteLength === 0 || compressed.byteLength >= bytes.byteLength) {
+      return { data: bytes, mime };
+    }
+    return { data: compressed, mime: 'image/jpeg' };
+  } catch (error) {
+    log.warn('图片压缩失败，用原图', { bytes: bytes.byteLength, error });
+    return { data: bytes, mime };
+  } finally {
+    await rm(dir, { recursive: true, force: true }).catch(() => undefined);
+  }
+}
+
+export interface LoadedImages {
+  /** 直接拼进用户消息的图片分段 */
+  parts: ContentPart[];
+  /** 插在文本里的位置标记，形如 `[图1]（附图）` */
+  markers: string[];
+  /** 加载失败的张数 */
+  failed: number;
+}
+
+/**
+ * 把消息里的图**原样**装进上下文（不是转述）。
+ *
+ * 之前只发一句描述，模型看到的永远是二手信息；截图里的文字、梗图的细节、
+ * 表格里的数字，全靠那次转写过一遍就没了。
+ */
+export async function loadImageParts(
+  attachments: AttachmentLike[] | undefined,
+  log: AppLogger,
+): Promise<LoadedImages> {
+  const result: LoadedImages = { parts: [], markers: [], failed: 0 };
+  const images = (attachments ?? [])
+    .filter((item) => (item.content_type ?? '').startsWith('image/') || item.url?.includes('multimedia'))
+    .slice(0, MAX_IMAGES_PER_MESSAGE);
+
+  for (let index = 0; index < images.length; index += 1) {
+    const item = images[index] as AttachmentLike;
+    const label = index + 1;
+    if (!item.url) {
+      continue;
+    }
+    try {
+      const raw = await download(item.url);
+      const prepared = await prepareImage(raw, mimeOf(item.content_type, raw), log);
+      result.parts.push({
+        type: 'image_url',
+        image_url: { url: `data:${prepared.mime};base64,${Buffer.from(prepared.data).toString('base64')}` },
+      });
+      log.info('图片进入上下文', {
+        label,
+        raw: raw.byteLength,
+        sent: prepared.data.byteLength,
+        mime: prepared.mime,
+      });
+      result.markers.push(`[图${label}]（附图${prepared.mime === 'image/jpeg' ? '，已压缩' : ''}）`);
+    } catch (error) {
+      result.failed += 1;
+      log.warn('图片加载失败', { url: item.url.slice(0, 60), error });
+      result.markers.push(`[图${label}]（没加载出来）`);
+    }
+  }
+  return result;
+}
+
 /** 让模型看一眼图，返回一句描述；失败返回 undefined（调用方不许瞎猜）。 */
 export async function describeImage(
   bytes: Uint8Array,
@@ -146,6 +283,7 @@ export async function digestAttachments(
   attachments: AttachmentLike[] | undefined,
   llm: LlmOptions,
   log: AppLogger,
+  options: { skipImages?: boolean } = {},
 ): Promise<DigestedAttachments> {
   const lines: string[] = [];
   let imagesSeen = 0;
@@ -165,9 +303,11 @@ export async function digestAttachments(
     }
   }
 
-  const images = attachments
-    .filter((item) => (item.content_type ?? '').startsWith('image/') || item.url?.includes('multimedia'))
-    .slice(0, MAX_IMAGES_PER_MESSAGE);
+  const images = options.skipImages
+    ? []
+    : attachments
+        .filter((item) => (item.content_type ?? '').startsWith('image/') || item.url?.includes('multimedia'))
+        .slice(0, MAX_IMAGES_PER_MESSAGE);
 
   for (let index = 0; index < images.length; index += 1) {
     const item = images[index] as AttachmentLike;

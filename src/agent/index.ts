@@ -19,13 +19,14 @@ import {
   chatCompleteRaw,
   type ChatMessage,
   type ChatResponse,
+  type ContentPart,
   type LlmOptions,
 } from './llm.js';
 import { GroupMemory } from './memory.js';
 import { CONTEXT_FOOTER, CONTEXT_HEADER, PERSONA } from './persona.js';
 import { cleanQQText } from './text.js';
 import { TOOL_DEFINITIONS, executeTool, type ToolContext } from './tools.js';
-import { digestAttachments } from './vision.js';
+import { digestAttachments, loadImageParts } from './vision.js';
 
 export interface AgentConfig {
   enabled: boolean;
@@ -519,11 +520,17 @@ export class ChatAgent {
 
     const called = scope.isDirect || isBotMentioned(message, this.config);
     if (!called) {
+      const imageUrls = attachments
+        .filter((item) => (item.content_type ?? '').startsWith('image/') || item.url?.includes('multimedia'))
+        .map((item) => item.url)
+        .filter((url): url is string => Boolean(url))
+        .slice(0, 3);
       const line = {
         senderName: message.senderName ?? message.senderId.slice(0, 8),
         text,
         timestamp: Date.now(),
         ...addresseeOf(message, this.config),
+        ...(imageUrls.length > 0 ? { imageUrls } : {}),
       };
       this.buffer.push(scope.conversationId, line);
       this.modes.store += 1;
@@ -540,13 +547,38 @@ export class ChatAgent {
 
     this.modes.process += 1;
 
-    // 被 @ 了：先把图看懂，再回
-    const extra = hasAttachments ? await this.enrich(message, attachments) : '';
-    const fullText = [text, extra].filter(Boolean).join('\n');
+    // 被 @ 了：图直接塞进模型上下文，不再只发一句描述
+    const images = hasAttachments
+      ? await loadImageParts(attachments, this.log)
+      : { parts: [], markers: [], failed: 0 };
+    let imageParts = images.parts;
+    const markers = [...images.markers];
+
+    // 「刚才那张图怎么样」：把缓冲里最近发过的图也带上，合计不超过 3 张
+    if (!scope.isDirect && imageParts.length < 3) {
+      const recentUrls = this.buffer.recentImageUrls(scope.conversationId, 3 - imageParts.length);
+      if (recentUrls.length > 0) {
+        const older = await loadImageParts(
+          recentUrls.map((url) => ({ content_type: 'image/jpeg', url })),
+          this.log,
+        );
+        if (older.parts.length > 0) {
+          imageParts = [...imageParts, ...older.parts];
+          markers.push(`[前面还有人发过 ${older.parts.length} 张图，也已附上]`);
+        }
+      }
+    }
+
+    const extra = hasAttachments
+      ? await this.enrich(message, attachments, { skipImages: images.parts.length > 0 })
+      : '';
+    const fullText = [text, ...markers, extra].filter(Boolean).join('\n');
 
     // 同会话串行：把本次处理挂在上一次后面
     const prev = this.chains.get(scope.conversationId) ?? Promise.resolve();
-    const task: Promise<void> = prev.catch(() => undefined).then(() => this.reply(message, bot, scope, fullText));
+    const task: Promise<void> = prev
+      .catch(() => undefined)
+      .then(() => this.reply(message, bot, scope, fullText, imageParts));
     const tail: Promise<void> = task.finally(() => {
       if (this.chains.get(scope.conversationId) === tail) {
         this.chains.delete(scope.conversationId);
@@ -560,9 +592,10 @@ export class ChatAgent {
   private async enrich(
     message: QQBotInboundMessage,
     attachments: NonNullable<QQBotInboundMessage['attachments']>,
+    options: { skipImages?: boolean } = {},
   ): Promise<string> {
     const startedAt = Date.now();
-    const digest = await digestAttachments(attachments, this.config.llm, this.log);
+    const digest = await digestAttachments(attachments, this.config.llm, this.log, options);
     if (digest.imagesSeen > 0 || digest.imagesFailed > 0) {
       this.log.info('看图', {
         conversationId: message.groupOpenid ?? message.senderId.slice(0, 8),
@@ -579,6 +612,7 @@ export class ChatAgent {
     bot: Bot,
     scope: Scope,
     text: string,
+    imageParts: ContentPart[] = [],
   ): Promise<void> {
     const pending = scope.isDirect ? [] : this.buffer.drain(scope.conversationId);
     const memory = this.memory(scope.memoryKey);
@@ -605,25 +639,21 @@ export class ChatAgent {
       ? `${CONTEXT_HEADER}\n${history}\n${CONTEXT_FOOTER}\n\n${current}`
       : current;
 
-    const messages: ChatMessage[] = [
+    const buildMessages = (body: string, withImages: boolean): ChatMessage[] => [
       { role: 'system', content: system },
-      { role: 'user', content: userText },
+      {
+        role: 'user',
+        content:
+          withImages && imageParts.length > 0
+            ? [{ type: 'text' as const, text: body }, ...imageParts]
+            : body,
+      },
     ];
 
-    try {
-      const reply = await this.converse(
-        messages,
-        {
-          ...this.config.llm,
-          purpose: 'chat',
-          conversationId: scope.conversationId,
-          speaker,
-        },
-        scope.isDirect ? undefined : scope.conversationId,
-      );
-      const cleaned = reply.replace(/^\s*\[SILENT\]\s*$/i, '').trim();
+    const send = async (raw: string): Promise<boolean> => {
+      const cleaned = raw.replace(/^\s*\[SILENT\]\s*$/i, '').trim();
       if (!cleaned) {
-        return;
+        return false;
       }
       const chunks = splitReply(cleaned);
       for (let i = 0; i < chunks.length; i += 1) {
@@ -638,9 +668,41 @@ export class ChatAgent {
         chars: cleaned.length,
         chunks: chunks.length,
         contextLines: pending.length,
+        images: imageParts.length,
       });
+      return true;
+    };
+
+    const opts = {
+      ...this.config.llm,
+      purpose: 'chat' as const,
+      conversationId: scope.conversationId,
+      speaker,
+    };
+    const chatId = scope.isDirect ? undefined : scope.conversationId;
+
+    try {
+      const reply = await this.converse(buildMessages(userText, true), opts, chatId);
+      await send(reply);
     } catch (error) {
-      this.log.error('回复失败', { conversationId: scope.conversationId, error });
+      // 带图请求失败（模型不支持 / 图太大被拒）就退回文字描述，别整条哑掉
+      if (imageParts.length === 0) {
+        this.log.error('回复失败', { conversationId: scope.conversationId, error });
+        return;
+      }
+      this.log.warn('带图对话失败，退回文字描述重试', {
+        conversationId: scope.conversationId,
+        images: imageParts.length,
+        error,
+      });
+      try {
+        const captions = await this.enrich(message, message.attachments ?? []);
+        const fallbackBody = `${userText}\n${captions}`.trim();
+        const reply = await this.converse(buildMessages(fallbackBody, false), opts, chatId);
+        await send(reply);
+      } catch (retryError) {
+        this.log.error('回复失败（退化后）', { conversationId: scope.conversationId, error: retryError });
+      }
     }
   }
 
