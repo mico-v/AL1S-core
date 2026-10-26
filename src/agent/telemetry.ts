@@ -63,7 +63,7 @@ export interface TelemetryOptions {
 const DEFAULT_OPTIONS: TelemetryOptions = {
   dir: path.join(process.cwd(), 'data', 'calls'),
   enabled: true,
-  contextWindow: 128_000,
+  contextWindow: 1_000_000,
 };
 
 let options: TelemetryOptions = DEFAULT_OPTIONS;

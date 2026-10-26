@@ -109,7 +109,7 @@ export function readAgentConfig(env: NodeJS.ProcessEnv): AgentConfig {
     callLog: {
       enabled: env.AGENT_CALL_LOG !== 'false',
       dir: env.AGENT_CALL_LOG_DIR ?? './data/calls',
-      contextWindow: Number(env.AGENT_CONTEXT_WINDOW ?? 128_000),
+      contextWindow: Number(env.AGENT_CONTEXT_WINDOW ?? 1_000_000),
     },
   };
 }

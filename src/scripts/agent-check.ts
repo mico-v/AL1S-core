@@ -442,7 +442,7 @@ async function main(): Promise<void> {
       bufferLines: 12,
       bufferLimit: 40,
       model: 'deepseek-v4.1-flash',
-      contextWindow: 128000,
+      contextWindow: 1000000,
       startedAt: Date.now() - 3660_000,
     });
     check('状态含模型名', statusText.includes('deepseek-v4.1-flash'));
