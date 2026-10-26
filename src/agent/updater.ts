@@ -21,7 +21,7 @@ const MAX_CONTENT_CHARS = 1200;
  * 之前把全群档案都塞进提示词、让模型整体重写，输出很容易超过 max_tokens
  * 被截断 —— JSON 尾巴一断，整批档案都写不进去。现在只处理这批里真正说过话的人。
  */
-const MAX_MEMBERS_PER_RUN = 8;
+const MAX_MEMBERS_PER_RUN = 20;
 
 export interface UpdaterConfig {
   dataRoot: string;
@@ -60,7 +60,7 @@ export function learnSystem(today = new Date().toISOString().slice(0, 10)): stri
 - 稳定不变的特征（口癖、性格底色、惯用表情）不用标时间。
 - 事实发生变化时**不要删旧条目**：给旧的补上结束日期，再加一条新的。允许同一类留 2~3 条历史。
 - 不要写「本批」「这批消息」这种视角说明，直接写事实；也不要写「第 N 条」。
-- 每人档案控制在 20 行以内（越短越不容易被截断）。开头必须是「# 昵称」。
+- 档案该写多少写多少，不要为了篇幅删信息；开头必须是「# 昵称」。
 
 只输出 JSON，不要任何解释：
 {"profiles":[{"openid":"...","name":"昵称","markdown":"# 昵称\\n- 性格: ..."}]}
@@ -170,7 +170,7 @@ export async function learnGroup(
       .filter((m): m is NonNullable<typeof m> => Boolean(m))
       .map((m) => `### ${m.name} (${m.openid})\n${m.profile}`)
       .join('\n\n')
-      .slice(0, 12_000) || '（这些人还没有档案）';
+      .slice(0, 20_000) || '（这些人还没有档案）';
 
     const raw = await chatComplete(
       [
@@ -182,7 +182,9 @@ export async function learnGroup(
       ],
       {
         ...config.llm,
-        maxTokens: 4000,
+        // 不设卡：输出多少由模型决定（实测接口 200k 也收）。
+        // 下面的砍半重试只是兜底，正常情况下不会触发。
+        maxTokens: 64_000,
         temperature: 0.3,
         // 结构化输出不需要推理；开着会把预算烧光，返回空内容
         disableThinking: true,
