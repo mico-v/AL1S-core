@@ -23,7 +23,7 @@ import {
   type LlmOptions,
 } from './llm.js';
 import { GroupMemory } from './memory.js';
-import { CONTEXT_FOOTER, CONTEXT_HEADER, OWNER_MODE, PERSONA } from './persona.js';
+import { CONTEXT_FOOTER, CONTEXT_HEADER, FULL_ANSWER_MODE, OWNER_HINT, PERSONA } from './persona.js';
 import { cleanQQText } from './text.js';
 import { TOOL_DEFINITIONS, executeTool, type ToolContext } from './tools.js';
 import { digestAttachments, loadImageParts } from './vision.js';
@@ -195,6 +195,49 @@ export function addresseeOf(message: QQBotInboundMessage, config: AgentConfig): 
     result.to = names.join('、');
   }
   return result;
+}
+
+/**
+ * 判断这条消息是不是「需要完整答案的正经问题」。
+ *
+ * 不看是谁问的，只看问的是什么：群里任何人都可能问一个真问题。
+ * 纯规则判定，零成本；宁可偶尔把闲聊判成正经（长一点），也别把问题判成闲聊。
+ */
+const SERIOUS_PATTERNS = [
+  /为什么/,
+  /为啥/,
+  /怎么(办|弄|搞|做|用|配|装|改|查|写|选)/,
+  /如何/,
+  /什么(原理|区别|意思|情况|原因)/,
+  /(区别|差异)是?什么/,
+  /是不是|能不能|可不可以|要不要|该不该|值不值/,
+  /帮我(看|查|分析|总结|写|改|弄|配|装)/,
+  /解释|分析一下|梳理|对比|评估|方案|建议|思路/,
+  /报错|错误|失败|不生效|没反应|连不上|打不开/,
+  /配置|安装|部署|编译|调试|优化|迁移/,
+  /代码|脚本|命令|参数|接口|数据库|服务器|域名|证书/,
+];
+
+/** 代码块、链接、路径这类明显是拿来问事的。 */
+const SERIOUS_MARKERS = [/```/, /https?:\/\//, /\/[\w.-]+\/[\w.-]+/, /\.(json|ya?ml|log|conf|py|ts|js|sh|md)\b/i];
+
+export function needsFullAnswer(text: string): boolean {
+  const body = text.trim();
+  if (!body) {
+    return false;
+  }
+  // 短寒暄一律不算，哪怕带问号（「在吗？」「吃了吗？」）
+  if (body.length < 12) {
+    return false;
+  }
+  if (SERIOUS_PATTERNS.some((re) => re.test(body))) {
+    return true;
+  }
+  if (SERIOUS_MARKERS.some((re) => re.test(body))) {
+    return true;
+  }
+  // 长句 + 问号：多半是在描述一件事然后求助
+  return body.length >= 40 && /[?？]/.test(body);
 }
 
 /** 单条消息上限（QQ 文本消息过长会被截断或发送失败）。 */
@@ -635,8 +678,13 @@ export class ChatAgent {
       parts.push(`## 你记得的 ${speaker}\n\n${remembered}`);
     }
     const isOwner = this.config.ownerOpenids.includes(message.senderId);
+    // 不看是谁问的，只看问的是什么：群里任何人都可能问一个真问题
+    const serious = isOwner || needsFullAnswer(text);
+    if (serious) {
+      parts.push(FULL_ANSWER_MODE);
+    }
     if (isOwner) {
-      parts.push(OWNER_MODE);
+      parts.push(OWNER_HINT);
     }
     if (scope.isDirect) {
       parts.push('## 提示\n\n现在是私聊，不是群里，可以放开一点聊。');
@@ -667,8 +715,8 @@ export class ChatAgent {
       if (!cleaned) {
         return false;
       }
-      // 主人可以长；群里仍然限制条数免得刷屏
-      const chunks = isOwner
+      // 正经问题可以长；纯闲聊仍然限制条数免得刷屏
+      const chunks = serious
         ? splitReply(cleaned, 3000, 4, true)
         : splitReply(cleaned);
       for (let i = 0; i < chunks.length; i += 1) {
@@ -693,13 +741,13 @@ export class ChatAgent {
       purpose: 'chat' as const,
       conversationId: scope.conversationId,
       speaker,
-      // 主人问正经事：让它完整推理，别为了省几百毫秒把思考关掉
-      ...(isOwner ? { disableThinking: false, timeoutMs: 120_000 } : {}),
+      // 正经问题：让它完整推理，别为了省几百毫秒把思考关掉
+      ...(serious ? { disableThinking: false, timeoutMs: 120_000 } : {}),
     };
     const chatId = scope.isDirect ? undefined : scope.conversationId;
 
     try {
-      const reply = await this.converse(buildMessages(userText, true), opts, chatId, isOwner ? 6 : 3);
+      const reply = await this.converse(buildMessages(userText, true), opts, chatId, serious ? 6 : 3);
       await send(reply);
     } catch (error) {
       // 带图请求失败（模型不支持 / 图太大被拒）就退回文字描述，别整条哑掉
@@ -715,7 +763,7 @@ export class ChatAgent {
       try {
         const captions = await this.enrich(message, message.attachments ?? []);
         const fallbackBody = `${userText}\n${captions}`.trim();
-        const reply = await this.converse(buildMessages(fallbackBody, false), opts, chatId, isOwner ? 6 : 3);
+        const reply = await this.converse(buildMessages(fallbackBody, false), opts, chatId, serious ? 6 : 3);
         await send(reply);
       } catch (retryError) {
         this.log.error('回复失败（退化后）', { conversationId: scope.conversationId, error: retryError });

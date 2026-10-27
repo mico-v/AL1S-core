@@ -9,7 +9,7 @@
 import { mkdir, mkdtemp, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
-import { ChatAgent, isBotMentioned, readAgentConfig, splitReply } from '../agent/index.js';
+import { ChatAgent, isBotMentioned, needsFullAnswer, readAgentConfig, splitReply } from '../agent/index.js';
 import type { ChatMessage } from '../agent/llm.js';
 import { GroupBuffer, renderBuffer } from '../agent/context.js';
 import { GroupMemory } from '../agent/memory.js';
@@ -111,8 +111,15 @@ async function main(): Promise<void> {
   check('点名机器人标 → Kei', (rendered.split('\n')[2] ?? '').includes('小明 → Kei'));
   check('空缓冲渲染成空串', renderBuffer([]) === '');
 
-  console.log('\n[1.5] 主人模式');
+  console.log('\n[1.5] 完整回答模式（按问题，不按人）');
   {
+    check('复杂问题 → 完整', needsFullAnswer('为什么 raw.githubusercontent.com 拉不下来'));
+    check('求助类 → 完整', needsFullAnswer('这个报错怎么弄 一直启动失败'));
+    check('带链接 → 完整', needsFullAnswer('你看下 https://example.com/a.json 这个'));
+    check('寒暄 → 不完整', !needsFullAnswer('在吗？'));
+    check('闲聊 → 不完整', !needsFullAnswer('今天上课好累啊'));
+    check('太短 → 不完整', !needsFullAnswer('为啥'));
+
     const ownerConfig = readAgentConfig({
       AGENT_BOT_OPENIDS: BOT_OPENID,
       AGENT_BOT_USERNAMES: 'Kei',
@@ -121,33 +128,33 @@ async function main(): Promise<void> {
       AGENT_OWNER_OPENIDS: MEMBER_OPENID,
     } as NodeJS.ProcessEnv);
 
-    let captured: { system: string; opts: Record<string, unknown> } | undefined;
-    const agent = new ChatAgent(ownerConfig, quietLogger, async (messages, opts) => {
-      captured = {
-        system: typeof messages[0]?.content === 'string' ? messages[0].content : '',
-        opts: opts as unknown as Record<string, unknown>,
-      };
-      return '第一点…\n第二点…';
-    });
-    await agent.handle(
-      makeMessage({ mentions: [{ member_openid: BOT_OPENID }] }),
-      { replyText: async () => {} } as unknown as Bot,
-    );
-    check('主人模式注入了「完整回答」', captured?.system.includes('回答要完整') === true);
-    check('主人模式覆盖长度硬规则', captured?.system.includes('覆盖上面「硬规则」') === true);
-    check('主人模式打开思考', captured?.opts.disableThinking === false);
-    check('主人模式放宽超时', (captured?.opts.timeoutMs as number) >= 60_000);
+    const capture = async (content: string, senderId: string) => {
+      let seen: { system: string; opts: Record<string, unknown> } | undefined;
+      const agent = new ChatAgent(ownerConfig, quietLogger, async (messages, opts) => {
+        seen = {
+          system: typeof messages[0]?.content === 'string' ? messages[0].content : '',
+          opts: opts as unknown as Record<string, unknown>,
+        };
+        return '好';
+      });
+      await agent.handle(
+        makeMessage({ content, senderId, senderName: '路人', mentions: [{ member_openid: BOT_OPENID }] }),
+        { replyText: async () => {} } as unknown as Bot,
+      );
+      return seen;
+    };
 
-    let normalSystem = '';
-    const normalAgent = new ChatAgent(ownerConfig, quietLogger, async (messages) => {
-      normalSystem = typeof messages[0]?.content === 'string' ? messages[0].content : '';
-      return '嗯';
-    });
-    await normalAgent.handle(
-      makeMessage({ senderId: 'someone-else', senderName: '路人', mentions: [{ member_openid: BOT_OPENID }] }),
-      { replyText: async () => {} } as unknown as Bot,
-    );
-    check('非主人不注入主人模式', !normalSystem.includes('回答要完整'));
+    const seriousSeen = await capture('为什么群里的机器人有时候不回话', 'stranger-1');
+    check('陌生人问复杂问题也完整回答', seriousSeen?.system.includes('回答要完整') === true);
+    check('完整模式覆盖长度硬规则', seriousSeen?.system.includes('覆盖上面「硬规则」') === true);
+    check('完整模式打开思考', seriousSeen?.opts.disableThinking === false);
+    check('完整模式放宽超时', (seriousSeen?.opts.timeoutMs as number) >= 60_000);
+
+    const casualSeen = await capture('今天上课好累啊', 'stranger-2');
+    check('闲聊不触发完整模式', casualSeen?.system.includes('回答要完整') !== true);
+
+    const ownerSeen = await capture('今天上课好累啊', MEMBER_OPENID);
+    check('主人闲聊也带主人提示', ownerSeen?.system.includes('主人') === true);
 
     const long = ['第一段'.repeat(60), '第二段'.repeat(60), '第三段'.repeat(60)].join('\n\n');
     const ownerChunks = splitReply(long, 3000, 4, true);
