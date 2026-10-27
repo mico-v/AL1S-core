@@ -9,7 +9,7 @@
 import { mkdir, mkdtemp, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
-import { ChatAgent, isBotMentioned, needsFullAnswer, readAgentConfig, splitReply } from '../agent/index.js';
+import { ChatAgent, isBotMentioned, MAX_REPLY_CHARS, MAX_REPLY_CHUNKS, readAgentConfig, splitReply } from '../agent/index.js';
 import type { ChatMessage } from '../agent/llm.js';
 import { GroupBuffer, renderBuffer } from '../agent/context.js';
 import { GroupMemory } from '../agent/memory.js';
@@ -111,56 +111,20 @@ async function main(): Promise<void> {
   check('点名机器人标 → Kei', (rendered.split('\n')[2] ?? '').includes('小明 → Kei'));
   check('空缓冲渲染成空串', renderBuffer([]) === '');
 
-  console.log('\n[1.5] 完整回答模式（按问题，不按人）');
+  console.log('\n[1.5] 回答长短交给模型判断');
   {
-    check('复杂问题 → 完整', needsFullAnswer('为什么 raw.githubusercontent.com 拉不下来'));
-    check('求助类 → 完整', needsFullAnswer('这个报错怎么弄 一直启动失败'));
-    check('带链接 → 完整', needsFullAnswer('你看下 https://example.com/a.json 这个'));
-    check('寒暄 → 不完整', !needsFullAnswer('在吗？'));
-    check('闲聊 → 不完整', !needsFullAnswer('今天上课好累啊'));
-    check('太短 → 不完整', !needsFullAnswer('为啥'));
+    check('人格里写了「先判断该怎么答」', PERSONA.includes('先判断这一轮该怎么答'));
+    check('人格里没有写死短句上限', !PERSONA.includes('一条通常 1–3 句'));
+    check('人格允许正经问题展开', PERSONA.includes('把话说全'));
+    check('人格允许分点和列表', PERSONA.includes('该分点就分点'));
 
-    const ownerConfig = readAgentConfig({
-      AGENT_BOT_OPENIDS: BOT_OPENID,
-      AGENT_BOT_USERNAMES: 'Kei',
-      AGENT_GROUPS: GROUP,
-      AGENT_TOOLS: 'false',
-      AGENT_OWNER_OPENIDS: MEMBER_OPENID,
-    } as NodeJS.ProcessEnv);
-
-    const capture = async (content: string, senderId: string) => {
-      let seen: { system: string; opts: Record<string, unknown> } | undefined;
-      const agent = new ChatAgent(ownerConfig, quietLogger, async (messages, opts) => {
-        seen = {
-          system: typeof messages[0]?.content === 'string' ? messages[0].content : '',
-          opts: opts as unknown as Record<string, unknown>,
-        };
-        return '好';
-      });
-      await agent.handle(
-        makeMessage({ content, senderId, senderName: '路人', mentions: [{ member_openid: BOT_OPENID }] }),
-        { replyText: async () => {} } as unknown as Bot,
-      );
-      return seen;
-    };
-
-    const seriousSeen = await capture('为什么群里的机器人有时候不回话', 'stranger-1');
-    check('陌生人问复杂问题也完整回答', seriousSeen?.system.includes('回答要完整') === true);
-    check('完整模式覆盖长度硬规则', seriousSeen?.system.includes('覆盖上面「硬规则」') === true);
-    check('完整模式打开思考', seriousSeen?.opts.disableThinking === false);
-    check('完整模式放宽超时', (seriousSeen?.opts.timeoutMs as number) >= 60_000);
-
-    const casualSeen = await capture('今天上课好累啊', 'stranger-2');
-    check('闲聊不触发完整模式', casualSeen?.system.includes('回答要完整') !== true);
-
-    const ownerSeen = await capture('今天上课好累啊', MEMBER_OPENID);
-    check('主人闲聊也带主人提示', ownerSeen?.system.includes('主人') === true);
-
-    const long = ['第一段'.repeat(60), '第二段'.repeat(60), '第三段'.repeat(60)].join('\n\n');
-    const ownerChunks = splitReply(long, 3000, 4, true);
-    check('主人长回复不按空行炸成多条', ownerChunks.length <= 2, `实际 ${ownerChunks.length} 条`);
-    check('主人单条不超长', ownerChunks.every((c) => c.length <= 3000), ownerChunks.map((c) => c.length).join(','));
-    check('群聊仍按空行分条', splitReply(long).length >= 2);
+    // 分片只负责不丢内容、不炸屏，不参与「说什么」
+    const paragraphs = Array.from({ length: 24 }, (_, i) => `第${i + 1}段内容`.repeat(8));
+    const many = splitReply(paragraphs.join('\n\n'));
+    check('24 段不会发成 24 条', many.length <= 3, `实际 ${many.length} 条`);
+    check('合并后内容不丢', many.join('').includes('第24段内容'));
+    const normal = splitReply('诶 累成这样\n\n一天白过也没啥');
+    check('两三句仍按原节奏分条', normal.length === 2, `实际 ${normal.length}`);
   }
 
   console.log('\n[2.15] 缓冲里的图片引用');
@@ -237,11 +201,11 @@ async function main(): Promise<void> {
     check('单换行不切', splitReply('第一行\n第二行').length === 1);
     check('多个空行只切一次', splitReply('甲\n\n\n\n乙').length === 2);
     check('空行分段内容正确', splitReply('甲\n\n乙')[1] === '乙', JSON.stringify(splitReply('甲\n\n乙')));
-    check('超过上限会合并', splitReply('一\n\n二\n\n三\n\n四\n\n五').length === 3);
+    check('超过条数会合并', splitReply('一\n\n二\n\n三\n\n四\n\n五').length <= MAX_REPLY_CHUNKS);
     const long = '第一段内容'.repeat(200) + '\n\n' + '第二段内容'.repeat(200);
     const parts = splitReply(long);
     check('长回复被切开', parts.length >= 2, `实际 ${parts.length}`);
-    check('每片不超限', parts.every((p) => p.length <= 700), `最长 ${Math.max(...parts.map((p) => p.length))}`);
+    check('每片不超限', parts.every((p) => p.length <= MAX_REPLY_CHARS), `最长 ${Math.max(...parts.map((p) => p.length))}`);
     check('没有丢内容', parts.join('').replace(/\s/g, '').length === long.replace(/\s/g, '').length);
 
     console.log('\n[6] 私聊');

@@ -23,7 +23,7 @@ import {
   type LlmOptions,
 } from './llm.js';
 import { GroupMemory } from './memory.js';
-import { CONTEXT_FOOTER, CONTEXT_HEADER, FULL_ANSWER_MODE, OWNER_HINT, PERSONA } from './persona.js';
+import { CONTEXT_FOOTER, CONTEXT_HEADER, PERSONA } from './persona.js';
 import { cleanQQText } from './text.js';
 import { TOOL_DEFINITIONS, executeTool, type ToolContext } from './tools.js';
 import { digestAttachments, loadImageParts } from './vision.js';
@@ -197,51 +197,8 @@ export function addresseeOf(message: QQBotInboundMessage, config: AgentConfig): 
   return result;
 }
 
-/**
- * 判断这条消息是不是「需要完整答案的正经问题」。
- *
- * 不看是谁问的，只看问的是什么：群里任何人都可能问一个真问题。
- * 纯规则判定，零成本；宁可偶尔把闲聊判成正经（长一点），也别把问题判成闲聊。
- */
-const SERIOUS_PATTERNS = [
-  /为什么/,
-  /为啥/,
-  /怎么(办|弄|搞|做|用|配|装|改|查|写|选)/,
-  /如何/,
-  /什么(原理|区别|意思|情况|原因)/,
-  /(区别|差异)是?什么/,
-  /是不是|能不能|可不可以|要不要|该不该|值不值/,
-  /帮我(看|查|分析|总结|写|改|弄|配|装)/,
-  /解释|分析一下|梳理|对比|评估|方案|建议|思路/,
-  /报错|错误|失败|不生效|没反应|连不上|打不开/,
-  /配置|安装|部署|编译|调试|优化|迁移/,
-  /代码|脚本|命令|参数|接口|数据库|服务器|域名|证书/,
-];
-
-/** 代码块、链接、路径这类明显是拿来问事的。 */
-const SERIOUS_MARKERS = [/```/, /https?:\/\//, /\/[\w.-]+\/[\w.-]+/, /\.(json|ya?ml|log|conf|py|ts|js|sh|md)\b/i];
-
-export function needsFullAnswer(text: string): boolean {
-  const body = text.trim();
-  if (!body) {
-    return false;
-  }
-  // 短寒暄一律不算，哪怕带问号（「在吗？」「吃了吗？」）
-  if (body.length < 12) {
-    return false;
-  }
-  if (SERIOUS_PATTERNS.some((re) => re.test(body))) {
-    return true;
-  }
-  if (SERIOUS_MARKERS.some((re) => re.test(body))) {
-    return true;
-  }
-  // 长句 + 问号：多半是在描述一件事然后求助
-  return body.length >= 40 && /[?？]/.test(body);
-}
-
 /** 单条消息上限（QQ 文本消息过长会被截断或发送失败）。 */
-export const MAX_REPLY_CHARS = 700;
+export const MAX_REPLY_CHARS = 1500;
 
 /** 一条回复最多拆成几条消息。QQ 群被动回复 5 分钟内最多 5 次，留余量。 */
 export const MAX_REPLY_CHUNKS = 3;
@@ -299,12 +256,30 @@ export function splitReply(
     return nonEmpty;
   }
 
-  // 条数超限时把尾巴并成一条；并完还是太长就宁可多发，也不截断内容
-  const merged = nonEmpty.slice(maxChunks - 1).join('\n');
-  if (merged.length <= limit) {
-    return [...nonEmpty.slice(0, maxChunks - 1), merged];
+  // 条数超限：按总字数均分成 maxChunks 组。
+  // 不丢内容，也不至于把一段完整回答拆成二十条刷屏。
+  const total = nonEmpty.join('\n').length;
+  const per = Math.ceil(total / maxChunks);
+  const buckets: string[] = [];
+  let current = '';
+  for (const part of nonEmpty) {
+    const next = current ? `${current}\n${part}` : part;
+    // 到了最后一格就全吃进 current，保证不丢内容、条数不超限
+    if (buckets.length >= maxChunks - 1) {
+      current = next;
+      continue;
+    }
+    if (current && next.length > per) {
+      buckets.push(current);
+      current = part;
+    } else {
+      current = next;
+    }
   }
-  return nonEmpty;
+  if (current) {
+    buckets.push(current);
+  }
+  return buckets;
 }
 
 interface Scope {
@@ -444,7 +419,7 @@ export class ChatAgent {
     messages: ChatMessage[],
     opts: LlmOptions,
     chatId?: string,
-    maxRounds = 3,
+    maxRounds = 5,
   ): Promise<string> {
     if (!this.config.toolsEnabled) {
       return this.complete(messages, opts, 1);
@@ -677,15 +652,7 @@ export class ChatAgent {
     if (remembered) {
       parts.push(`## 你记得的 ${speaker}\n\n${remembered}`);
     }
-    const isOwner = this.config.ownerOpenids.includes(message.senderId);
-    // 不看是谁问的，只看问的是什么：群里任何人都可能问一个真问题
-    const serious = isOwner || needsFullAnswer(text);
-    if (serious) {
-      parts.push(FULL_ANSWER_MODE);
-    }
-    if (isOwner) {
-      parts.push(OWNER_HINT);
-    }
+    // 怎么答由模型自己判断（人格里已经写清楚了），代码不预分类
     if (scope.isDirect) {
       parts.push('## 提示\n\n现在是私聊，不是群里，可以放开一点聊。');
     }
@@ -715,10 +682,7 @@ export class ChatAgent {
       if (!cleaned) {
         return false;
       }
-      // 正经问题可以长；纯闲聊仍然限制条数免得刷屏
-      const chunks = serious
-        ? splitReply(cleaned, 3000, 4, true)
-        : splitReply(cleaned);
+      const chunks = splitReply(cleaned);
       for (let i = 0; i < chunks.length; i += 1) {
         await bot.replyText(scope.replyTarget, chunks[i] as string);
         if (i < chunks.length - 1) {
@@ -741,13 +705,13 @@ export class ChatAgent {
       purpose: 'chat' as const,
       conversationId: scope.conversationId,
       speaker,
-      // 正经问题：让它完整推理，别为了省几百毫秒把思考关掉
-      ...(serious ? { disableThinking: false, timeoutMs: 120_000 } : {}),
+      // 思考与超时走配置（AGENT_DISABLE_THINKING / AGENT_TIMEOUT_MS），
+      // 不按消息类型切换 —— 怎么答交给模型判断
     };
     const chatId = scope.isDirect ? undefined : scope.conversationId;
 
     try {
-      const reply = await this.converse(buildMessages(userText, true), opts, chatId, serious ? 6 : 3);
+      const reply = await this.converse(buildMessages(userText, true), opts, chatId);
       await send(reply);
     } catch (error) {
       // 带图请求失败（模型不支持 / 图太大被拒）就退回文字描述，别整条哑掉
@@ -763,7 +727,7 @@ export class ChatAgent {
       try {
         const captions = await this.enrich(message, message.attachments ?? []);
         const fallbackBody = `${userText}\n${captions}`.trim();
-        const reply = await this.converse(buildMessages(fallbackBody, false), opts, chatId, serious ? 6 : 3);
+        const reply = await this.converse(buildMessages(fallbackBody, false), opts, chatId);
         await send(reply);
       } catch (retryError) {
         this.log.error('回复失败（退化后）', { conversationId: scope.conversationId, error: retryError });
