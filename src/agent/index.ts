@@ -23,7 +23,7 @@ import {
   type LlmOptions,
 } from './llm.js';
 import { GroupMemory } from './memory.js';
-import { CONTEXT_FOOTER, CONTEXT_HEADER, PERSONA } from './persona.js';
+import { CONTEXT_FOOTER, CONTEXT_HEADER, OWNER_MODE, PERSONA } from './persona.js';
 import { cleanQQText } from './text.js';
 import { TOOL_DEFINITIONS, executeTool, type ToolContext } from './tools.js';
 import { digestAttachments, loadImageParts } from './vision.js';
@@ -210,16 +210,21 @@ export const MAX_REPLY_CHUNKS = 3;
  * 单个换行只是行内换行，仍算同一条。
  * 单段超长再按句末/逗号切，避免一条撑爆 QQ 的长度限制。
  */
-export function splitReply(text: string, limit: number = MAX_REPLY_CHARS): string[] {
+export function splitReply(
+  text: string,
+  limit: number = MAX_REPLY_CHARS,
+  maxChunks: number = MAX_REPLY_CHUNKS,
+  /** true = 不按空行拆，尽量并成少数几条（主人模式用，避免刷屏式轰炸） */
+  compact = false,
+): string[] {
   const trimmed = text.trim();
   if (!trimmed) {
     return [];
   }
 
-  const paragraphs = trimmed
-    .split(/\n{2,}/)
-    .map((part) => part.trim())
-    .filter(Boolean);
+  const paragraphs = compact
+    ? [trimmed.split(/\n{2,}/).map((part) => part.trim()).filter(Boolean).join('\n')]
+    : trimmed.split(/\n{2,}/).map((part) => part.trim()).filter(Boolean);
 
   const chunks: string[] = [];
   for (const paragraph of paragraphs) {
@@ -247,14 +252,14 @@ export function splitReply(text: string, limit: number = MAX_REPLY_CHARS): strin
   }
 
   const nonEmpty = chunks.filter(Boolean);
-  if (nonEmpty.length <= MAX_REPLY_CHUNKS) {
+  if (nonEmpty.length <= maxChunks) {
     return nonEmpty;
   }
 
   // 条数超限时把尾巴并成一条；并完还是太长就宁可多发，也不截断内容
-  const merged = nonEmpty.slice(MAX_REPLY_CHUNKS - 1).join('\n');
+  const merged = nonEmpty.slice(maxChunks - 1).join('\n');
   if (merged.length <= limit) {
-    return [...nonEmpty.slice(0, MAX_REPLY_CHUNKS - 1), merged];
+    return [...nonEmpty.slice(0, maxChunks - 1), merged];
   }
   return nonEmpty;
 }
@@ -392,7 +397,12 @@ export class ChatAgent {
    * 回合上限 3：查历史 / 查档案 / 再补一次，足够覆盖真实提问，
    * 又不至于让一条群消息拖出十几秒。
    */
-  private async converse(messages: ChatMessage[], opts: LlmOptions, chatId?: string): Promise<string> {
+  private async converse(
+    messages: ChatMessage[],
+    opts: LlmOptions,
+    chatId?: string,
+    maxRounds = 3,
+  ): Promise<string> {
     if (!this.config.toolsEnabled) {
       return this.complete(messages, opts, 1);
     }
@@ -407,7 +417,7 @@ export class ChatAgent {
     };
 
     let convo = [...messages];
-    for (let round = 0; round < 3; round += 1) {
+    for (let round = 0; round < maxRounds; round += 1) {
       const response = await this.completeRaw(convo, { ...opts, tools: TOOL_DEFINITIONS }, 1);
       if (response.toolCalls.length === 0) {
         return response.content;
@@ -624,8 +634,9 @@ export class ChatAgent {
     if (remembered) {
       parts.push(`## 你记得的 ${speaker}\n\n${remembered}`);
     }
-    if (this.config.ownerOpenids.includes(message.senderId)) {
-      parts.push('## 提示\n\n现在说话的是**主人**，可以更放松、更直接一点。');
+    const isOwner = this.config.ownerOpenids.includes(message.senderId);
+    if (isOwner) {
+      parts.push(OWNER_MODE);
     }
     if (scope.isDirect) {
       parts.push('## 提示\n\n现在是私聊，不是群里，可以放开一点聊。');
@@ -656,7 +667,10 @@ export class ChatAgent {
       if (!cleaned) {
         return false;
       }
-      const chunks = splitReply(cleaned);
+      // 主人可以长；群里仍然限制条数免得刷屏
+      const chunks = isOwner
+        ? splitReply(cleaned, 3000, 4, true)
+        : splitReply(cleaned);
       for (let i = 0; i < chunks.length; i += 1) {
         await bot.replyText(scope.replyTarget, chunks[i] as string);
         if (i < chunks.length - 1) {
@@ -679,11 +693,13 @@ export class ChatAgent {
       purpose: 'chat' as const,
       conversationId: scope.conversationId,
       speaker,
+      // 主人问正经事：让它完整推理，别为了省几百毫秒把思考关掉
+      ...(isOwner ? { disableThinking: false, timeoutMs: 120_000 } : {}),
     };
     const chatId = scope.isDirect ? undefined : scope.conversationId;
 
     try {
-      const reply = await this.converse(buildMessages(userText, true), opts, chatId);
+      const reply = await this.converse(buildMessages(userText, true), opts, chatId, isOwner ? 6 : 3);
       await send(reply);
     } catch (error) {
       // 带图请求失败（模型不支持 / 图太大被拒）就退回文字描述，别整条哑掉
@@ -699,7 +715,7 @@ export class ChatAgent {
       try {
         const captions = await this.enrich(message, message.attachments ?? []);
         const fallbackBody = `${userText}\n${captions}`.trim();
-        const reply = await this.converse(buildMessages(fallbackBody, false), opts, chatId);
+        const reply = await this.converse(buildMessages(fallbackBody, false), opts, chatId, isOwner ? 6 : 3);
         await send(reply);
       } catch (retryError) {
         this.log.error('回复失败（退化后）', { conversationId: scope.conversationId, error: retryError });

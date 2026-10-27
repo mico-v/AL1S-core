@@ -111,6 +111,51 @@ async function main(): Promise<void> {
   check('点名机器人标 → Kei', (rendered.split('\n')[2] ?? '').includes('小明 → Kei'));
   check('空缓冲渲染成空串', renderBuffer([]) === '');
 
+  console.log('\n[1.5] 主人模式');
+  {
+    const ownerConfig = readAgentConfig({
+      AGENT_BOT_OPENIDS: BOT_OPENID,
+      AGENT_BOT_USERNAMES: 'Kei',
+      AGENT_GROUPS: GROUP,
+      AGENT_TOOLS: 'false',
+      AGENT_OWNER_OPENIDS: MEMBER_OPENID,
+    } as NodeJS.ProcessEnv);
+
+    let captured: { system: string; opts: Record<string, unknown> } | undefined;
+    const agent = new ChatAgent(ownerConfig, quietLogger, async (messages, opts) => {
+      captured = {
+        system: typeof messages[0]?.content === 'string' ? messages[0].content : '',
+        opts: opts as unknown as Record<string, unknown>,
+      };
+      return '第一点…\n第二点…';
+    });
+    await agent.handle(
+      makeMessage({ mentions: [{ member_openid: BOT_OPENID }] }),
+      { replyText: async () => {} } as unknown as Bot,
+    );
+    check('主人模式注入了「完整回答」', captured?.system.includes('回答要完整') === true);
+    check('主人模式覆盖长度硬规则', captured?.system.includes('覆盖上面「硬规则」') === true);
+    check('主人模式打开思考', captured?.opts.disableThinking === false);
+    check('主人模式放宽超时', (captured?.opts.timeoutMs as number) >= 60_000);
+
+    let normalSystem = '';
+    const normalAgent = new ChatAgent(ownerConfig, quietLogger, async (messages) => {
+      normalSystem = typeof messages[0]?.content === 'string' ? messages[0].content : '';
+      return '嗯';
+    });
+    await normalAgent.handle(
+      makeMessage({ senderId: 'someone-else', senderName: '路人', mentions: [{ member_openid: BOT_OPENID }] }),
+      { replyText: async () => {} } as unknown as Bot,
+    );
+    check('非主人不注入主人模式', !normalSystem.includes('回答要完整'));
+
+    const long = ['第一段'.repeat(60), '第二段'.repeat(60), '第三段'.repeat(60)].join('\n\n');
+    const ownerChunks = splitReply(long, 3000, 4, true);
+    check('主人长回复不按空行炸成多条', ownerChunks.length <= 2, `实际 ${ownerChunks.length} 条`);
+    check('主人单条不超长', ownerChunks.every((c) => c.length <= 3000), ownerChunks.map((c) => c.length).join(','));
+    check('群聊仍按空行分条', splitReply(long).length >= 2);
+  }
+
   console.log('\n[2.15] 缓冲里的图片引用');
   {
     const ib = new GroupBuffer(10);
