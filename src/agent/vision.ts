@@ -29,7 +29,7 @@ const MAX_IMAGES_PER_MESSAGE = 3;
 /** 看图的 token 预算。关掉推理后 600 足够，留点余量防止截断。 */
 const CAPTION_MAX_TOKENS = 600;
 /** 看图最多等这么久：超过就认「没看清」，别让人干等。 */
-const CAPTION_TIMEOUT_MS = 25_000;
+const CAPTION_TIMEOUT_MS = 35_000;
 /** 同时在跑的看图请求数。 */
 const CAPTION_CONCURRENCY = 2;
 
@@ -321,8 +321,11 @@ export async function digestAttachments(
       continue;
     }
     try {
-      const bytes = await download(item.url);
-      const desc = await describeImage(bytes, mimeOf(item.content_type, bytes), llm, log);
+      const raw = await download(item.url);
+      // 和直传路径一致：先缩放并转成标准 JPEG。
+      // 大图 base64 进去会被上游判 400「Failed to load image」，超时也多半是它拖的。
+      const prepared = await prepareImage(raw, mimeOf(item.content_type, raw), log);
+      const desc = await describeImage(prepared.data, prepared.mime, llm, log);
       if (!desc) {
         imagesFailed += 1;
         lines.push(`[图${index + 1}] （没看清）`);

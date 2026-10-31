@@ -66,7 +66,10 @@ interface ReplyLine {
   at: string;
   speaker: string;
   text: string;
+  chars?: number;
   chunks: number;
+  silent?: boolean;
+  ms?: number;
 }
 
 async function readReplies(): Promise<ReplyLine[]> {
@@ -175,7 +178,7 @@ async function main(): Promise<void> {
   }
 
   console.log('\n## 最近回复样本（用于判断质量，不含 @ 前缀）');
-  const samples = botLines.slice(-8);
+  const samples = botLines.filter((r) => !r.silent && r.text).slice(-8);
   if (samples.length === 0) {
     console.log('（这段时间 Kei 没说话）');
   }
@@ -186,10 +189,18 @@ async function main(): Promise<void> {
   }
 
   const hours = new Set(human.map((l) => (l.timestamp ?? '').slice(0, 13))).size;
+  const spoke = botLines.filter((r) => !r.silent && r.text);
+  const silent = botLines.filter((r) => r.silent);
+  const avgMs = spoke.length > 0 ? Math.round(spoke.reduce((a, r) => a + (r.ms ?? 0), 0) / spoke.length) : 0;
+  const avgChars = spoke.length > 0 ? Math.round(spoke.reduce((a, r) => a + (r.chars ?? r.text.length), 0) / spoke.length) : 0;
+  const answered = spoke.length + silent.length;
   console.log(
-    `\n## 活跃度\n真人发言覆盖 ${hours} 个小时段 · Kei 回复 ${botLines.length} 次 · ` +
-      `回复率 ${human.length > 0 ? pct(botLines.length / human.length) : '0%'}`,
+    `\n## 活跃度\n真人发言覆盖 ${hours} 个小时段 · 被叫 ${answered} 次 ` +
+      `（开口 ${spoke.length} · 选择沉默 ${silent.length}）`,
   );
+  if (spoke.length > 0) {
+    console.log(`开口时平均 ${avgChars} 字 · 平均耗时 ${fmtMs(avgMs)}`);
+  }
 }
 
 void main();

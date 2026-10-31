@@ -217,10 +217,19 @@ export async function learnGroup(
 
   // 输出坏了（多半被截断）就别推进水位线，否则这批消息永远学不到
   if (!valid) {
-    log.warn('归纳结果不合法，保留水位线下次重试', {
+    // 砍半到 1 个人还是解析不出来，说明这批内容本身有问题。
+    // 继续卡在这里会让水位线永久不动（每 30 分钟重试同一批），
+    // 所以记一笔缺口、把水位推过去 —— 丢一次学习，好过永远卡死。
+    const last = records[records.length - 1];
+    await memory.writeState({
+      lastMessageId: last?.messageId,
+      lastMessageAt: new Date().toISOString(),
+    });
+    log.warn('归纳结果不合法，跳过本批并推进水位线', {
       groupOpenid,
       members: members.length,
       rounds,
+      skipped: records.length,
     });
     return { processed: records.length, written: profiles.length };
   }

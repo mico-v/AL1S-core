@@ -751,9 +751,15 @@ export class ChatAgent {
       },
     ];
 
+    const startedAt = Date.now();
     const send = async (raw: string): Promise<boolean> => {
       const cleaned = raw.replace(/^\s*\[SILENT\]\s*$/i, '').trim();
       if (!cleaned) {
+        // 她选择不说话也要留痕，否则「没叫她」和「叫了但沉默」分不清
+        await this.recordReply(scope.conversationId, speaker, '', 0, {
+          silent: true,
+          ms: Date.now() - startedAt,
+        });
         return false;
       }
       const chunks = splitReply(cleaned);
@@ -775,7 +781,9 @@ export class ChatAgent {
           });
         }
       }
-      await this.recordReply(scope.conversationId, speaker, cleaned, chunks.length);
+      await this.recordReply(scope.conversationId, speaker, cleaned, chunks.length, {
+        ms: Date.now() - startedAt,
+      });
       this.log.info('已回复', {
         conversationId: scope.conversationId,
         speaker,
@@ -823,7 +831,13 @@ export class ChatAgent {
   }
 
   /** 把自己的回复落一行，供每日体检取样本（chat-log 里没有 bot 自己的话）。 */
-  private async recordReply(chatId: string, speaker: string, text: string, chunks: number): Promise<void> {
+  private async recordReply(
+    chatId: string,
+    speaker: string,
+    text: string,
+    chunks: number,
+    extra: { silent?: boolean; ms?: number } = {},
+  ): Promise<void> {
     // 自检/试跑用假模型，不该把测试数据写进真实样本
     if (process.env.AGENT_REPLY_LOG === 'false') {
       return;
@@ -834,7 +848,16 @@ export class ChatAgent {
       const day = new Date().toISOString().slice(0, 10);
       await appendFile(
         path.join(dir, `${day}.jsonl`),
-        `${JSON.stringify({ at: new Date().toISOString(), chatId, speaker, text, chunks })}\n`,
+        `${JSON.stringify({
+          at: new Date().toISOString(),
+          chatId,
+          speaker,
+          text,
+          chars: text.length,
+          chunks,
+          silent: extra.silent ?? false,
+          ms: extra.ms ?? 0,
+        })}\n`,
         'utf8',
       );
     } catch (error) {
