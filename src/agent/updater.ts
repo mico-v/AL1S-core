@@ -13,7 +13,9 @@ import { chatComplete, type LlmOptions } from './llm.js';
 import { GroupMemory, readNewRecords, type RawRecord } from './memory.js';
 
 const MIN_RECORDS = 6;
-const MAX_RECORDS_PER_RUN = 120;
+// 一次喂太多（120 条 × 1200 字）会让归纳请求超过 90s 超时，
+// 超时后还会重试，白烧 4 分钟。60 条足够覆盖一天。
+const MAX_RECORDS_PER_RUN = 60;
 const MAX_CONTENT_CHARS = 1200;
 /**
  * 一轮最多更新多少人的档案。
@@ -188,9 +190,12 @@ export async function learnGroup(
         temperature: 0.3,
         // 结构化输出不需要推理；开着会把预算烧光，返回空内容
         disableThinking: true,
+        // 归纳是一次性长调用：给足 3 分钟；不重试 —— 重试只会把 90s 变成 270s
+        timeoutMs: 180_000,
         purpose: 'learn',
         conversationId: groupOpenid,
       },
+      0,
     );
     return parseProfiles(raw);
   };

@@ -16,6 +16,12 @@ export interface BufferedLine {
   to?: string;
   /** 是否点名了机器人自己 */
   toBot?: boolean;
+  /** 消息 ID，用来在渲染时排除「当前这条」 */
+  messageId?: string;
+  /** 是不是 Kei 自己说的话 */
+  isSelf?: boolean;
+  /** 这条消息在回复谁（QQ 的引用） */
+  quote?: { sender: string; text: string };
   /**
    * 这行带的图片地址。不存字节：群里可能刷几十张图，存原图会把内存吃光；
    * 真被问到（有人 @）时再按需下载，这个时间差内 QQ 的 URL 还有效。
@@ -38,6 +44,13 @@ export class GroupBuffer {
       return;
     }
     const list = this.byGroup.get(groupOpenid) ?? [];
+    if (line.messageId && list.some((item) => item.messageId === line.messageId)) {
+      return;
+    }
+    // Kei 自己的话没有 messageId；万一哪天平台回投，按最近几条的文本去重
+    if (line.isSelf && list.slice(-5).some((item) => item.isSelf && item.text === line.text)) {
+      return;
+    }
     list.push(line);
     if (list.length > this.limit) {
       list.splice(0, list.length - this.limit);
@@ -105,7 +118,8 @@ export function renderBuffer(lines: BufferedLine[]): string {
     .map((line) => {
       const text = line.text.replace(/\s+/g, ' ').trim();
       const arrow = line.toBot ? ' → Kei' : line.to ? ` → ${line.to}` : '';
-      return `[${hhmm(line.timestamp)}] ${line.senderName}${arrow}: ${text}`;
+      const quote = line.quote ? `（回 ${line.quote.sender}「${line.quote.text.slice(0, 60)}」）` : '';
+      return `[${hhmm(line.timestamp)}] ${line.senderName}${arrow}: ${quote}${text}`;
     })
     .join('\n');
 }

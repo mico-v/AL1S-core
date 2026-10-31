@@ -26,6 +26,8 @@ import { GroupMemory } from './memory.js';
 import { CONTEXT_FOOTER, CONTEXT_HEADER, PERSONA } from './persona.js';
 import { cleanQQText } from './text.js';
 import { TOOL_DEFINITIONS, executeTool, type ToolContext } from './tools.js';
+import { appendFile, mkdir } from 'node:fs/promises';
+import path from 'node:path';
 import { digestAttachments, loadImageParts } from './vision.js';
 
 export interface AgentConfig {
@@ -302,6 +304,8 @@ export class ChatAgent {
   private readonly modes = { drop: 0, store: 0, process: 0 };
   /** 每个群上次主动发言的时间（冷却用） */
   private readonly lastProactiveAt = new Map<string, number>();
+  /** QQ 的 msgIdx → 这条消息是谁说的什么（解引用用，只留最近几百条） */
+  private readonly msgIndex = new Map<string, { sender: string; text: string }>();
   /** 同一会话串行处理，避免同一群里两条 @ 并发抢回复。 */
   private readonly chains = new Map<string, Promise<void>>();
 
@@ -466,6 +470,33 @@ export class ChatAgent {
     return store;
   }
 
+  /** 记下这条消息的 msgIdx，供后面的引用解析。 */
+  private rememberIdx(groupId: string, message: QQBotInboundMessage, sender: string, text: string): void {
+    const idx = (message as unknown as { msgIdx?: unknown }).msgIdx;
+    if (typeof idx !== 'string' || !idx) {
+      return;
+    }
+    if (this.msgIndex.size > 600) {
+      const oldest = this.msgIndex.keys().next().value;
+      if (oldest !== undefined) {
+        this.msgIndex.delete(oldest);
+      }
+    }
+    this.msgIndex.set(`${groupId}|${idx}`, { sender, text: text.slice(0, 200) });
+  }
+
+  /** 这条消息引用了谁、引用了什么。解析不到就明说，不让模型瞎猜。 */
+  private resolveQuote(
+    groupId: string,
+    message: QQBotInboundMessage,
+  ): { sender: string; text: string } | undefined {
+    const ref = (message as unknown as { refMsgIdx?: unknown }).refMsgIdx;
+    if (typeof ref !== 'string' || !ref) {
+      return undefined;
+    }
+    return this.msgIndex.get(`${groupId}|${ref}`);
+  }
+
   private resolveScope(message: QQBotInboundMessage): Scope | undefined {
     if (message.kind === 'group') {
       const groupOpenid = message.groupOpenid;
@@ -513,7 +544,25 @@ export class ChatAgent {
     const attachments = message.attachments ?? [];
     const hasAttachments = attachments.length > 0;
 
-    if (message.senderIsBot || (!text && !hasAttachments)) {
+    if (message.senderIsBot) {
+      // 自己说过的话也要留在缓冲里：否则下一句被追问「你刚才说什么」，直接断片
+      if (this.config.botOpenids.includes(message.senderId)) {
+        const said = text || '（发了条消息）';
+        this.buffer.push(scope.conversationId, {
+          senderName: this.config.botUsernames[0] ?? 'Kei',
+          text: said,
+          timestamp: Date.now(),
+          messageId: message.messageId,
+          isSelf: true,
+        });
+        this.rememberIdx(scope.conversationId, message, 'Kei', said);
+        this.modes.store += 1;
+      } else {
+        this.modes.drop += 1;
+      }
+      return;
+    }
+    if (!text && !hasAttachments) {
       this.modes.drop += 1;
       return;
     }
@@ -554,14 +603,19 @@ export class ChatAgent {
         .map((item) => item.url)
         .filter((url): url is string => Boolean(url))
         .slice(0, 3);
+      const sender = message.senderName ?? message.senderId.slice(0, 8);
+      const quote = this.resolveQuote(scope.conversationId, message);
       const line = {
-        senderName: message.senderName ?? message.senderId.slice(0, 8),
+        senderName: sender,
         text,
         timestamp: Date.now(),
+        messageId: message.messageId,
         ...addresseeOf(message, this.config),
         ...(imageUrls.length > 0 ? { imageUrls } : {}),
+        ...(quote ? { quote } : {}),
       };
       this.buffer.push(scope.conversationId, line);
+      this.rememberIdx(scope.conversationId, message, sender, text);
       this.modes.store += 1;
       if (hasAttachments) {
         // 后台看懂，看懂后原地补进这一行，别挡住后续消息
@@ -575,6 +629,21 @@ export class ChatAgent {
     }
 
     this.modes.process += 1;
+
+    // 被 @ 的消息同样进缓冲：它不是「说完就忘」的，下一轮还会被追问
+    {
+      const sender = message.senderName ?? message.senderId.slice(0, 8);
+      const quote = this.resolveQuote(scope.conversationId, message);
+      this.buffer.push(scope.conversationId, {
+        senderName: sender,
+        text,
+        timestamp: Date.now(),
+        messageId: message.messageId,
+        ...addresseeOf(message, this.config),
+        ...(quote ? { quote } : {}),
+      });
+      this.rememberIdx(scope.conversationId, message, sender, text);
+    }
 
     // 被 @ 了：图直接塞进模型上下文，不再只发一句描述
     const images = hasAttachments
@@ -643,15 +712,17 @@ export class ChatAgent {
     text: string,
     imageParts: ContentPart[] = [],
   ): Promise<void> {
-    const pending = scope.isDirect ? [] : this.buffer.drain(scope.conversationId);
+    // 不再「用完即清」：缓冲是一条滚动上下文，当前这条排除掉就行
+    const pending = scope.isDirect
+      ? []
+      : this.buffer.peek(scope.conversationId).filter((line) => line.messageId !== message.messageId);
     const memory = this.memory(scope.memoryKey);
     const speaker = message.senderName ?? message.senderId.slice(0, 8);
 
     const remembered = await memory.renderContext([message.senderId]);
+    // 注意：memory 不放进 system。它在每轮都可能变，放在最前面会整段击穿提示词缓存；
+    // 放到 user 消息末尾，前面的人格与群聊记录就能命中缓存。
     const parts: string[] = [];
-    if (remembered) {
-      parts.push(`## 你记得的 ${speaker}\n\n${remembered}`);
-    }
     // 怎么答由模型自己判断（人格里已经写清楚了），代码不预分类
     if (scope.isDirect) {
       parts.push('## 提示\n\n现在是私聊，不是群里，可以放开一点聊。');
@@ -661,10 +732,13 @@ export class ChatAgent {
     const history = renderBuffer(pending);
     const now = new Date();
     const stamp = `${String(now.getHours()).padStart(2, '0')}:${String(now.getMinutes()).padStart(2, '0')}`;
-    const current = `[${stamp}] ${speaker}${scope.isDirect ? '' : ' → Kei'}：${text}`;
+    const quoted = scope.isDirect ? undefined : this.resolveQuote(scope.conversationId, message);
+    const quotedPrefix = quoted ? `（回 ${quoted.sender}「${quoted.text.slice(0, 60)}」）` : '';
+    const current = `[${stamp}] ${speaker}${scope.isDirect ? '' : ' → Kei'}：${quotedPrefix}${text}`;
+    const memoryBlock = remembered ? `## 你记得的 ${speaker}\n\n${remembered}\n\n` : '';
     const userText = history
-      ? `${CONTEXT_HEADER}\n${history}\n${CONTEXT_FOOTER}\n\n${current}`
-      : current;
+      ? `${CONTEXT_HEADER}\n${history}\n${CONTEXT_FOOTER}\n\n${memoryBlock}${current}`
+      : `${memoryBlock}${current}`;
 
     const buildMessages = (body: string, withImages: boolean): ChatMessage[] => [
       { role: 'system', content: system },
@@ -689,6 +763,19 @@ export class ChatAgent {
           await new Promise((resolve) => setTimeout(resolve, 350));
         }
       }
+      // QQ 不回投 bot 自己的消息 → 自己说的话要主动记进缓冲，否则下一轮就断片
+      if (!scope.isDirect) {
+        const selfName = this.config.botUsernames[0] ?? 'Kei';
+        for (const chunk of chunks) {
+          this.buffer.push(scope.conversationId, {
+            senderName: selfName,
+            text: chunk,
+            timestamp: Date.now(),
+            isSelf: true,
+          });
+        }
+      }
+      await this.recordReply(scope.conversationId, speaker, cleaned, chunks.length);
       this.log.info('已回复', {
         conversationId: scope.conversationId,
         speaker,
@@ -732,6 +819,26 @@ export class ChatAgent {
       } catch (retryError) {
         this.log.error('回复失败（退化后）', { conversationId: scope.conversationId, error: retryError });
       }
+    }
+  }
+
+  /** 把自己的回复落一行，供每日体检取样本（chat-log 里没有 bot 自己的话）。 */
+  private async recordReply(chatId: string, speaker: string, text: string, chunks: number): Promise<void> {
+    // 自检/试跑用假模型，不该把测试数据写进真实样本
+    if (process.env.AGENT_REPLY_LOG === 'false') {
+      return;
+    }
+    try {
+      const dir = path.join(this.config.dataRoot, 'replies');
+      await mkdir(dir, { recursive: true });
+      const day = new Date().toISOString().slice(0, 10);
+      await appendFile(
+        path.join(dir, `${day}.jsonl`),
+        `${JSON.stringify({ at: new Date().toISOString(), chatId, speaker, text, chunks })}\n`,
+        'utf8',
+      );
+    } catch (error) {
+      this.log.warn('回复落盘失败', { error });
     }
   }
 

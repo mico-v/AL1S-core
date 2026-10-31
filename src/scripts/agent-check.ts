@@ -67,6 +67,7 @@ function makeMessage(overrides: Partial<Record<string, unknown>> = {}): QQBotInb
 }
 
 async function main(): Promise<void> {
+  process.env.AGENT_REPLY_LOG = 'false';
   const config = readAgentConfig({
     AGENT_BOT_OPENIDS: BOT_OPENID,
     AGENT_BOT_USERNAMES: 'Kei',
@@ -125,6 +126,43 @@ async function main(): Promise<void> {
     check('合并后内容不丢', many.join('').includes('第24段内容'));
     const normal = splitReply('诶 累成这样\n\n一天白过也没啥');
     check('两三句仍按原节奏分条', normal.length === 2, `实际 ${normal.length}`);
+  }
+
+  console.log('\n[2.12] 自己的话与引用');
+  {
+    // 自己的消息会被 QQ 回投，必须进缓冲，且在再次被问到时看得到
+    const selfAgent = new ChatAgent(config, quietLogger, async () => 'ok');
+    await selfAgent.handle(
+      makeMessage({ content: 'Kei 拒绝回答', senderIsBot: true, senderId: BOT_OPENID, senderName: 'Kei' }),
+      { replyText: async () => {} } as unknown as Bot,
+    );
+    await selfAgent.handle(
+      makeMessage({ content: '嗯', mentions: [{ member_openid: BOT_OPENID }] }),
+      { replyText: async () => {} } as unknown as Bot,
+    );
+    const seenSelf = (selfAgent as unknown as { buffer: GroupBuffer })
+      .buffer.peek(GROUP)
+      .some((line) => line.isSelf && line.text.includes('拒绝回答'));
+    check('自己说过的话留在缓冲里', seenSelf);
+
+    // 同一条消息重复投递（QQ 会回投自己的消息）不应该进两次
+    const b = new GroupBuffer(10);
+    const dup = { senderName: '甲', text: '重复', timestamp: Date.now(), messageId: 'mid-1' };
+    b.push(GROUP, dup);
+    b.push(GROUP, dup);
+    check('按 messageId 去重', b.peek(GROUP).length === 1);
+
+    // 引用：渲染成「（回 谁「原文」）」，让模型知道这句在接什么
+    const rendered = renderBuffer([
+      {
+        senderName: '謎矢',
+        text: '是香味',
+        timestamp: Date.now(),
+        quote: { sender: 'Kei', text: 'Kei 拒绝回答，并把这个…' },
+      },
+    ]);
+    check('引用带上原话', rendered.includes('回 Kei「Kei 拒绝回答'), rendered);
+    check('引用不遮住正文', rendered.includes('是香味'));
   }
 
   console.log('\n[2.15] 缓冲里的图片引用');
@@ -193,7 +231,8 @@ async function main(): Promise<void> {
       fakeBot,
     );
     const second = calls[1]?.map((m) => m.content).join('\n') ?? '';
-    check('背景用完后被清空', !second.includes('没人叫你的话1'));
+    check('上下文是滚动的，不会用完就忘', second.includes('没人叫你的话1'));
+    check('上一轮 @ 过的话也留在上下文里', second.includes('Kei 在吗'));
 
     console.log('\n[5] 长回复分片');
     check('短回复不切', splitReply('诶 累就早点歇').length === 1);

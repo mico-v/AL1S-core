@@ -17,6 +17,7 @@
     "agent:try": "tsx src/scripts/agent-try.ts",
     "agent:learn": "tsx --env-file=.env src/scripts/agent-learn.ts",
     "agent:stats": "tsx --env-file=.env src/scripts/agent-stats.ts",
+    "agent:daily": "tsx --env-file=.env src/scripts/agent-daily.ts",
     "agent:digest": "tsx --env-file=.env src/scripts/agent-digest.ts",
     "agent:proactive": "tsx --env-file=.env src/scripts/proactive-try.ts",
     "qq:check": "tsx src/scripts/qq-check.ts",
