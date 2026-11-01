@@ -95,7 +95,18 @@ async function main(): Promise<void> {
   ];
   const panel = { items, remark: REMARK };
 
-  if (ours) {
+  const desiredType = allGroups ? 'all' : 'specific';
+
+  // 更新接口只改内容，不改作用范围。范围要变（例如新加了群、想改成全群生效），
+  // 必须删掉重建 —— 否则面板永远绑在最初那几个群上，新群看不到。
+  if (ours && ours.target_type !== desiredType) {
+    try {
+      await api(token, 'DELETE', `/v2/panels/${ours.panel_id}`);
+      console.log(`已删除旧面板 ${ours.panel_id}（${ours.target_type} → ${desiredType}）`);
+    } catch (error) {
+      console.warn(`删除旧面板失败，将直接新建：${error instanceof Error ? error.message : String(error)}`);
+    }
+  } else if (ours) {
     const result = await api<{ version?: number }>(token, 'PUT', `/v2/panels/${ours.panel_id}`, { panel });
     console.log(`已更新面板 ${ours.panel_id} → version ${result.version ?? '?'}`);
     return;
