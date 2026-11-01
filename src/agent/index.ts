@@ -315,6 +315,8 @@ export class ChatAgent {
   private readonly modes = { drop: 0, store: 0, process: 0 };
   /** 每个群上次主动发言的时间（冷却用） */
   private readonly lastProactiveAt = new Map<string, number>();
+  /** 每个会话最近几次的开头词，用来提醒别重复同一个起手式 */
+  private readonly recentOpeners = new Map<string, string[]>();
   /** 已处理过的 messageId，防止同一条消息被事件与全量通道投递两次 */
   private readonly handled = new Set<string>();
   /** QQ 的 msgIdx → 这条消息是谁说的什么（解引用用，只留最近几百条） */
@@ -481,6 +483,21 @@ export class ChatAgent {
       this.members.set(groupOpenid, store);
     }
     return store;
+  }
+
+  /** 记下这次的开头词（前 1-3 个字）。 */
+  private noteOpener(conversationId: string, text: string): void {
+    const match = /^[\s「"'（(]*([^\s，。！？,.!?~～]{1,3})/.exec(text);
+    const opener = match?.[1] ?? text.slice(0, 2);
+    if (!opener) {
+      return;
+    }
+    const list = this.recentOpeners.get(conversationId) ?? [];
+    list.push(opener);
+    if (list.length > 3) {
+      list.splice(0, list.length - 3);
+    }
+    this.recentOpeners.set(conversationId, list);
   }
 
   /** 白名单外的群：每 6 小时提示一次，避免刷屏。 */
@@ -775,6 +792,15 @@ export class ChatAgent {
       parts.push('## 提示\n\n现在是私聊，不是群里，可以放开一点聊。');
     }
 
+    // 连着几次都用同一个词开头，一眼就是模板；给模型一个具体的「换一个」提示
+    const openers = this.recentOpeners.get(scope.conversationId) ?? [];
+    if (openers.length >= 2) {
+      parts.push(
+        `## 别重复自己\n\n最近几次你是这样开头的：「${openers.join('」「')}」。` +
+          '这次换一个说法，别再用同一个起手式；结尾也别每次都挂同一个表情。',
+      );
+    }
+
     const system = [PERSONA, ...parts].join('\n\n---\n\n');
     const history = renderBuffer(pending);
     const now = new Date();
@@ -828,6 +854,7 @@ export class ChatAgent {
           });
         }
       }
+      this.noteOpener(scope.conversationId, cleaned);
       await this.recordReply(scope.conversationId, speaker, cleaned, chunks.length, {
         ms: Date.now() - startedAt,
       });

@@ -71,23 +71,72 @@ async function withSlot<T>(task: () => Promise<T>): Promise<T> {
   }
 }
 
+/**
+ * 按文件头判断真实类型。
+ *
+ * 只看 content_type 和 URL 是不够的：群里的语音（#!SILK_V3）和视频（ftypmp42）
+ * 也会带 multimedia 链接，被当成图片塞进视觉链路，上游直接 400。
+ * 返回 undefined 表示「这不是我认识的图片」。
+ */
+export function sniffImageType(bytes: Uint8Array): string | undefined {
+  if (bytes.length < 12) {
+    return undefined;
+  }
+  if (bytes[0] === 0xff && bytes[1] === 0xd8 && bytes[2] === 0xff) {
+    return 'image/jpeg';
+  }
+  if (bytes[0] === 0x89 && bytes[1] === 0x50 && bytes[2] === 0x4e && bytes[3] === 0x47) {
+    return 'image/png';
+  }
+  if (bytes[0] === 0x47 && bytes[1] === 0x49 && bytes[2] === 0x46) {
+    return 'image/gif';
+  }
+  if (
+    bytes[0] === 0x52 && bytes[1] === 0x49 && bytes[2] === 0x46 && bytes[3] === 0x46 &&
+    bytes[8] === 0x57 && bytes[9] === 0x45 && bytes[10] === 0x42 && bytes[11] === 0x50
+  ) {
+    return 'image/webp';
+  }
+  // HEIC/HEIF：ftyp 在 offset 4，主品牌 heic/heix/mif1
+  if (bytes[4] === 0x66 && bytes[5] === 0x74 && bytes[6] === 0x79 && bytes[7] === 0x70) {
+    const brand = String.fromCharCode(bytes[8] ?? 0, bytes[9] ?? 0, bytes[10] ?? 0, bytes[11] ?? 0);
+    if (brand === 'heic' || brand === 'heix' || brand === 'mif1') {
+      return 'image/heic';
+    }
+  }
+  return undefined;
+}
+
+/** 是不是视频容器（mp4/mov），用来决定要不要抽帧。 */
+export function sniffVideo(bytes: Uint8Array): boolean {
+  return (
+    bytes.length >= 12 &&
+    bytes[4] === 0x66 && bytes[5] === 0x74 && bytes[6] === 0x79 && bytes[7] === 0x70
+  );
+}
+
 function mimeOf(contentType: string | undefined, bytes: Uint8Array): string {
+  const sniffed = sniffImageType(bytes);
+  if (sniffed) {
+    return sniffed;
+  }
   if (contentType && contentType.startsWith('image/')) {
     return contentType;
   }
-  if (bytes[0] === 0xff && bytes[1] === 0xd8) {
-    return 'image/jpeg';
+  return 'application/octet-stream';
+}
+
+/** 这个附件看起来像图吗。#!SILK_V3 / mp4 这类别再往视觉链路送。 */
+export function looksLikeImage(item: AttachmentLike): boolean {
+  const type = item.content_type ?? '';
+  if (type.startsWith('video/') || type.startsWith('audio/')) {
+    return false;
   }
-  if (bytes[0] === 0x89 && bytes[1] === 0x50) {
-    return 'image/png';
+  if (type.startsWith('image/')) {
+    return true;
   }
-  if (bytes[0] === 0x47 && bytes[1] === 0x49) {
-    return 'image/gif';
-  }
-  if (bytes[0] === 0x52 && bytes[1] === 0x49 && bytes[8] === 0x57) {
-    return 'image/webp';
-  }
-  return 'image/jpeg';
+  // 没有 content_type 时，凡是 multimedia 链接都先下下来验文件头
+  return !type && Boolean(item.url?.includes('multimedia'));
 }
 
 async function download(url: string, timeoutMs = 30_000): Promise<Uint8Array> {
@@ -184,6 +233,32 @@ export async function prepareImage(
   }
 }
 
+/** 视频抽一帧当图看：群里的视频消息至少能知道画面是什么。 */
+export async function extractVideoFrame(bytes: Uint8Array, log: AppLogger): Promise<Uint8Array | undefined> {
+  const ffmpeg = await findFfmpeg();
+  if (!ffmpeg) {
+    return undefined;
+  }
+  const dir = await mkdtemp(path.join(tmpdir(), 'al1s-vid-'));
+  const input = path.join(dir, 'in.mp4');
+  const output = path.join(dir, 'frame.jpg');
+  try {
+    await writeFile(input, bytes);
+    await execFileAsync(
+      ffmpeg,
+      ['-hide_banner', '-loglevel', 'error', '-y', '-i', input, '-frames:v', '1', '-q:v', '4', output],
+      { timeout: 25_000 },
+    );
+    const frame = new Uint8Array(await readFile(output));
+    return frame.byteLength > 0 ? frame : undefined;
+  } catch (error) {
+    log.warn('视频抽帧失败', { bytes: bytes.byteLength, error });
+    return undefined;
+  } finally {
+    await rm(dir, { recursive: true, force: true }).catch(() => undefined);
+  }
+}
+
 export interface LoadedImages {
   /** 直接拼进用户消息的图片分段 */
   parts: ContentPart[];
@@ -204,9 +279,7 @@ export async function loadImageParts(
   log: AppLogger,
 ): Promise<LoadedImages> {
   const result: LoadedImages = { parts: [], markers: [], failed: 0 };
-  const images = (attachments ?? [])
-    .filter((item) => (item.content_type ?? '').startsWith('image/') || item.url?.includes('multimedia'))
-    .slice(0, MAX_IMAGES_PER_MESSAGE);
+  const images = (attachments ?? []).filter(looksLikeImage).slice(0, MAX_IMAGES_PER_MESSAGE);
 
   for (let index = 0; index < images.length; index += 1) {
     const item = images[index] as AttachmentLike;
@@ -216,7 +289,23 @@ export async function loadImageParts(
     }
     try {
       const raw = await download(item.url);
-      const prepared = await prepareImage(raw, mimeOf(item.content_type, raw), log);
+      // 下载后按文件头确认：语音/视频/未知格式不往视觉链路送
+      const kind = sniffImageType(raw);
+      let bytes = raw;
+      if (!kind) {
+        if (sniffVideo(raw)) {
+          const frame = await extractVideoFrame(raw, log);
+          if (!frame) {
+            result.markers.push(`[图${label}]（是视频，没抽到画面）`);
+            continue;
+          }
+          bytes = frame;
+        } else {
+          result.markers.push(`[图${label}]（不是图片，跳过了）`);
+          continue;
+        }
+      }
+      const prepared = await prepareImage(bytes, mimeOf(item.content_type, bytes), log);
       result.parts.push({
         type: 'image_url',
         image_url: { url: `data:${prepared.mime};base64,${Buffer.from(prepared.data).toString('base64')}` },
@@ -305,9 +394,7 @@ export async function digestAttachments(
 
   const images = options.skipImages
     ? []
-    : attachments
-        .filter((item) => (item.content_type ?? '').startsWith('image/') || item.url?.includes('multimedia'))
-        .slice(0, MAX_IMAGES_PER_MESSAGE);
+    : attachments.filter(looksLikeImage).slice(0, MAX_IMAGES_PER_MESSAGE);
 
   for (let index = 0; index < images.length; index += 1) {
     const item = images[index] as AttachmentLike;
@@ -322,9 +409,25 @@ export async function digestAttachments(
     }
     try {
       const raw = await download(item.url);
-      // 和直传路径一致：先缩放并转成标准 JPEG。
-      // 大图 base64 进去会被上游判 400「Failed to load image」，超时也多半是它拖的。
-      const prepared = await prepareImage(raw, mimeOf(item.content_type, raw), log);
+      // 和直传路径一致：先验文件头，再缩放并转成标准 JPEG。
+      // 大图 base64 会被上游判 400；语音/视频混进来更会直接失败。
+      let bytes = raw;
+      if (!sniffImageType(raw)) {
+        if (sniffVideo(raw)) {
+          const frame = await extractVideoFrame(raw, log);
+          if (!frame) {
+            imagesFailed += 1;
+            lines.push(`[图${index + 1}]（是视频，没抽到画面）`);
+            continue;
+          }
+          bytes = frame;
+        } else {
+          log.info('跳过非图片附件', { bytes: raw.byteLength });
+          lines.push(`[文件] 不是图片（${raw.byteLength} 字节），没看`);
+          continue;
+        }
+      }
+      const prepared = await prepareImage(bytes, mimeOf(item.content_type, bytes), log);
       const desc = await describeImage(prepared.data, prepared.mime, llm, log);
       if (!desc) {
         imagesFailed += 1;

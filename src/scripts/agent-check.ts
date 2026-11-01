@@ -12,14 +12,15 @@ import path from 'node:path';
 import { ChatAgent, isBotMentioned, MAX_REPLY_CHARS, MAX_REPLY_CHUNKS, readAgentConfig, splitReply } from '../agent/index.js';
 import type { ChatMessage } from '../agent/llm.js';
 import { GroupBuffer, renderBuffer } from '../agent/context.js';
-import { GroupMemory } from '../agent/memory.js';
+import { GroupMemory, applyProfileChanges } from '../agent/memory.js';
+import { parseBraveHtml, renderHits as renderWebHits } from '../agent/web.js';
 import { PERSONA } from '../agent/persona.js';
 import { cleanQQText } from '../agent/text.js';
 import { matchCommand, renderStatus } from '../agent/commands.js';
 import { DigestEngine, DRIFT_THRESHOLD, topicDrift } from '../agent/digest.js';
 import { MessageIndex, renderHits } from '../agent/search.js';
 import { executeTool, expandQuery } from '../agent/tools.js';
-import { digestAttachments, loadImageParts, prepareImage } from '../agent/vision.js';
+import { digestAttachments, loadImageParts, looksLikeImage, prepareImage, sniffImageType, sniffVideo } from '../agent/vision.js';
 import { buildProactiveMessages, judgeProactive, parseProactive } from '../agent/proactive.js';
 import { learnSystem } from '../agent/updater.js';
 import { buildRecord, summarize } from '../agent/telemetry.js';
@@ -160,6 +161,69 @@ async function main(): Promise<void> {
     check('合并后内容不丢', many.join('').includes('第24段内容'));
     const normal = splitReply('诶 累成这样\n\n一天白过也没啥');
     check('两三句仍按原节奏分条', normal.length === 2, `实际 ${normal.length}`);
+  }
+
+  console.log('\n[1.7] 附件类型验证');
+  {
+    const jpeg = new Uint8Array([0xff, 0xd8, 0xff, 0xe0, 0, 0, 0, 0, 0, 0, 0, 0, 0]);
+    const png = new Uint8Array([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, 0, 0, 0, 0]);
+    const gif = new Uint8Array([0x47, 0x49, 0x46, 0x38, 0x39, 0x61, 0, 0, 0, 0, 0, 0]);
+    const webp = new Uint8Array([0x52, 0x49, 0x46, 0x46, 0, 0, 0, 0, 0x57, 0x45, 0x42, 0x50]);
+    const silk = new Uint8Array([0x23, 0x21, 0x53, 0x49, 0x4c, 0x4b, 0x5f, 0x56, 0x33, 0, 0, 0]);
+    const mp4 = new Uint8Array([0, 0, 0, 0x20, 0x66, 0x74, 0x79, 0x70, 0x6d, 0x70, 0x34, 0x32]);
+
+    check('识别 JPEG', sniffImageType(jpeg) === 'image/jpeg');
+    check('识别 PNG', sniffImageType(png) === 'image/png');
+    check('识别 GIF', sniffImageType(gif) === 'image/gif');
+    check('识别 WEBP', sniffImageType(webp) === 'image/webp');
+    check('语音不认成图', sniffImageType(silk) === undefined);
+    check('认出视频容器', sniffVideo(mp4));
+    check('语音不进视觉链路', !looksLikeImage({ content_type: 'audio/silk', url: 'https://x/multimedia?a' }));
+    check('视频不进视觉链路', !looksLikeImage({ content_type: 'video/mp4', url: 'https://x/multimedia?a' }));
+    check('真图放行', looksLikeImage({ content_type: 'image/png', url: 'https://x/multimedia?a' }));
+    check('无类型但有 multimedia 链接才去验', looksLikeImage({ url: 'https://x/multimedia?a' }));
+  }
+
+  console.log('\n[1.8] 档案增量合并');
+  {
+    const base = '# 甲\n- 性格: 话痨\n- 近况: 准备 CSP（2026-09-01 ~ ）';
+    const added = applyProfileChanges(base, '甲', [{ op: 'add', text: '- 常聊: 算法竞赛' }]);
+    check('add 追加一行', added.includes('算法竞赛'));
+    check('add 不动旧内容', added.includes('话痨'));
+
+    const dup = applyProfileChanges(base, '甲', [{ op: 'add', text: '- 性格: 话痨' }]);
+    check('add 不重复堆同样的行', dup.split('\n').filter((l) => l.includes('话痨')).length === 1);
+
+    const replaced = applyProfileChanges(base, '甲', [
+      { op: 'replace', match: '准备 CSP', text: '- 近况: 改准备考研（2026-11-01 ~ ）' },
+    ]);
+    check('replace 换掉旧行', replaced.includes('考研') && !replaced.includes('CSP'));
+
+    const removed = applyProfileChanges(base, '甲', [{ op: 'remove', match: '话痨' }]);
+    check('remove 删掉该行', !removed.includes('话痨'));
+
+    const untouched = applyProfileChanges(base, '甲', [{ op: 'replace', match: '不存在的片段', text: '- 新' }]);
+    check('match 不到就保持原样', untouched === base);
+    check('标题始终保留', added.startsWith('# 甲'));
+  }
+
+  console.log('\n[1.9] 联网搜索解析');
+  {
+    const html = `
+      <div class="snippet x" data-type="web">
+        <a href="https://example.com/a"><div class="title t">第一条标题</div></a>
+        <div class="generic-snippet s">2 days ago - 第一条摘要</div>
+      </div>
+      <div class="snippet x" data-type="web">
+        <a href="https://example.com/b"><div class="title t">第二条标题</div></a>
+        <div class="generic-snippet s">第二条摘要</div>
+      </div>`;
+    const hits = parseBraveHtml(html, 5);
+    check('解析出两条结果', hits.length === 2, `实际 ${hits.length}`);
+    check('标题正确', hits[0]?.title === '第一条标题');
+    check('链接正确', hits[0]?.url === 'https://example.com/a');
+    check('摘要去掉时间前缀', hits[0]?.snippet.includes('第一条摘要') === true);
+    check('空结果有兜底文案', renderWebHits('x', []).includes('没有搜到'));
   }
 
   console.log('\n[2.12] 自己的话与引用');

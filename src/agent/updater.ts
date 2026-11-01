@@ -10,7 +10,7 @@ import { readdir } from 'node:fs/promises';
 import path from 'node:path';
 import type { AppLogger } from '../logger.js';
 import { chatComplete, type LlmOptions } from './llm.js';
-import { GroupMemory, readNewRecords, type RawRecord } from './memory.js';
+import { GroupMemory, readNewRecords, applyProfileChanges, type ProfileChange, type RawRecord } from './memory.js';
 
 const MIN_RECORDS = 6;
 // 一次喂太多（120 条 × 1200 字）会让归纳请求超过 90s 超时，
@@ -23,7 +23,7 @@ const MAX_CONTENT_CHARS = 1200;
  * 之前把全群档案都塞进提示词、让模型整体重写，输出很容易超过 max_tokens
  * 被截断 —— JSON 尾巴一断，整批档案都写不进去。现在只处理这批里真正说过话的人。
  */
-const MAX_MEMBERS_PER_RUN = 20;
+const MAX_MEMBERS_PER_RUN = 12;
 
 export interface UpdaterConfig {
   dataRoot: string;
@@ -35,7 +35,10 @@ export interface UpdaterConfig {
 interface ParsedProfile {
   openid: string;
   name: string;
-  markdown: string;
+  /** 旧格式：整份重写（保留兼容） */
+  markdown?: string;
+  /** 新格式：只给变更 */
+  changes?: ProfileChange[];
 }
 
 /**
@@ -64,9 +67,24 @@ export function learnSystem(today = new Date().toISOString().slice(0, 10)): stri
 - 不要写「本批」「这批消息」这种视角说明，直接写事实；也不要写「第 N 条」。
 - 档案该写多少写多少，不要为了篇幅删信息；开头必须是「# 昵称」。
 
+**只输出变化，不要重写整份档案。** 没有变化的人不要出现在结果里。
+
 只输出 JSON，不要任何解释：
-{"profiles":[{"openid":"...","name":"昵称","markdown":"# 昵称\\n- 性格: ..."}]}
-如果这批消息没有值得记的内容，输出 {"profiles":[]}`;
+{"profiles":[{"openid":"...","name":"昵称","changes":[
+  {"op":"add","text":"- 近况: 在准备考研（2026-10-20 ~ ）"},
+  {"op":"replace","match":"准备 CSP","text":"- 近况: 改准备考研（2026-11-01 ~ ）"},
+  {"op":"remove","match":"已经退坑"}
+]}]}
+
+- **每条 text 不超过 60 字，一条只讲一件事。** 不要在一行里罗列一串例子（最多举一个）
+- 档案里已有同类条目（例如已有「- 说话风格: ...」）时，用 replace 改写那一行，match 取行首 8~10 个字；
+  **不要另外 add 一条同类**，否则档案会越堆越长
+- 看到某一行特别长（超过 120 字），用 replace 把它压成「类别: 要点；要点」的短行
+- add：新增一行，text 以「- 」开头
+- replace：找到包含 match 的那一行，整行换成 text
+- remove：删掉包含 match 的那一行
+- 每人最多 6 条变更；宁可少记，不要凑数
+- 如果这批消息没有值得记的内容，输出 {"profiles":[]}`;
 }
 
 const SYSTEM = learnSystem();
@@ -105,10 +123,27 @@ function parseProfiles(raw: string): ParsedResult {
     const openid = typeof rec.openid === 'string' ? rec.openid.trim() : '';
     const markdown = typeof rec.markdown === 'string' ? rec.markdown.trim() : '';
     const name = typeof rec.name === 'string' && rec.name.trim() ? rec.name.trim() : openid.slice(0, 8);
-    if (!openid || !markdown) {
+    const rawChanges = Array.isArray(rec.changes) ? rec.changes : [];
+    const changes: ProfileChange[] = [];
+    for (const item of rawChanges) {
+      if (!item || typeof item !== 'object') {
+        continue;
+      }
+      const c = item as Record<string, unknown>;
+      const op = c.op;
+      if (op !== 'add' && op !== 'replace' && op !== 'remove') {
+        continue;
+      }
+      changes.push({
+        op,
+        ...(typeof c.match === 'string' ? { match: c.match } : {}),
+        ...(typeof c.text === 'string' ? { text: c.text } : {}),
+      });
+    }
+    if (!openid || (!markdown && changes.length === 0)) {
       continue;
     }
-    out.push({ openid, name, markdown });
+    out.push({ openid, name, ...(markdown ? { markdown } : {}), ...(changes.length > 0 ? { changes } : {}) });
   }
   return { profiles: out, valid: true };
 }
@@ -170,7 +205,7 @@ export async function learnGroup(
     const existingBlock = members
       .map(([openid]) => memberMap.get(openid))
       .filter((m): m is NonNullable<typeof m> => Boolean(m))
-      .map((m) => `### ${m.name} (${m.openid})\n${m.profile}`)
+      .map((m) => `### ${m.name} (${m.openid})\n${m.profile.slice(0, 800)}`)
       .join('\n\n')
       .slice(0, 20_000) || '（这些人还没有档案）';
 
@@ -212,7 +247,20 @@ export async function learnGroup(
 
   const { profiles, valid } = result;
   for (const profile of profiles) {
-    await memory.saveMember(profile.openid, profile.name, profile.markdown);
+    if (profile.markdown) {
+      // 兼容旧格式：模型偶尔仍会给整份 markdown
+      await memory.saveMember(profile.openid, profile.name, profile.markdown);
+      continue;
+    }
+    if (!profile.changes || profile.changes.length === 0) {
+      continue;
+    }
+    const existing = await memory.getMember(profile.openid);
+    const base = existing?.profile ?? `# ${profile.name}`;
+    const merged = applyProfileChanges(base, profile.name, profile.changes);
+    if (merged.trim() !== base.trim()) {
+      await memory.saveMember(profile.openid, profile.name, merged);
+    }
   }
 
   // 输出坏了（多半被截断）就别推进水位线，否则这批消息永远学不到

@@ -10,6 +10,7 @@ import path from 'node:path';
 import type { AppLogger } from '../logger.js';
 import type { ChatMessage, LlmOptions } from './llm.js';
 import { MessageIndex, renderHits } from './search.js';
+import { renderHits as renderWebHits, searchWeb } from './web.js';
 
 export interface ToolContext {
   dataRoot: string;
@@ -35,6 +36,22 @@ export const TOOL_DEFINITIONS: unknown[] = [
           sender: { type: 'string', description: '只看某个人说的，填昵称' },
           days: { type: 'number', description: '只搜最近多少天，不填表示全部历史' },
           limit: { type: 'number', description: '返回条数，默认 8，最大 20' },
+        },
+        required: ['query'],
+      },
+    },
+  },
+  {
+    type: 'function',
+    function: {
+      name: 'web_search',
+      description:
+        '联网搜索。问到今天的事、新闻、版本号、价格、比赛结果、某个人最近的动态这类你不可能知道的信息时，先搜再答，不要凭记忆编。',
+      parameters: {
+        type: 'object',
+        properties: {
+          query: { type: 'string', description: '搜索词，像人一样写，别堆关键词' },
+          limit: { type: 'number', description: '返回条数，默认 5，最多 8' },
         },
         required: ['query'],
       },
@@ -380,6 +397,14 @@ export async function executeTool(name: string, rawArgs: string, ctx: ToolContex
         return `「${query}」和它的近义说法（${alternatives.join('、')}）都没有命中。可能是真没聊过，别编。`;
       }
       return `（原词没命中，按近义说法 ${alternatives.join('、')} 搜到这些）\n${renderHits(expanded)}`;
+    }
+    if (name === 'web_search') {
+      const query = asString(args.query).trim();
+      if (!query) {
+        return '需要提供搜索词。';
+      }
+      const hits = await searchWeb(query, asNumber(args.limit) ?? 5, ctx.log);
+      return renderWebHits(query, hits);
     }
     if (name === 'member_profile') {
       return await memberProfile(ctx, asString(args.name));
