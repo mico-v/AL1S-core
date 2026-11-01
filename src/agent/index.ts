@@ -126,6 +126,17 @@ interface MentionLike {
   bot?: unknown;
 }
 
+/**
+ * 这条消息是不是「@ 专用事件」推来的。
+ *
+ * 群主没开「允许机器人接收全部消息」时，QQ 只投递 @ 消息，
+ * 事件是 GROUP_AT_MESSAGE_CREATE —— 而且**会把 @ 从正文里剥掉**，
+ * mentions 也可能是空的。所以这种事件本身就等于「有人在叫她」。
+ */
+export function isAtEvent(message: QQBotInboundMessage): boolean {
+  return (message as unknown as { rawEventType?: string }).rawEventType === 'GROUP_AT_MESSAGE_CREATE';
+}
+
 /** 这条消息是不是 @ 了机器人本人。只看 openid / bot+username，不看空的 bot 标志。 */
 export function isBotMentioned(message: QQBotInboundMessage, config: AgentConfig): boolean {
   const mentions = (message as unknown as { mentions?: unknown }).mentions;
@@ -304,6 +315,8 @@ export class ChatAgent {
   private readonly modes = { drop: 0, store: 0, process: 0 };
   /** 每个群上次主动发言的时间（冷却用） */
   private readonly lastProactiveAt = new Map<string, number>();
+  /** 已处理过的 messageId，防止同一条消息被事件与全量通道投递两次 */
+  private readonly handled = new Set<string>();
   /** QQ 的 msgIdx → 这条消息是谁说的什么（解引用用，只留最近几百条） */
   private readonly msgIndex = new Map<string, { sender: string; text: string }>();
   /** 同一会话串行处理，避免同一群里两条 @ 并发抢回复。 */
@@ -616,7 +629,7 @@ export class ChatAgent {
       this.digest.observe(scope.conversationId, text, Date.now());
     }
 
-    const called = scope.isDirect || isBotMentioned(message, this.config);
+    const called = scope.isDirect || isAtEvent(message) || isBotMentioned(message, this.config);
     if (!called) {
       const imageUrls = attachments
         .filter((item) => (item.content_type ?? '').startsWith('image/') || item.url?.includes('multimedia'))
@@ -648,6 +661,20 @@ export class ChatAgent {
       return;
     }
 
+    // 同一条消息可能从 GROUP_AT_MESSAGE_CREATE 和 GROUP_MESSAGE_CREATE 各来一次
+    if (message.messageId) {
+      if (this.handled.has(message.messageId)) {
+        this.log.debug('重复投递，已忽略', { messageId: message.messageId });
+        return;
+      }
+      this.handled.add(message.messageId);
+      if (this.handled.size > 500) {
+        const first = this.handled.values().next().value;
+        if (first !== undefined) {
+          this.handled.delete(first);
+        }
+      }
+    }
     this.modes.process += 1;
 
     // 被 @ 的消息同样进缓冲：它不是「说完就忘」的，下一轮还会被追问

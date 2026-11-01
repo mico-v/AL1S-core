@@ -90,6 +90,40 @@ async function main(): Promise<void> {
     isBotMentioned(makeMessage({ mentions: [{ username: 'Kei', bot: true }] }), config));
   check('没有 mentions → false', !isBotMentioned(makeMessage({ mentions: undefined }), config));
 
+  console.log('\n[1.6] @ 专用事件（群主没开全量消息时）');
+  {
+    const cfg = readAgentConfig({
+      AGENT_BOT_OPENIDS: BOT_OPENID,
+      AGENT_BOT_USERNAMES: 'Kei',
+      AGENT_GROUPS: GROUP,
+      AGENT_TOOLS: 'false',
+    } as NodeJS.ProcessEnv);
+
+    const run = async (overrides: Record<string, unknown>) => {
+      let calls = 0;
+      const agent = new ChatAgent(cfg, quietLogger, async () => {
+        calls += 1;
+        return '在';
+      });
+      await agent.handle(makeMessage(overrides), { replyText: async () => {} } as unknown as Bot);
+      return calls;
+    };
+
+    // QQ 在这种群里会剥掉 @，mentions 是空的，但事件类型说明是在叫她
+    const viaAtEvent = await run({ content: '早上好', mentions: [], rawEventType: 'GROUP_AT_MESSAGE_CREATE' });
+    check('@ 专用事件即使 mentions 为空也回', viaAtEvent === 1, `实际 ${viaAtEvent}`);
+
+    const viaFullNoMention = await run({ content: '早上好', mentions: [], rawEventType: 'GROUP_MESSAGE_CREATE' });
+    check('全量群里没 @ 仍然不回', viaFullNoMention === 0, `实际 ${viaFullNoMention}`);
+
+    const viaFullMention = await run({
+      content: '在吗',
+      rawEventType: 'GROUP_MESSAGE_CREATE',
+      mentions: [{ member_openid: BOT_OPENID }],
+    });
+    check('全量群里 @ 了才回', viaFullMention === 1, `实际 ${viaFullMention}`);
+  }
+
   console.log('\n[2] 群聊缓冲');
   const buf = new GroupBuffer(3);
   for (let i = 0; i < 5; i += 1) {
