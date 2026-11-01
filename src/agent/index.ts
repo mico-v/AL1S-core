@@ -470,6 +470,23 @@ export class ChatAgent {
     return store;
   }
 
+  /** 白名单外的群：每 6 小时提示一次，避免刷屏。 */
+  private noteUnlistedGroup(groupOpenid: string, message: QQBotInboundMessage): void {
+    this.modes.drop += 1;
+    const key = `unlisted:${groupOpenid}`;
+    const last = this.lastProactiveAt.get(key) ?? 0;
+    if (Date.now() - last < 6 * 3600_000) {
+      return;
+    }
+    this.lastProactiveAt.set(key, Date.now());
+    this.log.info('群不在白名单，只记录不回复', {
+      groupOpenid,
+      sender: message.senderName ?? message.senderId.slice(0, 8),
+      text: (message.content ?? '').slice(0, 40),
+      hint: '要启用请把 group_openid 加进 AGENT_GROUPS',
+    });
+  }
+
   /** 记下这条消息的 msgIdx，供后面的引用解析。 */
   private rememberIdx(groupId: string, message: QQBotInboundMessage, sender: string, text: string): void {
     const idx = (message as unknown as { msgIdx?: unknown }).msgIdx;
@@ -504,6 +521,9 @@ export class ChatAgent {
         return undefined;
       }
       if (this.config.groupAllowlist.length > 0 && !this.config.groupAllowlist.includes(groupOpenid)) {
+        // 不在白名单：不回复，但要让运维看得见「有个新群在说话」。
+        // 消息本身已经由 chat-log 落盘了（那层与白名单无关）。
+        this.noteUnlistedGroup(groupOpenid, message);
         return undefined;
       }
       return {
