@@ -11,6 +11,7 @@ import path from 'node:path';
 import type { AppLogger } from '../logger.js';
 import { chatComplete, type LlmOptions } from './llm.js';
 import { GroupMemory, readNewRecords, applyProfileChanges, type ProfileChange, type RawRecord } from './memory.js';
+import { backgroundPauseUntil } from './quota.js';
 
 const MIN_RECORDS = 6;
 // 一次喂太多（120 条 × 1200 字）会让归纳请求超过 90s 超时，
@@ -23,7 +24,7 @@ const MAX_CONTENT_CHARS = 1200;
  * 之前把全群档案都塞进提示词、让模型整体重写，输出很容易超过 max_tokens
  * 被截断 —— JSON 尾巴一断，整批档案都写不进去。现在只处理这批里真正说过话的人。
  */
-const MAX_MEMBERS_PER_RUN = 12;
+const MAX_MEMBERS_PER_RUN = 6;
 
 export interface UpdaterConfig {
   dataRoot: string;
@@ -164,6 +165,13 @@ export async function learnGroup(
   groupOpenid: string,
   log: AppLogger,
 ): Promise<{ processed: number; written: number }> {
+  // 配额打满就干脆不跑：否则每 30 分钟一次 429，日志没法看
+  const pausedUntil = await backgroundPauseUntil(config.llm, log);
+  if (pausedUntil > Date.now()) {
+    log.debug('配额未恢复，跳过归纳', { groupOpenid, until: new Date(pausedUntil).toISOString() });
+    return { processed: 0, written: 0 };
+  }
+
   const memory = new GroupMemory(config.dataRoot, groupOpenid);
   const state = await memory.readState();
   const batch = config.batchSize ?? MAX_RECORDS_PER_RUN;
@@ -207,14 +215,16 @@ export async function learnGroup(
       .filter((m): m is NonNullable<typeof m> => Boolean(m))
       .map((m) => `### ${m.name} (${m.openid})\n${m.profile.slice(0, 800)}`)
       .join('\n\n')
-      .slice(0, 20_000) || '（这些人还没有档案）';
+      .slice(0, 12_000) || '（这些人还没有档案）';
 
     const raw = await chatComplete(
       [
         { role: 'system', content: SYSTEM },
         {
           role: 'user',
-          content: `## 本轮只更新这些人（其他人不要动）\n${scopeLine}\n\n## 他们现有的档案\n\n${existingBlock}\n\n## 新消息\n\n${renderRecords(records)}`,
+          // 顺序有意为之：稳定内容（人格、现有档案）放前面，可变的名单和新消息放后面，
+          // 这样前缀缓存能命中；反过来每次都不一样，命中率恒为 0。
+          content: `## 他们现有的档案\n\n${existingBlock}\n\n## 本轮只更新这些人（其他人不要动）\n${scopeLine}\n\n## 新消息\n\n${renderRecords(records)}`,
         },
       ],
       {

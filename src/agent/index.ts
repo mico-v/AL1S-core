@@ -14,6 +14,7 @@ import { matchCommand, renderStatus } from './commands.js';
 import { GroupBuffer, renderBuffer } from './context.js';
 import { DigestEngine } from './digest.js';
 import { judgeProactive } from './proactive.js';
+import { backgroundPauseUntil, currentQuota, renderQuota } from './quota.js';
 import {
   chatComplete,
   chatCompleteRaw,
@@ -348,6 +349,11 @@ export class ChatAgent {
 
   /** 定时兜底：群里安静下来、没到阈值时也把已有的对话归档掉。 */
   async runDigestSweep(chatIds: string[]): Promise<number> {
+    const pausedUntil = await backgroundPauseUntil(this.config.llm, this.log);
+    if (pausedUntil > Date.now()) {
+      this.log.debug('配额未恢复，跳过摘要巡检', { until: new Date(pausedUntil).toISOString() });
+      return 0;
+    }
     let count = 0;
     // 冷场的话题先归档：没人再说话也必须落盘，不能等下一句。
     this.digest.sweepIdle();
@@ -377,6 +383,12 @@ export class ChatAgent {
     if (!this.config.proactive.enabled) {
       return 0;
     }
+    const pausedUntil = await backgroundPauseUntil(this.config.llm, this.log);
+    if (pausedUntil > Date.now()) {
+      this.log.debug('配额未恢复，跳过主动巡检', { until: new Date(pausedUntil).toISOString() });
+      return 0;
+    }
+
     let spoken = 0;
     for (const chatId of chatIds) {
       const allowed =
@@ -628,6 +640,7 @@ export class ChatAgent {
         contextWindow: this.config.callLog.contextWindow,
         startedAt: this.startedAt,
         modes: this.modes,
+        quota: renderQuota(await currentQuota(this.config.llm, this.log)),
       });
       await bot.replyText(scope.replyTarget, body);
       this.log.info('指令', { command, conversationId: scope.conversationId });

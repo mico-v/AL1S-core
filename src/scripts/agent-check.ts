@@ -14,6 +14,8 @@ import type { ChatMessage } from '../agent/llm.js';
 import { GroupBuffer, renderBuffer } from '../agent/context.js';
 import { GroupMemory, applyProfileChanges } from '../agent/memory.js';
 import { parseBraveHtml, renderHits as renderWebHits } from '../agent/web.js';
+import { blockingWindow, renderQuota } from '../agent/quota.js';
+import { quotaPauseFrom } from '../agent/llm.js';
 import { PERSONA } from '../agent/persona.js';
 import { cleanQQText } from '../agent/text.js';
 import { matchCommand, renderStatus } from '../agent/commands.js';
@@ -205,6 +207,34 @@ async function main(): Promise<void> {
     const untouched = applyProfileChanges(base, '甲', [{ op: 'replace', match: '不存在的片段', text: '- 新' }]);
     check('match 不到就保持原样', untouched === base);
     check('标题始终保留', added.startsWith('# 甲'));
+  }
+
+  console.log('\n[1.85] 配额熔断');
+  {
+    const weekly = quotaPauseFrom('{"code":"GoUsageLimitError","message":"weekly usage limit reached"}');
+    check('识别周配额 429', weekly > Date.now());
+    const resetAt = new Date(weekly);
+    check('暂停到下个 UTC 零点', resetAt.getUTCHours() === 0 && resetAt.getUTCMinutes() === 0);
+    check('非配额错误不暂停', quotaPauseFrom('HTTP 400: invalid request') === 0);
+
+    const blocked = blockingWindow({
+      weekly: { status: 'exceeded', percent: 100, resetsAt: new Date(Date.now() + 3600_000).toISOString() },
+      fetchedAt: Date.now(),
+    });
+    check('打满的窗口能被识别', blocked?.name === 'weekly');
+
+    const healthy = blockingWindow({
+      weekly: { status: 'ok', percent: 40, resetsAt: '2026-11-09T00:00:00Z' },
+      monthly: { status: 'ok', percent: 65, resetsAt: '2026-11-12T00:00:00Z' },
+      fetchedAt: Date.now(),
+    });
+    check('没打满就不拦', healthy === undefined);
+    check('配额渲染成一行', renderQuota({
+      rolling: { status: 'ok', percent: 12, resetsAt: '' },
+      weekly: { status: 'ok', percent: 40, resetsAt: '' },
+      monthly: { status: 'ok', percent: 65, resetsAt: '' },
+      fetchedAt: Date.now(),
+    }).includes('周 40%'));
   }
 
   console.log('\n[1.9] 联网搜索解析');

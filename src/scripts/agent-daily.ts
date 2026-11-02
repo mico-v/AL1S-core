@@ -9,6 +9,7 @@ import { existsSync } from 'node:fs';
 import { readFile } from 'node:fs/promises';
 import path from 'node:path';
 import { readRecords, summarize, type CallRecord } from '../agent/telemetry.js';
+import { currentQuota, renderQuota } from '../agent/quota.js';
 
 const ROOT = process.cwd();
 const DATA = path.join(ROOT, 'data');
@@ -119,6 +120,16 @@ async function main(): Promise<void> {
   const botLines = await readReplies();
 
   console.log(`# Kei 每日体检 · ${new Date().toISOString().slice(0, 16).replace('T', ' ')}`);
+
+  const quota = await currentQuota(
+    {
+      baseUrl: process.env.AGENT_API_BASE ?? 'https://opencode.ai/zen/go/v1',
+      apiKey: process.env.AGENT_API_KEY ?? '',
+      model: process.env.AGENT_MODEL ?? '',
+    },
+    undefined,
+  );
+  console.log(`配额：${renderQuota(quota)}${quota?.weekly?.resetsAt ? `（周配额 ${quota.weekly.resetsAt} 重置）` : ''}`);
   console.log(
     `窗口：最近 24 小时 · 群消息 ${lines.length} 条（真人 ${human.length} / Kei ${botLines.length}）`,
   );

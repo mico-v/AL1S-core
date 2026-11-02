@@ -70,6 +70,47 @@ export interface UsageLike {
   completion_tokens_details?: { reasoning_tokens?: number };
 }
 
+/**
+ * 配额熔断。
+ *
+ * 服务端周配额打满时每次请求都会 429，而 digest / learn 是定时任务，
+ * 会每 10 分钟、每 30 分钟重打同一批 —— 一晚能空转上千次请求。
+ * 识别到 weekly 配额耗尽就记一个恢复时间点，期间后台任务直接跳过。
+ */
+let quotaPausedUntil = 0;
+
+export function quotaPausedUntilAt(): number {
+  return quotaPausedUntil;
+}
+
+export function isQuotaPaused(): boolean {
+  return Date.now() < quotaPausedUntil;
+}
+
+/** 从错误文本判断配额类型，返回需要暂停到的时刻；不是配额错误返回 0。 */
+export function quotaPauseFrom(text: string): number {
+  if (!/usage.?limit|quota|GoUsageLimitError/i.test(text)) {
+    return 0;
+  }
+  const now = new Date();
+  if (/weekly/i.test(text)) {
+    // 周配额按 UTC 自然日重置
+    return Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), now.getUTCDate() + 1);
+  }
+  return Date.now() + 3600_000;
+}
+
+/** 只有后台任务会被熔断；chat 仍然放行，让用户拿到真实错误而不是静默。 */
+function guardQuota(purpose?: string): void {
+  if (purpose === 'chat' || !isQuotaPaused()) {
+    return;
+  }
+  throw new LlmError(
+    `配额已暂停（至 ${new Date(quotaPausedUntil).toISOString()}），跳过本次 ${purpose ?? '调用'}`,
+    429,
+  );
+}
+
 export class LlmError extends Error {
   readonly status?: number;
 
@@ -86,6 +127,7 @@ export async function chatCompleteRaw(
   opts: LlmOptions,
   retries = 2,
 ): Promise<ChatResponse> {
+  guardQuota(opts.purpose);
   const url = `${opts.baseUrl.replace(/\/+$/, '')}/chat/completions`;
   // 不传就不设上限：由模型自己决定生成多长
   const maxTokens = opts.maxTokens && opts.maxTokens > 0 ? opts.maxTokens : undefined;
@@ -163,6 +205,12 @@ export async function chatCompleteRaw(
       });
       if (!res.ok) {
         const text = await res.text().catch(() => '');
+        if (res.status === 429) {
+          const until = quotaPauseFrom(text);
+          if (until > quotaPausedUntil) {
+            quotaPausedUntil = until;
+          }
+        }
         // 4xx 除了 429 之外重试没有意义
         if (res.status >= 400 && res.status < 500 && res.status !== 429) {
           throw new LlmError(`HTTP ${res.status}: ${text.slice(0, 300)}`, res.status);
@@ -221,6 +269,7 @@ export async function chatComplete(
   opts: LlmOptions,
   retries = 2,
 ): Promise<string> {
+  guardQuota(opts.purpose);
   const response = await chatCompleteRaw(messages, opts, retries);
   if (!response.content) {
     throw new LlmError('空回复');

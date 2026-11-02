@@ -57,7 +57,7 @@ try {
 
   // 档案归纳是后台任务，不参与实时回复，慢一点无所谓。
   if (agentConfig.enabled) {
-    const learnEveryMs = Number(process.env.AGENT_LEARN_INTERVAL_MS ?? 30 * 60 * 1000);
+    const learnEveryMs = Number(process.env.AGENT_LEARN_INTERVAL_MS ?? 60 * 60 * 1000);
     if (learnEveryMs > 0) {
       const timer = setInterval(() => {
         void learnAllGroups({ dataRoot: agentConfig.dataRoot, llm: agentConfig.llm }, log)

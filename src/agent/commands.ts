@@ -39,6 +39,8 @@ export interface StatusInput {
   startedAt: number;
   /** 处理门分状态计数 */
   modes?: { drop: number; store: number; process: number };
+  /** 配额摘要 */
+  quota?: string;
 }
 
 function fmtNum(value: number): string {
@@ -148,6 +150,7 @@ export async function renderStatus(input: StatusInput): Promise<string> {
     ...(input.modes
       ? [`本轮 存 ${input.modes.store} · 处理 ${input.modes.process} · 丢弃 ${input.modes.drop}`]
       : []),
+    ...(input.quota ? [input.quota] : []),
     `已连续运行 ${fmtDuration(Date.now() - input.startedAt)}`,
   ].join('\n');
 }
