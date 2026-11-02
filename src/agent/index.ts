@@ -14,6 +14,7 @@ import { matchCommand, renderStatus } from './commands.js';
 import { GroupBuffer, renderBuffer } from './context.js';
 import { DigestEngine } from './digest.js';
 import { judgeProactive } from './proactive.js';
+import { QuoteResolver } from './quote.js';
 import { backgroundPauseUntil, currentQuota, renderQuota } from './quota.js';
 import {
   chatComplete,
@@ -320,8 +321,10 @@ export class ChatAgent {
   private readonly recentOpeners = new Map<string, string[]>();
   /** 已处理过的 messageId，防止同一条消息被事件与全量通道投递两次 */
   private readonly handled = new Set<string>();
-  /** QQ 的 msgIdx → 这条消息是谁说的什么（解引用用，只留最近几百条） */
-  private readonly msgIndex = new Map<string, { sender: string; text: string }>();
+  /** 引用解析：从 chat-log 增量建索引，重启不丢 */
+  private readonly quotes: QuoteResolver;
+  /** 每个会话最后一句回复（引用不到时当候选，明确标注不确定） */
+  private readonly lastReply = new Map<string, { text: string; at: number }>();
   /** 同一会话串行处理，避免同一群里两条 @ 并发抢回复。 */
   private readonly chains = new Map<string, Promise<void>>();
 
@@ -337,6 +340,7 @@ export class ChatAgent {
     this.complete = complete;
     this.completeRaw = completeRaw;
     this.buffer = new GroupBuffer(config.contextSize);
+    this.quotes = new QuoteResolver(config.dataRoot);
     this.digest = new DigestEngine({
       dataRoot: config.dataRoot,
       llm: config.llm,
@@ -529,31 +533,37 @@ export class ChatAgent {
     });
   }
 
-  /** 记下这条消息的 msgIdx，供后面的引用解析。 */
-  private rememberIdx(groupId: string, message: QQBotInboundMessage, sender: string, text: string): void {
-    const idx = (message as unknown as { msgIdx?: unknown }).msgIdx;
-    if (typeof idx !== 'string' || !idx) {
-      return;
-    }
-    if (this.msgIndex.size > 600) {
-      const oldest = this.msgIndex.keys().next().value;
-      if (oldest !== undefined) {
-        this.msgIndex.delete(oldest);
-      }
-    }
-    this.msgIndex.set(`${groupId}|${idx}`, { sender, text: text.slice(0, 200) });
-  }
-
-  /** 这条消息引用了谁、引用了什么。解析不到就明说，不让模型瞎猜。 */
-  private resolveQuote(
+  /** 这条消息引用了谁、引用了什么。查 chat-log 里的 msgIdx。 */
+  private async resolveQuote(
     groupId: string,
     message: QQBotInboundMessage,
-  ): { sender: string; text: string } | undefined {
+  ): Promise<{ sender: string; text: string } | undefined> {
     const ref = (message as unknown as { refMsgIdx?: unknown }).refMsgIdx;
     if (typeof ref !== 'string' || !ref) {
       return undefined;
     }
-    return this.msgIndex.get(`${groupId}|${ref}`);
+    const hit = await this.quotes.resolve(groupId, ref);
+    return hit ? { sender: hit.sender, text: hit.text } : undefined;
+  }
+
+  /**
+   * 引用了一条我这边没有的消息时给模型的提示。
+   *
+   * QQ 不回投 bot 自己的消息，所以大量「引用 Kei 的话再 @ 她」的引用是解析不到的。
+   * 如果对方刚在我上一句之后不久发问，大概率就是在接那句 —— 给出来，但标明是猜测。
+   */
+  private unresolvedQuoteHint(conversationId: string): string {
+    const last = this.lastReply.get(conversationId);
+    if (last && Date.now() - last.at < 5 * 60_000) {
+      return `（对方引用了一条我看不到的消息，很可能是我刚才说的「${last.text.slice(0, 50)}」；按这个理解答，拿不准就问一句）`;
+    }
+    return '（引用了一条我看不到的消息：可能是我更早说的，也可能我没收到；不确定就问对方指的是哪句，别猜）';
+  }
+
+  /** 有没有引用（不管能不能解析）：解析不到时要明确告诉模型，不许猜。 */
+  private hasQuoteRef(message: QQBotInboundMessage): boolean {
+    const ref = (message as unknown as { refMsgIdx?: unknown }).refMsgIdx;
+    return typeof ref === 'string' && ref.length > 0;
   }
 
   private resolveScope(message: QQBotInboundMessage): Scope | undefined {
@@ -617,7 +627,6 @@ export class ChatAgent {
           messageId: message.messageId,
           isSelf: true,
         });
-        this.rememberIdx(scope.conversationId, message, 'Kei', said);
         this.modes.store += 1;
       } else {
         this.modes.drop += 1;
@@ -667,7 +676,7 @@ export class ChatAgent {
         .filter((url): url is string => Boolean(url))
         .slice(0, 3);
       const sender = message.senderName ?? message.senderId.slice(0, 8);
-      const quote = this.resolveQuote(scope.conversationId, message);
+      const quote = await this.resolveQuote(scope.conversationId, message);
       const line = {
         senderName: sender,
         text,
@@ -678,7 +687,6 @@ export class ChatAgent {
         ...(quote ? { quote } : {}),
       };
       this.buffer.push(scope.conversationId, line);
-      this.rememberIdx(scope.conversationId, message, sender, text);
       this.modes.store += 1;
       if (hasAttachments) {
         // 后台看懂，看懂后原地补进这一行，别挡住后续消息
@@ -710,7 +718,7 @@ export class ChatAgent {
     // 被 @ 的消息同样进缓冲：它不是「说完就忘」的，下一轮还会被追问
     {
       const sender = message.senderName ?? message.senderId.slice(0, 8);
-      const quote = this.resolveQuote(scope.conversationId, message);
+      const quote = await this.resolveQuote(scope.conversationId, message);
       this.buffer.push(scope.conversationId, {
         senderName: sender,
         text,
@@ -719,7 +727,6 @@ export class ChatAgent {
         ...addresseeOf(message, this.config),
         ...(quote ? { quote } : {}),
       });
-      this.rememberIdx(scope.conversationId, message, sender, text);
     }
 
     // 被 @ 了：图直接塞进模型上下文，不再只发一句描述
@@ -818,8 +825,12 @@ export class ChatAgent {
     const history = renderBuffer(pending);
     const now = new Date();
     const stamp = `${String(now.getHours()).padStart(2, '0')}:${String(now.getMinutes()).padStart(2, '0')}`;
-    const quoted = scope.isDirect ? undefined : this.resolveQuote(scope.conversationId, message);
-    const quotedPrefix = quoted ? `（回 ${quoted.sender}「${quoted.text.slice(0, 60)}」）` : '';
+    const quoted = scope.isDirect ? undefined : await this.resolveQuote(scope.conversationId, message);
+    const quotedPrefix = quoted
+      ? `（回 ${quoted.sender}「${quoted.text.slice(0, 60)}」）`
+      : !scope.isDirect && this.hasQuoteRef(message)
+        ? this.unresolvedQuoteHint(scope.conversationId)
+        : '';
     const current = `[${stamp}] ${speaker}${scope.isDirect ? '' : ' → Kei'}：${quotedPrefix}${text}`;
     const memoryBlock = remembered ? `## 你记得的 ${speaker}\n\n${remembered}\n\n` : '';
     const userText = history
@@ -868,6 +879,9 @@ export class ChatAgent {
         }
       }
       this.noteOpener(scope.conversationId, cleaned);
+      if (!scope.isDirect) {
+        this.lastReply.set(scope.conversationId, { text: cleaned, at: Date.now() });
+      }
       await this.recordReply(scope.conversationId, speaker, cleaned, chunks.length, {
         ms: Date.now() - startedAt,
       });

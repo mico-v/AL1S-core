@@ -15,6 +15,7 @@ import { GroupBuffer, renderBuffer } from '../agent/context.js';
 import { GroupMemory, applyProfileChanges } from '../agent/memory.js';
 import { parseBraveHtml, renderHits as renderWebHits } from '../agent/web.js';
 import { blockingWindow, renderQuota } from '../agent/quota.js';
+import { QuoteResolver } from '../agent/quote.js';
 import { quotaPauseFrom } from '../agent/llm.js';
 import { PERSONA } from '../agent/persona.js';
 import { cleanQQText } from '../agent/text.js';
@@ -207,6 +208,35 @@ async function main(): Promise<void> {
     const untouched = applyProfileChanges(base, '甲', [{ op: 'replace', match: '不存在的片段', text: '- 新' }]);
     check('match 不到就保持原样', untouched === base);
     check('标题始终保留', added.startsWith('# 甲'));
+  }
+
+  console.log('\n[1.82] 引用解析（磁盘索引）');
+  {
+    const root = await mkdtemp(path.join(tmpdir(), 'al1s-quote-'));
+    try {
+      const dir = path.join(root, 'chats', 'group', GROUP);
+      await mkdir(dir, { recursive: true });
+      const file = path.join(dir, 'messages.jsonl');
+      const rows = [
+        { msgIdx: 'IDX_A', senderName: '甲', content: '第一句话', timestamp: '2026-11-01T10:00:00+08:00' },
+        { msgIdx: 'IDX_B', senderName: '乙', content: '第二句话', timestamp: '2026-11-01T10:01:00+08:00' },
+      ];
+      await writeFile(file, rows.map((r) => JSON.stringify(r)).join('\n') + '\n', 'utf8');
+
+      const resolver = new QuoteResolver(root);
+      check('按 msgIdx 解析到原文', (await resolver.resolve(GROUP, 'IDX_A'))?.text === '第一句话');
+      check('解析到发送者', (await resolver.resolve(GROUP, 'IDX_B'))?.sender === '乙');
+      check('找不到返回 undefined', (await resolver.resolve(GROUP, 'IDX_ZZZ')) === undefined);
+      check('没有引用就不查', (await resolver.resolve(GROUP, undefined)) === undefined);
+
+      // 追加后应增量读到，且半行不报错
+      await writeFile(file, `${JSON.stringify({ msgIdx: 'IDX_C', senderName: '丙', content: '第三句' })}\n`, { flag: 'a' });
+      check('增量读到新消息', (await resolver.resolve(GROUP, 'IDX_C'))?.text === '第三句');
+      await writeFile(file, '{"msgIdx":"IDX_D","senderName":"丁","content":"半', { flag: 'a' });
+      check('半行不影响已有索引', (await resolver.resolve(GROUP, 'IDX_A'))?.text === '第一句话');
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
   }
 
   console.log('\n[1.85] 配额熔断');
