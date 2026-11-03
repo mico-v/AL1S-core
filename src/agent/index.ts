@@ -32,6 +32,26 @@ import { appendFile, mkdir } from 'node:fs/promises';
 import path from 'node:path';
 import { captionStorePath, digestAttachments, loadImageParts } from './vision.js';
 
+/**
+ * 找出最近几次回复里重复使用的起手式（同一个词出现 ≥2 次）。
+ *
+ * 「换个说法」这种提醒模型会当耳旁风；必须点名是哪个词、用了几次，
+ * 它才会真的换。实测同一个字连用 32/45 次就是这么来的。
+ */
+export function repeatedOpener(openers: string[]): { word: string; count: number } | undefined {
+  const counts = new Map<string, number>();
+  for (const word of openers) {
+    counts.set(word, (counts.get(word) ?? 0) + 1);
+  }
+  let best: { word: string; count: number } | undefined;
+  for (const [word, count] of counts) {
+    if (count >= 2 && (!best || count > best.count)) {
+      best = { word, count };
+    }
+  }
+  return best;
+}
+
 export interface AgentConfig {
   enabled: boolean;
   llm: LlmOptions;
@@ -816,12 +836,14 @@ export class ChatAgent {
       parts.push('## 提示\n\n现在是私聊，不是群里，可以放开一点聊。');
     }
 
-    // 连着几次都用同一个词开头，一眼就是模板；给模型一个具体的「换一个」提示
+    // 连着几次都用同一个词开头，一眼就是模板；点名那个词，别只说「换个说法」
     const openers = this.recentOpeners.get(scope.conversationId) ?? [];
-    if (openers.length >= 2) {
+    const repeated = repeatedOpener(openers);
+    if (repeated) {
       parts.push(
-        `## 别重复自己\n\n最近几次你是这样开头的：「${openers.join('」「')}」。` +
-          '这次换一个说法，别再用同一个起手式；结尾也别每次都挂同一个表情。',
+        `## 别重复自己\n\n你最近 ${openers.length} 次是这样开头的：「${openers.join('」「')}」。` +
+          `其中「${repeated.word}」已经用了 ${repeated.count} 次 —— 这次不要用「${repeated.word}」开头，` +
+          '直接从一个动作、一句判断或一句追问切进去；结尾也别每次都挂同一个表情。',
       );
     }
 

@@ -9,7 +9,7 @@
 import { mkdir, mkdtemp, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
-import { ChatAgent, isBotMentioned, MAX_REPLY_CHARS, MAX_REPLY_CHUNKS, readAgentConfig, splitReply } from '../agent/index.js';
+import { ChatAgent, isBotMentioned, MAX_REPLY_CHARS, MAX_REPLY_CHUNKS, readAgentConfig, repeatedOpener, splitReply } from '../agent/index.js';
 import type { ChatMessage } from '../agent/llm.js';
 import { GroupBuffer, renderBuffer } from '../agent/context.js';
 import { GroupMemory, applyProfileChanges } from '../agent/memory.js';
@@ -391,6 +391,16 @@ async function main(): Promise<void> {
     const second = calls[1]?.map((m) => m.content).join('\n') ?? '';
     check('上下文是滚动的，不会用完就忘', second.includes('没人叫你的话1'));
     check('上一轮 @ 过的话也留在上下文里', second.includes('Kei 在吗'));
+
+    // 假模型每次都回「诶 …」开头：第三轮必须点名这个字，而不是含糊地「换个说法」
+    check('重复开头能识别', repeatedOpener(['诶', '诶', '哈哈'])?.word === '诶');
+    check('只出现一次不算重复', repeatedOpener(['诶', '哈哈', '哦～']) === undefined);
+    await agent.handle(
+      makeMessage({ content: '第三句', mentions: [{ member_openid: BOT_OPENID }] }),
+      fakeBot,
+    );
+    const third = calls[2]?.map((m) => m.content).join('\n') ?? '';
+    check('提示点名禁用的起手式', third.includes('已经用了 2 次') && third.includes('不要用「诶」开头'));
 
     console.log('\n[5] 长回复分片');
     check('短回复不切', splitReply('诶 累就早点歇').length === 1);
