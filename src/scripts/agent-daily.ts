@@ -110,6 +110,59 @@ function byPurpose(records: CallRecord[]): Array<[string, CallRecord[]]> {
   return [...map.entries()].sort((a, b) => b[1].length - a[1].length);
 }
 
+interface VisionStat {
+  seen: number;
+  failed: number;
+  cached: number;
+  rounds: number;
+}
+
+/**
+ * 从服务日志里数「看图」：命中缓存的那部分不产生 caption 调用，
+ * 只看按用途的调用数是看不出省没省的 —— 所以单独统计一条。
+ */
+async function readVisionStat(): Promise<VisionStat | undefined> {
+  const file = path.join(ROOT, 'logs', 'service.log');
+  if (!existsSync(file)) {
+    return undefined;
+  }
+  const stat: VisionStat = { seen: 0, failed: 0, cached: 0, rounds: 0 };
+  for (const line of (await readFile(file, 'utf8')).split('\n')) {
+    const at = line.indexOf('看图 {');
+    if (at < 0) {
+      continue;
+    }
+    const body = line.slice(line.indexOf('{', at));
+    const stamp = /^\[([^\]]+)\]/.exec(line)?.[1];
+    if (!stamp || (Date.parse(stamp) || 0) < since) {
+      continue;
+    }
+    try {
+      const data = JSON.parse(body) as {
+        seen?: number;
+        failed?: number;
+        cached?: number;
+      };
+      stat.rounds += 1;
+      stat.seen += data.seen ?? 0;
+      stat.failed += data.failed ?? 0;
+      stat.cached += data.cached ?? 0;
+    } catch {
+      // 半行日志跳过
+    }
+  }
+  return stat.rounds > 0 ? stat : undefined;
+}
+
+async function captionStoreSize(): Promise<number> {
+  try {
+    const raw = JSON.parse(await readFile(path.join(DATA, 'captions.json'), 'utf8')) as Record<string, string>;
+    return Object.keys(raw).length;
+  } catch {
+    return 0;
+  }
+}
+
 async function main(): Promise<void> {
   const records = (await readRecords(path.join(DATA, 'calls'), 1)).filter(
     (r) => Date.parse(r.at) >= since,
@@ -163,6 +216,16 @@ async function main(): Promise<void> {
         `\n## 对话质量相关的硬指标\n` +
           `单次上下文 ${avgPrompt.toLocaleString()} token · 缓存 ${pct(cs.cacheRate)} · ` +
           `平均 ${fmtMs(cs.avgMs)} · 失败 ${cs.failedCalls}`,
+      );
+    }
+
+    // 看图成本：缓存命中率高说明同一批表情包没有再重复识别
+    const vision = await readVisionStat();
+    if (vision) {
+      const hits = vision.cached > 0 ? ` · 命中缓存 ${vision.cached}（${pct(vision.cached / Math.max(1, vision.seen))}）` : '';
+      console.log(
+        `\n## 看图\n看了 ${vision.seen} 张（失败 ${vision.failed}）${hits} · ` +
+          `缓存库 ${await captionStoreSize()} 条`,
       );
     }
 

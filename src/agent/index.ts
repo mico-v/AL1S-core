@@ -30,7 +30,7 @@ import { cleanQQText } from './text.js';
 import { TOOL_DEFINITIONS, executeTool, type ToolContext } from './tools.js';
 import { appendFile, mkdir } from 'node:fs/promises';
 import path from 'node:path';
-import { digestAttachments, loadImageParts } from './vision.js';
+import { captionStorePath, digestAttachments, loadImageParts } from './vision.js';
 
 export interface AgentConfig {
   enabled: boolean;
@@ -777,12 +777,16 @@ export class ChatAgent {
     options: { skipImages?: boolean } = {},
   ): Promise<string> {
     const startedAt = Date.now();
-    const digest = await digestAttachments(attachments, this.config.llm, this.log, options);
+    const digest = await digestAttachments(attachments, this.config.llm, this.log, {
+      ...options,
+      captionStore: captionStorePath(this.config.dataRoot),
+    });
     if (digest.imagesSeen > 0 || digest.imagesFailed > 0) {
       this.log.info('看图', {
         conversationId: message.groupOpenid ?? message.senderId.slice(0, 8),
         seen: digest.imagesSeen,
         failed: digest.imagesFailed,
+        cached: digest.imagesCached,
         ms: Date.now() - startedAt,
       });
     }

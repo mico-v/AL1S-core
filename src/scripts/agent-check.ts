@@ -23,7 +23,7 @@ import { matchCommand, renderStatus } from '../agent/commands.js';
 import { DigestEngine, DRIFT_THRESHOLD, topicDrift } from '../agent/digest.js';
 import { MessageIndex, renderHits } from '../agent/search.js';
 import { executeTool, expandQuery } from '../agent/tools.js';
-import { digestAttachments, loadImageParts, looksLikeImage, prepareImage, sniffImageType, sniffVideo } from '../agent/vision.js';
+import { captionForSha, captionStorePath, digestAttachments, flushCaptionStore, loadImageParts, looksLikeImage, prepareImage, rememberCaption, sniffImageType, sniffVideo, useCaptionStore } from '../agent/vision.js';
 import { buildProactiveMessages, judgeProactive, parseProactive } from '../agent/proactive.js';
 import { learnSystem } from '../agent/updater.js';
 import { buildRecord, summarize } from '../agent/telemetry.js';
@@ -732,6 +732,28 @@ async function main(): Promise<void> {
     );
     check('跳图后不再写图描述', !voice.text.includes('[图'));
     check('跳图不影响语音转写', voice.text.includes('今天好累'));
+
+    // 描述缓存按内容哈希落盘：同一个表情包换 rkey 再发、隔天重启，都不该再花钱
+    const capTmp = await mkdtemp(path.join(tmpdir(), 'al1s-caption-'));
+    try {
+      const store = captionStorePath(capTmp);
+      const sha = 'a'.repeat(64);
+      useCaptionStore(store);
+      rememberCaption(sha, '一只在笑的猫');
+      check('刚识别完的图立刻命中', captionForSha(sha) === '一只在笑的猫');
+      await flushCaptionStore();
+      useCaptionStore(undefined);
+      useCaptionStore(store);
+      check('重启后同一张图仍命中', captionForSha(sha) === '一只在笑的猫');
+      check('没见过的图不误命中', captionForSha('b'.repeat(64)) === undefined);
+      await writeFile(store, '{坏掉的 json', 'utf8');
+      useCaptionStore(undefined);
+      useCaptionStore(store);
+      check('缓存文件损坏不影响启动', captionForSha('c'.repeat(64)) === undefined);
+    } finally {
+      useCaptionStore(undefined);
+      await rm(capTmp, { recursive: true, force: true });
+    }
   }
 
   console.log('\n[15] 检索同义扩展');

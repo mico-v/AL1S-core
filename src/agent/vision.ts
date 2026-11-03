@@ -8,8 +8,9 @@
  */
 
 import { execFile } from 'node:child_process';
-import { constants } from 'node:fs';
-import { access, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
+import { createHash } from 'node:crypto';
+import { constants, readFileSync } from 'node:fs';
+import { access, mkdir, mkdtemp, readFile, rename, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 import { promisify } from 'node:util';
@@ -51,9 +52,117 @@ export interface AttachmentLike {
   voice_wav_url?: string;
 }
 
-/** url → 描述。同一个表情包被反复发时不再重复花钱。 */
+/**
+ * 描述缓存：key 是 `s:<内容哈希>` 或 `u:<url>`。
+ *
+ * 群里的图有一半是同一批表情包 —— 按 url 存没用，QQ 每次给的 rkey 都变，
+ * 第二天重启内存也清空。所以按图片内容哈希存，并且落盘，跨重启、跨天都命中。
+ */
 const captionCache = new Map<string, string>();
-const CACHE_LIMIT = 300;
+const CACHE_LIMIT = 4000;
+/** 落盘文件名（相对 dataRoot）。 */
+const CAPTION_STORE_NAME = 'captions.json';
+
+/** 缓存文件放在 dataRoot 下的固定位置。 */
+export function captionStorePath(dataRoot: string): string {
+  return path.join(dataRoot, CAPTION_STORE_NAME);
+}
+
+let storePath: string | undefined;
+let storeLoaded = false;
+let flushTimer: NodeJS.Timeout | undefined;
+
+/** 明确指定缓存落盘位置；路径变了就重新加载。 */
+export function useCaptionStore(file: string | undefined): void {
+  if (file === storePath) {
+    return;
+  }
+  storePath = file;
+  storeLoaded = false;
+  captionCache.clear();
+  if (file) {
+    loadCaptionStore();
+  }
+}
+
+function loadCaptionStore(): void {
+  if (storeLoaded || !storePath) {
+    return;
+  }
+  storeLoaded = true;
+  try {
+    const raw = JSON.parse(readFileSync(storePath, 'utf8')) as Record<string, string>;
+    for (const [sha, desc] of Object.entries(raw)) {
+      if (typeof desc === 'string' && desc.trim()) {
+        captionCache.set(`s:${sha}`, desc);
+      }
+    }
+  } catch {
+    // 第一次跑还没有文件；文件读坏也照常重新攒，不影响回复
+  }
+}
+
+/** 按内容哈希取回描述（会触发一次懒加载）。 */
+export function captionForSha(sha: string): string | undefined {
+  loadCaptionStore();
+  return captionCache.get(`s:${sha}`);
+}
+
+/** 记下一条描述：先更内存，落盘防抖。 */
+export function rememberCaption(sha: string, desc: string): void {
+  loadCaptionStore();
+  trimCache();
+  captionCache.set(`s:${sha}`, desc);
+  scheduleFlush();
+}
+
+/** 立刻把缓存写盘（自检和退出时用）。 */
+export async function flushCaptionStore(): Promise<void> {
+  const file = storePath;
+  if (!file) {
+    return;
+  }
+  const out: Record<string, string> = {};
+  let count = 0;
+  for (const [key, value] of captionCache) {
+    if (key.startsWith('s:')) {
+      out[key.slice(2)] = value;
+      count += 1;
+    }
+  }
+  if (count === 0) {
+    return;
+  }
+  try {
+    await mkdir(path.dirname(file), { recursive: true });
+    const tmp = `${file}.tmp`;
+    await writeFile(tmp, JSON.stringify(out), 'utf8');
+    await rename(tmp, file);
+  } catch {
+    // 落盘失败只影响下次命中率，不值得打扰对话
+  }
+}
+
+function scheduleFlush(): void {
+  if (!storePath || flushTimer) {
+    return;
+  }
+  flushTimer = setTimeout(() => {
+    flushTimer = undefined;
+    void flushCaptionStore();
+  }, 2000);
+  flushTimer.unref();
+}
+
+function trimCache(): void {
+  while (captionCache.size >= CACHE_LIMIT) {
+    const oldest = captionCache.keys().next().value;
+    if (oldest === undefined) {
+      return;
+    }
+    captionCache.delete(oldest);
+  }
+}
 
 let active = 0;
 const waiting: Array<() => void> = [];
@@ -361,6 +470,8 @@ export interface DigestedAttachments {
   /** 有几张图真的看成了。 */
   imagesSeen: number;
   imagesFailed: number;
+  /** 其中几张是直接命中缓存、没花 token。 */
+  imagesCached: number;
 }
 
 /**
@@ -372,14 +483,19 @@ export async function digestAttachments(
   attachments: AttachmentLike[] | undefined,
   llm: LlmOptions,
   log: AppLogger,
-  options: { skipImages?: boolean } = {},
+  options: { skipImages?: boolean; captionStore?: string } = {},
 ): Promise<DigestedAttachments> {
   const lines: string[] = [];
   let imagesSeen = 0;
   let imagesFailed = 0;
+  let imagesCached = 0;
+
+  if (options.captionStore) {
+    useCaptionStore(options.captionStore);
+  }
 
   if (!attachments || attachments.length === 0) {
-    return { text: '', imagesSeen, imagesFailed };
+    return { text: '', imagesSeen, imagesFailed, imagesCached };
   }
 
   // 语音：QQ 已经转好文字就直接用
@@ -401,10 +517,11 @@ export async function digestAttachments(
     if (!item.url) {
       continue;
     }
-    const cached = captionCache.get(item.url);
+    const cached = captionCache.get(`u:${item.url}`);
     if (cached) {
       lines.push(`[图${index + 1}] ${cached}`);
       imagesSeen += 1;
+      imagesCached += 1;
       continue;
     }
     try {
@@ -427,6 +544,16 @@ export async function digestAttachments(
           continue;
         }
       }
+      // 同一张图换个 rkey 再发一遍，url 变了但字节没变 —— 按内容哈希复用描述
+      const sha = createHash('sha256').update(bytes).digest('hex');
+      const known = captionForSha(sha);
+      if (known) {
+        captionCache.set(`u:${item.url}`, known);
+        lines.push(`[图${index + 1}] ${known}`);
+        imagesSeen += 1;
+        imagesCached += 1;
+        continue;
+      }
       const prepared = await prepareImage(bytes, mimeOf(item.content_type, bytes), log);
       const desc = await describeImage(prepared.data, prepared.mime, llm, log);
       if (!desc) {
@@ -434,13 +561,8 @@ export async function digestAttachments(
         lines.push(`[图${index + 1}] （没看清）`);
         continue;
       }
-      if (captionCache.size >= CACHE_LIMIT) {
-        const oldest = captionCache.keys().next().value;
-        if (oldest !== undefined) {
-          captionCache.delete(oldest);
-        }
-      }
-      captionCache.set(item.url, desc);
+      rememberCaption(sha, desc);
+      captionCache.set(`u:${item.url}`, desc);
       imagesSeen += 1;
       lines.push(`[图${index + 1}] ${desc}`);
     } catch (error) {
@@ -458,5 +580,5 @@ export async function digestAttachments(
     lines.push(`[文件] ${item.filename ?? '未命名'}${type ? `（${type}）` : ''}`);
   }
 
-  return { text: lines.join('\n'), imagesSeen, imagesFailed };
+  return { text: lines.join('\n'), imagesSeen, imagesFailed, imagesCached };
 }
