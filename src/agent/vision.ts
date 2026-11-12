@@ -455,7 +455,9 @@ export async function describeImage(
         timeoutMs: CAPTION_TIMEOUT_MS,
         disableThinking: true,
         purpose: 'caption',
-      }, 0),
+        // 压缩后一张图只剩几十 KB，重试一次很便宜；
+        // 之前 retries=0，网络抖一下就白丢一张图（实测占看图请求的 6%）
+      }, 1),
     );
     return text.trim() || undefined;
   } catch (error) {
