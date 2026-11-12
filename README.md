@@ -183,11 +183,17 @@ pnpm agent:learn    # 手动跑一次档案归纳
 pnpm install
 cp .env.example .env    # 填 QQBOT_APP_ID / QQBOT_APP_SECRET / AGENT_API_KEY
 mkdir -p logs
+pnpm build              # 服务单元跑的是 dist/index.js，不再用 tsx 现场编译
 # 管理台（可选）
 (cd admin && npm install && npm run build)
 cp deploy/al1s-bot.service deploy/al1s-admin.service /etc/systemd/system/
 systemctl daemon-reload && systemctl enable --now al1s-bot
 ```
+
+> 单元文件里写的是 `ExecStart=<node> /opt/al1s/app/dist/index.js`。
+> 改了 `src/` 必须 `pnpm build`（或 `pnpm deploy:server`）再重启，否则跑的还是旧代码；
+> 想回到「免编译」的开发方式，把 `ExecStart` 换回
+> `node node_modules/tsx/dist/cli.mjs src/index.ts`（内存会多占 100MB 左右）。
 
 同一个 AppID 只能有一个进程连 WebSocket —— 部署前先把其它占用同一 AppID 的进程停掉
 （包括别的 Hermes profile 的 qqbot 适配器），否则两边会互相抢事件、随机丢消息。
