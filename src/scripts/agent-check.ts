@@ -6,13 +6,15 @@
  * 覆盖：@ 判定、群聊缓冲、记忆读写、以及「@ 才调模型」这条主链路。
  */
 
-import { mkdir, mkdtemp, rm, writeFile } from 'node:fs/promises';
+import { existsSync } from 'node:fs';
+import { mkdir, mkdtemp, rm, utimes, appendFile, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 import { ChatAgent, isBotMentioned, MAX_REPLY_CHARS, MAX_REPLY_CHUNKS, readAgentConfig, repeatedOpener, splitReply } from '../agent/index.js';
+import { pruneMediaCache } from '../chat-log.js';
 import type { ChatMessage } from '../agent/llm.js';
 import { GroupBuffer, renderBuffer } from '../agent/context.js';
-import { GroupMemory, applyProfileChanges } from '../agent/memory.js';
+import { GroupMemory, applyProfileChanges, readNewRecordsFrom } from '../agent/memory.js';
 import { parseBraveHtml, renderHits as renderWebHits } from '../agent/web.js';
 import { blockingWindow, renderQuota } from '../agent/quota.js';
 import { QuoteResolver } from '../agent/quote.js';
@@ -351,6 +353,53 @@ async function main(): Promise<void> {
     check('档案写入并读回', Boolean(got?.profile.includes('话痨')));
     const rendered = await mem.renderContext([MEMBER_OPENID]);
     check('渲染含昵称', rendered.includes('謎矢'));
+
+    console.log('\n[3.1] chat-log 按字节偏移增量读');
+    {
+      const chatDir = path.join(tmp, 'chats', 'group', GROUP);
+      await mkdir(chatDir, { recursive: true });
+      const logFile = path.join(chatDir, 'messages.jsonl');
+      const row = (id: string, text: string): string =>
+        `${JSON.stringify({ messageId: id, timestamp: '2026-10-26T10:00:00+08:00', senderId: 'S', senderName: '甲', content: text })}\n`;
+      await writeFile(logFile, row('M1', '第一条') + row('M2', '第二条'));
+      const first = await readNewRecordsFrom(tmp, GROUP, 0);
+      check('首次读全部', first.records.length === 2, `实际 ${first.records.length}`);
+      const second = await readNewRecordsFrom(tmp, GROUP, first.offset);
+      check('没新消息就读 0 条', second.records.length === 0);
+      await appendFile(logFile, row('M3', '第三条'));
+      const third = await readNewRecordsFrom(tmp, GROUP, second.offset);
+      check('只返回新增那条', third.records.length === 1 && third.records[0]?.messageId === 'M3');
+      await appendFile(logFile, '{"messageId":"HALF","content":"没写完');
+      const half = await readNewRecordsFrom(tmp, GROUP, third.offset);
+      check('半行不吞，留给下次', half.records.length === 0 && half.offset === third.offset);
+      await appendFile(logFile, '"}\n');
+      const completed = await readNewRecordsFrom(tmp, GROUP, half.offset);
+      check('补齐后能读到', completed.records.length === 1 && completed.records[0]?.messageId === 'HALF');
+      // 老状态：只有 lastMessageId、没有 offset
+      const legacy = await readNewRecordsFrom(tmp, GROUP, undefined, 'M3');
+      check(
+        '老水位迁移：结果与按 id 扫描一致',
+        legacy.records.length === 1 && legacy.records[0]?.messageId === 'HALF',
+        `实际 ${legacy.records.map((r) => r.messageId).join(',')}`,
+      );
+      const afterMigrate = await readNewRecordsFrom(tmp, GROUP, legacy.offset);
+      check('迁移后立刻可以增量读', afterMigrate.records.length === 0);
+      // 文件被截断（换成了新文件）时不能卡死
+      await writeFile(logFile, row('N1', '重新开始'));
+      const truncated = await readNewRecordsFrom(tmp, GROUP, completed.offset);
+      check('文件变短就从头读', truncated.records.length === 1 && truncated.records[0]?.messageId === 'N1');
+
+      console.log('\n[3.2] 媒体缓存淘汰');
+      const mediaDir = path.join(tmp, 'media-cache');
+      await mkdir(mediaDir, { recursive: true });
+      await writeFile(path.join(mediaDir, 'old'), 'x'.repeat(64));
+      await writeFile(path.join(mediaDir, 'fresh'), 'y'.repeat(64));
+      const past = new Date(Date.now() - 40 * 24 * 3600_000);
+      await utimes(path.join(mediaDir, 'old'), past, past);
+      const pruned = await pruneMediaCache(tmp, 30);
+      check('超期文件被删', pruned.removed === 1 && !existsSync(path.join(mediaDir, 'old')));
+      check('新文件保留', existsSync(path.join(mediaDir, 'fresh')));
+    }
 
     console.log('\n[4] 主链路：非 @ 不调模型，@ 才调');
     const calls: ChatMessage[][] = [];
