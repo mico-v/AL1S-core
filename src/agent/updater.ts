@@ -10,7 +10,13 @@ import { readdir } from 'node:fs/promises';
 import path from 'node:path';
 import type { AppLogger } from '../logger.js';
 import { chatComplete, type LlmOptions } from './llm.js';
-import { GroupMemory, readNewRecords, applyProfileChanges, type ProfileChange, type RawRecord } from './memory.js';
+import {
+  GroupMemory,
+  readNewRecordsFrom,
+  applyProfileChanges,
+  type ProfileChange,
+  type RawRecord,
+} from './memory.js';
 import { backgroundPauseUntil } from './quota.js';
 
 const MIN_RECORDS = 6;
@@ -87,8 +93,6 @@ export function learnSystem(today = new Date().toISOString().slice(0, 10)): stri
 - 每人最多 6 条变更；宁可少记，不要凑数
 - 如果这批消息没有值得记的内容，输出 {"profiles":[]}`;
 }
-
-const SYSTEM = learnSystem();
 
 /** 从可能带 markdown 围栏或前后废话的回复里抠出 JSON。 */
 function extractJson(raw: string): unknown {
@@ -175,7 +179,14 @@ export async function learnGroup(
   const memory = new GroupMemory(config.dataRoot, groupOpenid);
   const state = await memory.readState();
   const batch = config.batchSize ?? MAX_RECORDS_PER_RUN;
-  const records = (await readNewRecords(config.dataRoot, groupOpenid, state.lastMessageId)).slice(-batch);
+  // 按字节偏移增量读：只解析上次水位之后的新行，不再每次全量 parse 整个 JSONL
+  const { records: fresh, offset } = await readNewRecordsFrom(
+    config.dataRoot,
+    groupOpenid,
+    state.lastOffset,
+    state.lastMessageId,
+  );
+  const records = fresh.slice(-batch);
 
   if (records.length < MIN_RECORDS) {
     log.debug('记录太少，跳过归纳', { groupOpenid, count: records.length });
@@ -210,21 +221,30 @@ export async function learnGroup(
    */
   const attempt = async (members: Array<[string, { name: string; n: number }]>) => {
     const scopeLine = members.map(([openid, info]) => `- ${info.name} (${openid}) ${info.n} 条`).join('\n');
+    /**
+     * 现有档案放进 system，让它们落在可缓存的前缀里。
+     *
+     * 两条纪律：
+     *   1. 顺序按 openid 排（永不变动）—— 改一份档案只会击穿它后面的缓存块，
+     *      而不是把整段顺序打乱；
+     *   2. 名单与新消息是每轮都变的，必须留在 user 里，否则前缀恒不命中。
+     */
     const existingBlock = members
       .map(([openid]) => memberMap.get(openid))
       .filter((m): m is NonNullable<typeof m> => Boolean(m))
+      .sort((a, b) => a.openid.localeCompare(b.openid))
       .map((m) => `### ${m.name} (${m.openid})\n${m.profile.slice(0, 800)}`)
       .join('\n\n')
       .slice(0, 12_000) || '（这些人还没有档案）';
+    // 日期每次重算：旧的模块级常量会让提示词一直停在启动那天
+    const system = `${learnSystem()}\n\n---\n\n## 他们现有的档案\n\n${existingBlock}`;
 
     const raw = await chatComplete(
       [
-        { role: 'system', content: SYSTEM },
+        { role: 'system', content: system },
         {
           role: 'user',
-          // 顺序有意为之：稳定内容（人格、现有档案）放前面，可变的名单和新消息放后面，
-          // 这样前缀缓存能命中；反过来每次都不一样，命中率恒为 0。
-          content: `## 他们现有的档案\n\n${existingBlock}\n\n## 本轮只更新这些人（其他人不要动）\n${scopeLine}\n\n## 新消息\n\n${renderRecords(records)}`,
+          content: `## 本轮只更新这些人（其他人不要动）\n${scopeLine}\n\n## 新消息\n\n${renderRecords(records)}`,
         },
       ],
       {
@@ -282,6 +302,7 @@ export async function learnGroup(
     await memory.writeState({
       lastMessageId: last?.messageId,
       lastMessageAt: new Date().toISOString(),
+      lastOffset: offset,
     });
     log.warn('归纳结果不合法，跳过本批并推进水位线', {
       groupOpenid,
@@ -296,6 +317,7 @@ export async function learnGroup(
   await memory.writeState({
     lastMessageId: last?.messageId,
     lastMessageAt: new Date().toISOString(),
+    lastOffset: offset,
   });
 
   log.info('归纳完成', { groupOpenid, records: records.length, written: profiles.length });
@@ -306,6 +328,8 @@ export async function learnGroup(
 export async function learnAllGroups(
   config: UpdaterConfig,
   log: AppLogger,
+  /** 只跑这些群；不传就扫全部（已退群/早死的目录不必每轮都试一遍）。 */
+  onlyGroups?: string[],
 ): Promise<{ groups: number; written: number }> {
   const dir = path.join(config.dataRoot, 'chats', 'group');
   if (!existsSync(dir)) {
@@ -313,7 +337,8 @@ export async function learnAllGroups(
   }
   let groups = 0;
   let written = 0;
-  for (const name of await readdir(dir)) {
+  const targets = onlyGroups && onlyGroups.length > 0 ? onlyGroups : await readdir(dir);
+  for (const name of targets) {
     if (name.startsWith('.')) {
       continue;
     }

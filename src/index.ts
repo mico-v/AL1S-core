@@ -11,6 +11,7 @@ import { ChatAgent, readAgentConfig } from './agent/index.js';
 import { configureTelemetry } from './agent/telemetry.js';
 import { learnAllGroups, learnGroup } from './agent/updater.js';
 import { Bot } from './bot.js';
+import { pruneMediaCache } from './chat-log.js';
 import { ConfigError, loadConfig } from './config.js';
 import { createLogger } from './logger.js';
 
@@ -60,7 +61,11 @@ try {
     const learnEveryMs = Number(process.env.AGENT_LEARN_INTERVAL_MS ?? 60 * 60 * 1000);
     if (learnEveryMs > 0) {
       const timer = setInterval(() => {
-        void learnAllGroups({ dataRoot: agentConfig.dataRoot, llm: agentConfig.llm }, log)
+        void learnAllGroups(
+          { dataRoot: agentConfig.dataRoot, llm: agentConfig.llm },
+          log,
+          agentConfig.groupAllowlist,
+        )
           .then((result) => {
             if (result.written > 0) {
               log.info('定时归纳完成', result);
@@ -71,6 +76,20 @@ try {
       timer.unref();
       log.info('已开启档案定时归纳', { intervalMs: learnEveryMs });
     }
+  }
+
+  // 媒体缓存没有任何淘汰机制，一个活跃群一天进 40MB —— 每天清一次超期的
+  if (config.chatLog.enabled) {
+    const retainDays = Number(process.env.CHAT_MEDIA_RETAIN_DAYS ?? 30);
+    const prune = (): void => {
+      void pruneMediaCache(config.chatLog.root, retainDays, log).catch((error: unknown) => {
+        log.warn('清理媒体缓存失败', { error });
+      });
+    };
+    prune();
+    const timer = setInterval(prune, 24 * 3600_000);
+    timer.unref();
+    log.info('已开启媒体缓存清理', { retainDays, root: config.chatLog.root });
   }
 
   // 群里安静下来、没到阈值时兜底归档一次

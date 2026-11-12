@@ -15,7 +15,7 @@ import { appendFile, mkdir, readFile, writeFile } from 'node:fs/promises';
 import path from 'node:path';
 import type { AppLogger } from '../logger.js';
 import { chatComplete, type ChatMessage, type LlmOptions } from './llm.js';
-import { readNewRecords, type RawRecord } from './memory.js';
+import { readNewRecordsFrom, type RawRecord } from './memory.js';
 
 export interface DigestTopic {
   title: string;
@@ -52,6 +52,8 @@ export interface DigestOptions {
 interface DigestState {
   lastMessageId?: string;
   lastMessageAt?: string;
+  /** chat-log 的字节水位：下次从这里接着读，不再全量 parse */
+  lastOffset?: number;
 }
 
 const PROMPT = `你在给一个 QQ 群做"这一轮聊了什么"的归档。
@@ -119,7 +121,7 @@ export const IDLE_GAP_MS = 30 * 60 * 1000;
 export const MIN_TOPIC_MESSAGES = 8;
 
 /** 话题漂移触发的最小消息数。 */
-export const MIN_DRIFT_MESSAGES = 12;
+export const MIN_DRIFT_MESSAGES = 20;
 
 /** 中文按双字组切，英文按词切；过滤标点与语气词，只留有信息量的部分。 */
 function shingles(text: string): Set<string> {
@@ -238,7 +240,12 @@ export class DigestEngine {
   /** 手动/定时触发：按 chat-log 水位线看看够不够。 */
   async dueCount(chatId: string): Promise<number> {
     const state = await readState(path.join(digestDir(this.opts.dataRoot, chatId), 'state.json'));
-    const records = await readNewRecords(this.opts.dataRoot, chatId, state.lastMessageId);
+    const { records } = await readNewRecordsFrom(
+      this.opts.dataRoot,
+      chatId,
+      state.lastOffset,
+      state.lastMessageId,
+    );
     return records.length;
   }
 
@@ -253,7 +260,12 @@ export class DigestEngine {
       const stateFile = path.join(dir, 'state.json');
       const state = await readState(stateFile);
 
-      const fresh = await readNewRecords(this.opts.dataRoot, chatId, state.lastMessageId);
+      const { records: fresh, offset } = await readNewRecordsFrom(
+        this.opts.dataRoot,
+        chatId,
+        state.lastOffset,
+        state.lastMessageId,
+      );
       if (fresh.length < Math.min(8, this.opts.threshold)) {
         this.pending.set(chatId, fresh.length);
         return undefined;
@@ -346,7 +358,11 @@ export class DigestEngine {
 
       await writeFile(
         stateFile,
-        JSON.stringify({ lastMessageId: last.messageId, lastMessageAt: record.to }, null, 2),
+        JSON.stringify(
+          { lastMessageId: last.messageId, lastMessageAt: record.to, lastOffset: offset },
+          null,
+          2,
+        ),
         'utf8',
       );
       this.pending.set(chatId, 0);

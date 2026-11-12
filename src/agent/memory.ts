@@ -9,7 +9,7 @@
  */
 
 import { existsSync } from 'node:fs';
-import { mkdir, readFile, readdir, writeFile } from 'node:fs/promises';
+import { mkdir, open, readFile, readdir, stat, writeFile } from 'node:fs/promises';
 import path from 'node:path';
 
 export interface RawRecord {
@@ -27,6 +27,8 @@ export interface MemberEntry {
   name: string;
   profilePath: string;
   profile: string;
+  /** 档案最后更新时间；归纳时用来把「刚改过的人」排到最后，保住提示词缓存前缀。 */
+  mtimeMs: number;
 }
 
 const MAX_CONTEXT_PROFILE_CHARS = 700;
@@ -60,10 +62,13 @@ export class GroupMemory {
     const out: MemberEntry[] = [];
     for (const file of files) {
       const profilePath = path.join(this.membersDir, file);
-      const profile = await readFile(profilePath, 'utf8');
+      const [profile, info] = await Promise.all([
+        readFile(profilePath, 'utf8'),
+        stat(profilePath).catch(() => undefined),
+      ]);
       const openid = file.replace(/\.md$/, '');
       const name = /^#\s*(.+)$/m.exec(profile)?.[1]?.trim() ?? openid.slice(0, 8);
-      out.push({ openid, name, profilePath, profile });
+      out.push({ openid, name, profilePath, profile, mtimeMs: info?.mtimeMs ?? 0 });
     }
     return out;
   }
@@ -73,9 +78,12 @@ export class GroupMemory {
     if (!existsSync(profilePath)) {
       return undefined;
     }
-    const profile = await readFile(profilePath, 'utf8');
+    const [profile, info] = await Promise.all([
+      readFile(profilePath, 'utf8'),
+      stat(profilePath).catch(() => undefined),
+    ]);
     const name = /^#\s*(.+)$/m.exec(profile)?.[1]?.trim() ?? openid.slice(0, 8);
-    return { openid, name, profilePath, profile };
+    return { openid, name, profilePath, profile, mtimeMs: info?.mtimeMs ?? 0 };
   }
 
   async saveMember(openid: string, name: string, body: string): Promise<void> {
@@ -101,7 +109,7 @@ export class GroupMemory {
     return blocks.join('\n\n');
   }
 
-  async readState(): Promise<{ lastMessageId?: string; lastMessageAt?: string }> {
+  async readState(): Promise<{ lastMessageId?: string; lastMessageAt?: string; lastOffset?: number }> {
     if (!existsSync(this.stateFile)) {
       return {};
     }
@@ -109,13 +117,18 @@ export class GroupMemory {
       return JSON.parse(await readFile(this.stateFile, 'utf8')) as {
         lastMessageId?: string;
         lastMessageAt?: string;
+        lastOffset?: number;
       };
     } catch {
       return {};
     }
   }
 
-  async writeState(state: { lastMessageId?: string; lastMessageAt?: string }): Promise<void> {
+  async writeState(state: {
+    lastMessageId?: string;
+    lastMessageAt?: string;
+    lastOffset?: number;
+  }): Promise<void> {
     await this.ensure();
     await writeFile(this.stateFile, JSON.stringify(state, null, 2), 'utf8');
   }
@@ -222,6 +235,29 @@ export function applyProfileChanges(existing: string, name: string, changes: Pro
   return [lines[0] ?? `# ${name}`, ...kept].join('\n');
 }
 
+/** 文件末尾对齐到最后一行的偏移（append 写的是整行，正常就等于文件大小）。 */
+async function endOffset(file: string): Promise<number> {
+  const info = await stat(file);
+  if (info.size === 0) {
+    return 0;
+  }
+  const fh = await open(file, 'r');
+  try {
+    const tail = Buffer.allocUnsafe(1);
+    await fh.read(tail, 0, 1, info.size - 1);
+    if (tail[0] === 0x0a) {
+      return info.size;
+    }
+    // 最后一行还没写完：退到它之前，留给下次
+    const back = Buffer.allocUnsafe(Math.min(4096, info.size));
+    const { bytesRead } = await fh.read(back, 0, back.length, info.size - back.length);
+    const nl = back.subarray(0, bytesRead).lastIndexOf(0x0a);
+    return nl >= 0 ? info.size - bytesRead + nl + 1 : 0;
+  } finally {
+    await fh.close();
+  }
+}
+
 /** 从 chat-log 的 JSONL 里读增量记录（按 messageId 去重，取 watermark 之后的部分）。 */
 export async function readNewRecords(
   chatRoot: string,
@@ -257,4 +293,89 @@ export async function readNewRecords(
     records.push(rec);
   }
   return records;
+}
+
+/** 一次增量读的结果。 */
+export interface TailRead {
+  records: RawRecord[];
+  /** 这次读完的最后一个完整行之后的字节偏移；下次从这里接着读。 */
+  offset: number;
+}
+
+/** 单次最多往回读多少字节（防止水位丢了之后一次读爆内存）。 */
+const MAX_TAIL_BYTES = 64 * 1024 * 1024;
+
+/**
+ * 按字节偏移增量读 chat-log。
+ *
+ * 旧实现每次 readFile 整个 messages.jsonl 再逐行 JSON.parse（一个群一天长 1.7MB，
+ * 而巡检每 10 分钟、归纳每 30 分钟、每次归档前后都各读一遍），白白烧 CPU 和 GC。
+ * 这里改成只读上次之后的字节，而且只解析到最后一个换行符 —— 半行留给下次。
+ */
+export async function readNewRecordsFrom(
+  chatRoot: string,
+  groupOpenid: string,
+  fromOffset?: number,
+  /**
+   * 老状态兼容：state.json 里只有 messageId、还没写 lastOffset 时，
+   * 走一次旧的全量扫描拿到准确的未读集合，顺便把 offset 补齐。
+   */
+  fallbackAfterMessageId?: string,
+): Promise<TailRead> {
+  const file = path.join(chatRoot, 'chats', 'group', groupOpenid, 'messages.jsonl');
+  if (!existsSync(file)) {
+    return { records: [], offset: 0 };
+  }
+  if (fromOffset === undefined && fallbackAfterMessageId !== undefined) {
+    const records = await readNewRecords(chatRoot, groupOpenid, fallbackAfterMessageId);
+    return { records, offset: await endOffset(file) };
+  }
+  const info = await stat(file);
+  // 文件被截断/换掉（偏移超出大小）就从头读
+  let start = fromOffset !== undefined && fromOffset > 0 && fromOffset <= info.size ? fromOffset : 0;
+  if (info.size - start > MAX_TAIL_BYTES) {
+    start = info.size - MAX_TAIL_BYTES;
+    // 从中间开始读会切出半行，丢第一行就行
+  }
+  if (info.size === start) {
+    return { records: [], offset: start };
+  }
+
+  const fh = await open(file, 'r');
+  try {
+    const length = info.size - start;
+    const buf = Buffer.allocUnsafe(length);
+    const { bytesRead } = await fh.read(buf, 0, length, start);
+    const chunk = buf.subarray(0, bytesRead);
+    const lastNewline = chunk.lastIndexOf(0x0a);
+    if (lastNewline < 0) {
+      // 连一个完整行都没有：等下次
+      return { records: [], offset: start };
+    }
+    const text = chunk.subarray(0, lastNewline).toString('utf8');
+    const offset = start + lastNewline + 1;
+    const records: RawRecord[] = [];
+    for (const line of text.split('\n')) {
+      if (!line) {
+        continue;
+      }
+      let rec: RawRecord;
+      try {
+        rec = JSON.parse(line) as RawRecord;
+      } catch {
+        // 从中间截断时第一行可能是半截，跳过
+        continue;
+      }
+      if (rec.senderIsBot) {
+        continue;
+      }
+      if (!rec.content?.trim()) {
+        continue;
+      }
+      records.push(rec);
+    }
+    return { records, offset };
+  } finally {
+    await fh.close();
+  }
 }

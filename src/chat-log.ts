@@ -23,7 +23,7 @@
 
 import { createHash } from 'node:crypto';
 import { appendFileSync, existsSync, mkdirSync } from 'node:fs';
-import { writeFile } from 'node:fs/promises';
+import { readdir, stat, unlink, writeFile } from 'node:fs/promises';
 import { join, relative } from 'node:path';
 import type { QQBotInboundMessage } from '@tencent-connect/qqbot-nodejs';
 import type { InboundAttachment } from '@tencent-connect/qqbot-nodejs/protocol';
@@ -372,6 +372,47 @@ export class ChatStore {
       }
     }
   }
+}
+
+/**
+ * 清理 media-cache 里的旧图。
+ *
+ * 这个目录按内容哈希存原图，没有任何淘汰机制：一个活跃群一天进 40MB，
+ * 三个月就能吃掉几 G。它只是「回看原图」用的，超期删掉不影响任何功能。
+ */
+export async function pruneMediaCache(
+  root: string,
+  retainDays = 30,
+  logger?: AppLogger,
+): Promise<{ removed: number; bytes: number }> {
+  const dir = join(root, 'media-cache');
+  if (!existsSync(dir)) {
+    return { removed: 0, bytes: 0 };
+  }
+  const cutoff = Date.now() - Math.max(1, retainDays) * 24 * 3600_000;
+  let removed = 0;
+  let bytes = 0;
+  for (const name of await readdir(dir).catch(() => [] as string[])) {
+    if (name === 'download-errors.log') {
+      continue;
+    }
+    const file = join(dir, name);
+    const info = await stat(file).catch(() => undefined);
+    if (!info?.isFile() || info.mtimeMs >= cutoff) {
+      continue;
+    }
+    try {
+      await unlink(file);
+      removed += 1;
+      bytes += info.size;
+    } catch {
+      // 删不掉就算了，下次再试
+    }
+  }
+  if (removed > 0) {
+    logger?.info('清理媒体缓存', { removed, mb: Math.round(bytes / 1048576) });
+  }
+  return { removed, bytes };
 }
 
 export type { InboundAttachment };

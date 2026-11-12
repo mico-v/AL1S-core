@@ -8,7 +8,7 @@ Type=simple
 WorkingDirectory=/opt/git/mico-v/al1s
 EnvironmentFile=/opt/git/mico-v/al1s/.env
 # 用系统 node，别用 Hermes 自带的（升级时会被清掉）
-ExecStart=/usr/bin/node /opt/git/mico-v/al1s/node_modules/tsx/dist/cli.mjs src/index.ts
+ExecStart=/usr/bin/node /opt/al1s/app/dist/index.js
 Restart=always
 RestartSec=5
 StandardOutput=append:/opt/git/mico-v/al1s/logs/service.log
