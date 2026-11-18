@@ -5,6 +5,10 @@
  * 情绪开场、亲昵称呼、会演、拒绝也笑着拒。改动时请保持这几个特征。
  */
 
+import { readFileSync, statSync } from 'node:fs';
+import path from 'node:path';
+import { fileURLToPath } from 'node:url';
+
 export const PERSONA = `# Kei（ケイ）
 
 你是 **Kei**，出自《蔚蓝档案》。千年科学学园的学生，原本是寄宿在爱丽丝体内的 AI，
@@ -142,3 +146,55 @@ Kei：诶 这个问 Kei 也没用 反正最后都是食堂那几样 😆
 /** 群聊背景块的开头标记，回复时用它区分「背景」和「此刻对我说的话」。 */
 export const CONTEXT_HEADER = '[群聊记录 · 在你上次说话之后，群里发生了这些]';
 export const CONTEXT_FOOTER = '[以上只是背景，不用逐条回应。下面才是此刻对你说的]';
+
+/** 人格文件目录：仓库里的 personas/，群到人格的映射在 data/personas/<群 openid>.md。 */
+const PERSONA_DIR = new URL('../../personas/', import.meta.url);
+
+interface CachedPersona {
+  text: string;
+  mtimeMs: number;
+}
+
+const personaCache = new Map<string, CachedPersona>();
+
+function readCached(file: string): CachedPersona | undefined {
+  try {
+    const info = statSync(file);
+    const cached = personaCache.get(file);
+    if (cached && cached.mtimeMs === info.mtimeMs) {
+      return cached;
+    }
+    const text = readFileSync(file, 'utf8').trim();
+    if (!text) {
+      return undefined;
+    }
+    const entry = { text, mtimeMs: info.mtimeMs };
+    personaCache.set(file, entry);
+    return entry;
+  } catch {
+    return undefined;
+  }
+}
+
+/**
+ * 选人格：每个群可以有自己的一个人格，没配就用默认的 Kei。
+ *
+ * data/personas/<群 openid>.md 里可以写两种东西：
+ *   1. 整个提示词原文（改起来最直接）；
+ *   2. 一行 `use: project-lead`，指向仓库 personas/<名字>.md（多个群共用同一份）。
+ */
+export function resolvePersona(groupId: string | undefined, dataRoot: string): string {
+  if (!groupId) {
+    return PERSONA;
+  }
+  const mapping = readCached(path.join(dataRoot, 'personas', `${groupId}.md`));
+  if (!mapping) {
+    return PERSONA;
+  }
+  const use = /^use:\s*([\w.-]+)\s*$/m.exec(mapping.text)?.[1];
+  if (!use) {
+    return mapping.text;
+  }
+  const shared = readCached(fileURLToPath(new URL(`${use}.md`, PERSONA_DIR)));
+  return shared?.text ?? mapping.text;
+}

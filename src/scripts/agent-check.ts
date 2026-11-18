@@ -19,12 +19,15 @@ import { parseBraveHtml, renderHits as renderWebHits } from '../agent/web.js';
 import { blockingWindow, renderQuota } from '../agent/quota.js';
 import { QuoteResolver } from '../agent/quote.js';
 import { quotaPauseFrom } from '../agent/llm.js';
-import { PERSONA } from '../agent/persona.js';
+import { PERSONA, resolvePersona } from '../agent/persona.js';
+import { capabilitiesFor, resolveTier } from '../agent/policy.js';
+import { checkCommand, devAllowed } from '../agent/exec.js';
+import { RecordStore } from '../agent/records.js';
 import { cleanQQText } from '../agent/text.js';
 import { matchCommand, renderStatus } from '../agent/commands.js';
 import { DigestEngine, DRIFT_THRESHOLD, topicDrift } from '../agent/digest.js';
 import { MessageIndex, renderHits } from '../agent/search.js';
-import { executeTool, expandQuery } from '../agent/tools.js';
+import { executeTool, expandQuery, toolDefinitionsFor } from '../agent/tools.js';
 import { captionForSha, captionStorePath, digestAttachments, flushCaptionStore, loadImageParts, looksLikeImage, prepareImage, rememberCaption, sniffImageType, sniffVideo, useCaptionStore } from '../agent/vision.js';
 import { buildProactiveMessages, judgeProactive, parseProactive } from '../agent/proactive.js';
 import { learnSystem } from '../agent/updater.js';
@@ -862,6 +865,82 @@ async function main(): Promise<void> {
   check('提示词带今天日期', learnPrompt.includes(today));
   check('要求标时间区间', learnPrompt.includes('~ )') || learnPrompt.includes('~ ）'));
   check('不删旧条目', learnPrompt.includes('不要删旧条目'));
+
+  console.log('\n[17] 权限分档与代码工具');
+  const policy = {
+    ownerOpenids: ['OWNER'],
+    devOpenids: ['DEV'],
+    devGroups: ['G1'],
+    codeTools: true,
+    workspace: '/tmp/ws',
+    repo: 'campus-nav-3d',
+    repoSlug: 'mico-v/campus-nav-3d',
+  };
+  check('主人 → owner', resolveTier('OWNER', 'G1', policy) === 'owner');
+  check('工程群里的开发成员 → dev', resolveTier('DEV', 'G1', policy) === 'dev');
+  check('非工程群里同一个开发成员 → guest', resolveTier('DEV', 'G2', policy) === 'guest');
+  check('陌生人 → guest', resolveTier('X', 'G1', policy) === 'guest');
+  check('私聊不给 dev', resolveTier('DEV', undefined, policy) === 'guest');
+  check('关掉代码工具后连主人也只剩聊天', capabilitiesFor('owner', { ...policy, codeTools: false }).exec === false);
+  check('guest 没有仓库读权限', capabilitiesFor('guest', policy).repoRead === false);
+  check('guest 没有写权限', capabilitiesFor('guest', policy).repoWrite === false);
+  check('dev 能读不能写', capabilitiesFor('dev', policy).repoRead && !capabilitiesFor('dev', policy).repoWrite);
+
+  check('guest 不能跑命令', !checkCommand('git status', 'guest', '/tmp/ws').allowed);
+  check('dev 能跑测试', checkCommand('npm test', 'dev', '/tmp/ws').allowed);
+  check('dev 不能提交', !checkCommand('git commit -am x', 'dev', '/tmp/ws').allowed);
+  check('主人能推分支', checkCommand('git push -u origin feat/x', 'owner', '/tmp/ws').allowed);
+  check('主人也不能直推 main', !checkCommand('git push origin main', 'owner', '/tmp/ws').allowed);
+  check('不能提权', !checkCommand('sudo systemctl restart x', 'owner', '/tmp/ws').allowed);
+  check('不能碰 /etc', !checkCommand('cat /etc/shadow', 'owner', '/tmp/ws').allowed);
+  check('不能删根', !checkCommand('rm -rf /', 'owner', '/tmp/ws').allowed);
+  check('管道按段判', devAllowed('git log --oneline | head -5'));
+  check('带写操作的管道不放过', !devAllowed('git log --oneline | rm x'));
+
+  const guestTools = JSON.stringify(toolDefinitionsFor(capabilitiesFor('guest', policy)));
+  const ownerTools = JSON.stringify(toolDefinitionsFor(capabilitiesFor('owner', policy)));
+  check('guest 看不到 run_command', !guestTools.includes('run_command'));
+  check('guest 看不到 write_file', !guestTools.includes('write_file'));
+  check('guest 能看到记忆查询', guestTools.includes('memory_query'));
+  check('主人能看到 run_command', ownerTools.includes('run_command'));
+  check('主人能看到 write_file', ownerTools.includes('write_file'));
+  check('主人能看到 memory_note', ownerTools.includes('memory_note'));
+
+  console.log('\n[18] 分群人格');
+  const personaTmp = await mkdtemp(path.join(tmpdir(), 'persona-'));
+  try {
+    check('没配就退回默认人格', resolvePersona('NOPE', personaTmp) === PERSONA);
+    check('私聊用默认人格', resolvePersona(undefined, personaTmp) === PERSONA);
+    await mkdir(path.join(personaTmp, 'personas'), { recursive: true });
+    await writeFile(path.join(personaTmp, 'personas', 'G1.md'), 'use: project-lead\n', 'utf8');
+    const lead = resolvePersona('G1', personaTmp);
+    check('use: 指向仓库里的人格', lead.includes('项目管家'), lead.slice(0, 30));
+    check('掌家人格要求先看再答', lead.includes('repo_status'));
+    await writeFile(path.join(personaTmp, 'personas', 'G2.md'), '# 别的人格\n\n就这一句。\n', 'utf8');
+    check('整份人格原文也能用', resolvePersona('G2', personaTmp).includes('就这一句'));
+  } finally {
+    await rm(personaTmp, { recursive: true, force: true });
+  }
+
+  console.log('\n[19] 记录本');
+  const recTmp = await mkdtemp(path.join(tmpdir(), 'records-'));
+  try {
+    const store = new RecordStore(recTmp, 'G1');
+    check('空记录本没有简报', (await store.brief()) === '');
+    const task = await store.note({ kind: 'task', title: '真机验证', status: 'todo', owner: '謎矢', by: '謎矢' });
+    check('任务记下来了', task.includes('已记录'), task);
+    check('简报里有未完成任务', (await store.brief()).includes('真机验证'));
+    await store.note({ kind: 'decision', title: '先做通用化底座' });
+    check('决策进了简报', (await store.brief()).includes('先做通用化底座'));
+    const id = task.replace(/^已记录 #/, '').split('（')[0] ?? '';
+    await store.setStatus(id, 'done');
+    check('状态改成 done 后离开未完成列表', !(await store.brief()).includes('真机验证'));
+    check('查得到历史条目', (await store.query({ text: '真机' })).includes('done'));
+    check('不认识的 kind 被拒', (await store.note({ kind: '随便', title: 'x' })).includes('kind 只能是'));
+    check('找不到的 id 不乱改', (await store.setStatus('zzzz', 'done')).includes('找不到'));
+  } finally {
+    await rm(recTmp, { recursive: true, force: true });
+  }
 
   console.log(failures === 0 ? '\n全部通过\n' : `\n${failures} 项失败\n`);
   process.exit(failures === 0 ? 0 : 1);

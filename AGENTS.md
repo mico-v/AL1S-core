@@ -9,6 +9,18 @@ logging, and `src/chat-log.ts` persists JSONL records and media. Operational scr
 live in `src/scripts/`. The official API snapshot is under `docs/qq-api/`; consult
 it before changing protocol behavior. `data/` and `logs/` are ignored runtime stores.
 
+`src/agent/` is the only business layer. Besides chatting it can work on code, so the
+permission chain is load-bearing: `policy.ts` (tiers `owner`/`dev`/`guest` and their
+capability sets) → `tools.ts` (`toolDefinitionsFor()` hides tools a tier cannot use) →
+`exec.ts` (`checkCommand()`, per-tier allowlist plus a danger blocklist) → the systemd
+unit (`User=kei`, `ProtectSystem=strict`, `ReadWritePaths` limited to `data/`, `logs/`,
+`/srv/kei`). Never widen one layer and assume another covers it.
+
+`workspace.ts` confines every filesystem and command path to `AGENT_WORKSPACE`;
+`records.ts` is the per-group ledger (decisions, tasks, milestones, risks) that feeds the
+briefing injected into the system prompt. Per-group personas live in `personas/` (shared)
+and `data/personas/<group>.md` (mapping or full text).
+
 ## Build, Test, and Development Commands
 
 Use Node.js 22+ and pnpm:
@@ -20,6 +32,7 @@ pnpm qq:login          # Scan to obtain QQ credentials and update .env
 pnpm dev               # Watch mode with .env loaded
 pnpm start             # Run the bot
 pnpm typecheck         # Strict TypeScript check
+pnpm agent:check       # Offline agent check: persona, memory, permissions, records
 pnpm qq:check          # Offline config, logging, protocol, and Bot assertions
 pnpm webhook:check     # Local webhook end-to-end check
 pnpm integration:check # typecheck + qq:check + webhook:check

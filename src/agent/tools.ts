@@ -11,6 +11,10 @@ import type { AppLogger } from '../logger.js';
 import type { ChatMessage, LlmOptions } from './llm.js';
 import { MessageIndex, renderHits } from './search.js';
 import { renderHits as renderWebHits, searchWeb } from './web.js';
+import { renderRunResult, runCommand } from './exec.js';
+import type { Capabilities, Tier } from './policy.js';
+import { isKind, isStatus, type RecordStore } from './records.js';
+import type { Workspace } from './workspace.js';
 
 export interface ToolContext {
   dataRoot: string;
@@ -20,9 +24,19 @@ export interface ToolContext {
   /** 用来做同义扩展；没有就退回纯子串匹配 */
   complete?: (messages: ChatMessage[], opts: LlmOptions) => Promise<string>;
   llm?: LlmOptions;
+  /** 当前说话人的权限档位与能力集，决定能调哪些工具。 */
+  tier?: Tier;
+  capabilities?: Capabilities;
+  /** 代码工作区；没配就没有代码类工具。 */
+  workspace?: Workspace;
+  /** 这个群的记录本。 */
+  records?: RecordStore;
+  /** 说话人昵称，记条目时当 by。 */
+  speaker?: string;
 }
 
-export const TOOL_DEFINITIONS: unknown[] = [
+/** 聊天类工具：任何身份都能用。 */
+const CHAT_TOOLS: unknown[] = [
   {
     type: 'function',
     function: {
@@ -109,6 +123,193 @@ export const TOOL_DEFINITIONS: unknown[] = [
   },
 ];
 
+/** 记录本：查。任何身份都能查本群的条目。 */
+const RECORD_QUERY_TOOLS: unknown[] = [
+  {
+    type: 'function',
+    function: {
+      name: 'memory_query',
+      description:
+        '查这个群的记录本：决策、任务、里程碑、风险。问「之前定了什么」「还有哪些没做」先查这里，不要凭印象答。',
+      parameters: {
+        type: 'object',
+        properties: {
+          text: { type: 'string', description: '关键词，留空就是列最近的条目' },
+          kind: { type: 'string', enum: ['decision', 'task', 'milestone', 'risk', 'note'] },
+          status: { type: 'string', enum: ['todo', 'doing', 'done', 'blocked', 'dropped'] },
+          limit: { type: 'number', description: '默认 12 条' },
+        },
+        required: [],
+      },
+    },
+  },
+];
+
+/** 记录本：写。开发成员与主人才有。 */
+const RECORD_WRITE_TOOLS: unknown[] = [
+  {
+    type: 'function',
+    function: {
+      name: 'memory_note',
+      description:
+        '把一个结论落进记录本：定下的事用 decision，要做的事用 task，卡住的用 risk，完成了的用 milestone。只追加不改写，不要记流水账。',
+      parameters: {
+        type: 'object',
+        properties: {
+          kind: { type: 'string', enum: ['decision', 'task', 'milestone', 'risk', 'note'] },
+          title: { type: 'string', description: '一句话说清是什么事' },
+          body: { type: 'string', description: '补充：范围、依据、验收标准' },
+          status: { type: 'string', enum: ['todo', 'doing', 'done', 'blocked', 'dropped'] },
+          owner: { type: 'string', description: '谁负责（昵称或角色）' },
+          tags: { type: 'array', items: { type: 'string' } },
+          refs: { type: 'array', items: { type: 'string' }, description: '出处：PR、issue、commit 链接' },
+        },
+        required: ['kind', 'title'],
+      },
+    },
+  },
+  {
+    type: 'function',
+    function: {
+      name: 'memory_status',
+      description: '改一条记录的状态（todo / doing / done / blocked / dropped）。id 用 memory_query 看到的编号。',
+      parameters: {
+        type: 'object',
+        properties: {
+          id: { type: 'string', description: '条目编号，如 3f2a 或完整 id' },
+          status: { type: 'string', enum: ['todo', 'doing', 'done', 'blocked', 'dropped'] },
+        },
+        required: ['id', 'status'],
+      },
+    },
+  },
+];
+
+/** 读仓库：开发成员与主人。 */
+const REPO_READ_TOOLS: unknown[] = [
+  {
+    type: 'function',
+    function: {
+      name: 'repo_status',
+      description: '看主仓库现在什么状态：分支、未提交改动、最近几次提交。回答「改到哪了」「有没有脏文件」先跑它。',
+      parameters: { type: 'object', properties: {} },
+    },
+  },
+  {
+    type: 'function',
+    function: {
+      name: 'ci_status',
+      description: '看 GitHub Actions 最近几次运行结果（分支、结论、提交信息）。回答「CI 过了吗」用它。',
+      parameters: {
+        type: 'object',
+        properties: { limit: { type: 'number', description: '看几次，默认 3' } },
+      },
+    },
+  },
+  {
+    type: 'function',
+    function: {
+      name: 'list_dir',
+      description: '列工作区里的目录。路径都是相对工作区的，比如 `campus-nav-3d/src`。',
+      parameters: {
+        type: 'object',
+        properties: {
+          path: { type: 'string', description: '相对路径，默认仓库根目录' },
+          depth: { type: 'number', description: '展开几层，默认 2' },
+        },
+      },
+    },
+  },
+  {
+    type: 'function',
+    function: {
+      name: 'read_file',
+      description: '读工作区里的一个文本文件。大文件会截断，需要定位就用 grep_files。',
+      parameters: {
+        type: 'object',
+        properties: { path: { type: 'string', description: '相对路径' } },
+        required: ['path'],
+      },
+    },
+  },
+  {
+    type: 'function',
+    function: {
+      name: 'grep_files',
+      description: '在工作区里按正则搜文本，返回文件名、行号、那一行。找函数、找配置、找关键词都用它。',
+      parameters: {
+        type: 'object',
+        properties: {
+          pattern: { type: 'string' },
+          path: { type: 'string', description: '搜哪个子目录，默认整个工作区' },
+          limit: { type: 'number', description: '最多多少条，默认 40' },
+        },
+        required: ['pattern'],
+      },
+    },
+  },
+  {
+    type: 'function',
+    function: {
+      name: 'run_command',
+      description:
+        '在工作区里跑一条命令：git status/log/diff、跑测试、看构建日志。只能用工作区内的路径，超时 120 秒。要写文件用 write_file。',
+      parameters: {
+        type: 'object',
+        properties: {
+          cmd: { type: 'string', description: '命令，一句一条，可以带管道' },
+          cwd: { type: 'string', description: '相对工作区的目录，默认主仓库' },
+          timeout_ms: { type: 'number', description: '超时，默认 120000，最大 300000' },
+        },
+        required: ['cmd'],
+      },
+    },
+  },
+];
+
+/** 写仓库：只有主人。 */
+const REPO_WRITE_TOOLS: unknown[] = [
+  {
+    type: 'function',
+    function: {
+      name: 'write_file',
+      description: '在工作区里写一个文本文件（整个覆盖）。改完代码要自己跑测试，再说明改了什么。',
+      parameters: {
+        type: 'object',
+        properties: {
+          path: { type: 'string', description: '相对路径' },
+          content: { type: 'string', description: '完整文件内容' },
+        },
+        required: ['path', 'content'],
+      },
+    },
+  },
+];
+
+/** 按能力集挑工具：模型看不到它用不了的工具，就不会去试。 */
+export function toolDefinitionsFor(caps: Capabilities): unknown[] {
+  const tools: unknown[] = [...CHAT_TOOLS, ...RECORD_QUERY_TOOLS];
+  if (caps.repoRead) {
+    tools.push(...REPO_READ_TOOLS);
+  }
+  if (caps.memoryWrite) {
+    tools.push(...RECORD_WRITE_TOOLS);
+  }
+  if (caps.repoWrite) {
+    tools.push(...REPO_WRITE_TOOLS);
+  }
+  return tools;
+}
+
+/** 兼容旧引用：没给能力集时就是聊天工具。 */
+export const TOOL_DEFINITIONS: unknown[] = toolDefinitionsFor({
+  chat: true,
+  repoRead: false,
+  exec: false,
+  repoWrite: false,
+  memoryWrite: false,
+});
+
 /** 索引按 dataRoot 复用，避免每次检索都重新解析 JSONL。 */
 const indexes = new Map<string, MessageIndex>();
 
@@ -136,6 +337,20 @@ function safeParse(raw: string): Record<string, unknown> {
   } catch {
     return {};
   }
+}
+
+/** 字符串数组参数：模型偶尔会塞一个字符串进来，统一成数组。 */
+function arrayOf(value: unknown): string[] | undefined {
+  if (Array.isArray(value)) {
+    return value.filter((v): v is string => typeof v === 'string' && v.trim() !== '').map((v) => v.trim());
+  }
+  if (typeof value === 'string' && value.trim() !== '') {
+    return value
+      .split(/[,，、\s]+/)
+      .map((v) => v.trim())
+      .filter(Boolean);
+  }
+  return undefined;
 }
 
 async function memberProfile(ctx: ToolContext, name: string): Promise<string> {
@@ -417,6 +632,107 @@ export async function executeTool(name: string, rawArgs: string, ctx: ToolContex
     }
     if (name === 'chat_stats') {
       return await chatStats(ctx);
+    }
+    if (name === 'memory_query') {
+      if (!ctx.records) {
+        return '这个群没有记录本。';
+      }
+      return await ctx.records.query({
+        text: asString(args.text),
+        kind: isKind(args.kind) ? args.kind : undefined,
+        status: isStatus(args.status) ? args.status : undefined,
+        limit: asNumber(args.limit),
+      });
+    }
+    if (name === 'memory_note') {
+      if (!ctx.records || !ctx.capabilities?.memoryWrite) {
+        return '当前身份不能写记录，只能查。';
+      }
+      return await ctx.records.note({
+        kind: asString(args.kind),
+        title: asString(args.title),
+        body: asString(args.body) || undefined,
+        status: asString(args.status) || undefined,
+        owner: asString(args.owner) || undefined,
+        tags: arrayOf(args.tags),
+        refs: arrayOf(args.refs),
+        by: ctx.speaker,
+      });
+    }
+    if (name === 'memory_status') {
+      if (!ctx.records || !ctx.capabilities?.memoryWrite) {
+        return '当前身份不能改记录状态。';
+      }
+      return await ctx.records.setStatus(asString(args.id), asString(args.status), ctx.speaker);
+    }
+    if (name === 'repo_status') {
+      if (!ctx.workspace || !ctx.capabilities?.repoRead) {
+        return '当前身份不能看仓库。';
+      }
+      return await ctx.workspace.gitSummary();
+    }
+    if (name === 'ci_status') {
+      if (!ctx.workspace || !ctx.capabilities?.repoRead) {
+        return '当前身份不能看 CI。';
+      }
+      return await ctx.workspace.ciStatus(asNumber(args.limit) ?? 3);
+    }
+    if (name === 'list_dir') {
+      if (!ctx.workspace || !ctx.capabilities?.repoRead) {
+        return '当前身份不能看仓库。';
+      }
+      const rel = asString(args.path) || ctx.workspace.repoDir;
+      return await ctx.workspace.list(rel, Math.min(asNumber(args.depth) ?? 2, 4));
+    }
+    if (name === 'read_file') {
+      if (!ctx.workspace || !ctx.capabilities?.repoRead) {
+        return '当前身份不能读代码。';
+      }
+      const rel = asString(args.path);
+      if (!rel) {
+        return '需要提供 path。';
+      }
+      return await ctx.workspace.read(rel);
+    }
+    if (name === 'grep_files') {
+      if (!ctx.workspace || !ctx.capabilities?.repoRead) {
+        return '当前身份不能搜代码。';
+      }
+      const pattern = asString(args.pattern);
+      if (!pattern) {
+        return '需要提供 pattern。';
+      }
+      return await ctx.workspace.grep(pattern, asString(args.path) || '.', Math.min(asNumber(args.limit) ?? 40, 100));
+    }
+    if (name === 'write_file') {
+      if (!ctx.workspace || !ctx.capabilities?.repoWrite) {
+        return '当前身份不能改仓库；需要改就把想要的改动说清楚，等主人执行。';
+      }
+      const rel = asString(args.path);
+      if (!rel) {
+        return '需要提供 path。';
+      }
+      return await ctx.workspace.write(rel, asString(args.content));
+    }
+    if (name === 'run_command') {
+      if (!ctx.workspace || !ctx.capabilities?.exec) {
+        return '当前身份不能跑命令。';
+      }
+      const cmd = asString(args.cmd).trim();
+      if (!cmd) {
+        return '需要提供 cmd。';
+      }
+      const timeout = Math.min(Math.max(asNumber(args.timeout_ms) ?? 120_000, 5_000), 300_000);
+      const result = await runCommand({
+        cmd,
+        cwd: asString(args.cwd) || ctx.workspace.repoDir,
+        workspace: ctx.workspace.root,
+        tier: ctx.tier ?? 'guest',
+        home: ctx.workspace.home,
+        limits: { timeoutMs: timeout, maxBytes: 8_000 },
+      });
+      ctx.log.info('跑了命令', { cmd: cmd.slice(0, 120), code: result.code, denied: result.denied });
+      return renderRunResult(result, cmd);
     }
     return `未知工具：${name}`;
   } catch (error) {

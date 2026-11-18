@@ -25,10 +25,14 @@ import {
   type LlmOptions,
 } from './llm.js';
 import { GroupMemory } from './memory.js';
-import { CONTEXT_FOOTER, CONTEXT_HEADER, PERSONA } from './persona.js';
+import { CONTEXT_FOOTER, CONTEXT_HEADER, resolvePersona } from './persona.js';
+import { capabilitiesFor, describeTier, resolveTier, type PolicyConfig, type Tier } from './policy.js';
+import { RecordStore } from './records.js';
 import { cleanQQText } from './text.js';
-import { TOOL_DEFINITIONS, executeTool, type ToolContext } from './tools.js';
+import { executeTool, toolDefinitionsFor, type ToolContext } from './tools.js';
+import { Workspace } from './workspace.js';
 import { appendFile, mkdir } from 'node:fs/promises';
+import { homedir } from 'node:os';
 import path from 'node:path';
 import { captionStorePath, digestAttachments, loadImageParts } from './vision.js';
 
@@ -93,6 +97,8 @@ export interface AgentConfig {
     dir: string;
     contextWindow: number;
   };
+  /** 权限分档、代码工作区、工程群。 */
+  policy: PolicyConfig;
 }
 
 export function readAgentConfig(env: NodeJS.ProcessEnv): AgentConfig {
@@ -135,6 +141,15 @@ export function readAgentConfig(env: NodeJS.ProcessEnv): AgentConfig {
       enabled: env.AGENT_CALL_LOG !== 'false',
       dir: env.AGENT_CALL_LOG_DIR ?? './data/calls',
       contextWindow: Number(env.AGENT_CONTEXT_WINDOW ?? 1_000_000),
+    },
+    policy: {
+      ownerOpenids: list(env.AGENT_OWNER_OPENIDS),
+      devOpenids: list(env.AGENT_DEV_OPENIDS),
+      devGroups: list(env.AGENT_DEV_GROUPS),
+      codeTools: env.AGENT_CODE_TOOLS !== 'false',
+      workspace: env.AGENT_WORKSPACE ?? '/srv/kei/work',
+      repo: env.AGENT_REPO ?? 'campus-nav-3d',
+      repoSlug: env.AGENT_REPO_SLUG ?? 'mico-v/campus-nav-3d',
     },
   };
 }
@@ -347,6 +362,10 @@ export class ChatAgent {
   private readonly lastReply = new Map<string, { text: string; at: number }>();
   /** 同一会话串行处理，避免同一群里两条 @ 并发抢回复。 */
   private readonly chains = new Map<string, Promise<void>>();
+  /** 代码工作区：只有开了代码工具才存在。 */
+  private readonly workspace?: Workspace;
+  /** 每个群一个记录本（直接对话也一个）。 */
+  private readonly recordStores = new Map<string, RecordStore>();
 
   constructor(
     config: AgentConfig,
@@ -361,6 +380,14 @@ export class ChatAgent {
     this.completeRaw = completeRaw;
     this.buffer = new GroupBuffer(config.contextSize);
     this.quotes = new QuoteResolver(config.dataRoot);
+    if (config.policy.codeTools) {
+      this.workspace = new Workspace(
+        config.policy.workspace,
+        config.policy.repo,
+        config.policy.repoSlug,
+        homedir(),
+      );
+    }
     this.digest = new DigestEngine({
       dataRoot: config.dataRoot,
       llm: config.llm,
@@ -475,11 +502,14 @@ export class ChatAgent {
     opts: LlmOptions,
     chatId?: string,
     maxRounds = 5,
+    access: { tier: Tier; speaker: string } = { tier: 'guest', speaker: '' },
   ): Promise<string> {
     if (!this.config.toolsEnabled) {
       return this.complete(messages, opts, 1);
     }
 
+    const caps = capabilitiesFor(access.tier, this.config.policy);
+    const tools = toolDefinitionsFor(caps);
     const ctx: ToolContext = {
       dataRoot: this.config.dataRoot,
       // 私聊没有群 id，就搜全部历史，否则会一条都搜不到
@@ -487,11 +517,16 @@ export class ChatAgent {
       log: this.log,
       complete: this.complete,
       llm: { ...this.config.llm, purpose: 'expand' },
+      tier: access.tier,
+      capabilities: caps,
+      workspace: caps.repoRead ? this.workspace : undefined,
+      records: this.recordsFor(chatId ?? 'direct'),
+      speaker: access.speaker,
     };
 
     let convo = [...messages];
     for (let round = 0; round < maxRounds; round += 1) {
-      const response = await this.completeRaw(convo, { ...opts, tools: TOOL_DEFINITIONS }, 1);
+      const response = await this.completeRaw(convo, { ...opts, tools }, 1);
       if (response.toolCalls.length === 0) {
         return response.content;
       }
@@ -517,6 +552,16 @@ export class ChatAgent {
     if (!store) {
       store = new GroupMemory(this.config.dataRoot, groupOpenid);
       this.members.set(groupOpenid, store);
+    }
+    return store;
+  }
+
+  /** 记录本按会话分开：群用自己的 openid，私聊用 direct。 */
+  private recordsFor(key: string): RecordStore {
+    let store = this.recordStores.get(key);
+    if (!store) {
+      store = new RecordStore(this.config.dataRoot, key);
+      this.recordStores.set(key, store);
     }
     return store;
   }
@@ -836,6 +881,24 @@ export class ChatAgent {
       parts.push('## 提示\n\n现在是私聊，不是群里，可以放开一点聊。');
     }
 
+    // 权限与能力：写在提示词里，模型才不会去碰它没有的工具
+    const tier = resolveTier(
+      message.senderId,
+      scope.isDirect ? undefined : scope.conversationId,
+      this.config.policy,
+    );
+    parts.push(`## 你的身份与边界\n\n${describeTier(tier)}`);
+    if (tier !== 'guest' && this.workspace) {
+      parts.push(
+        `## 工作区\n\n${this.workspace.describe()}\n` +
+          '动作顺序：先 repo_status 看清现状 → 读相关文件 → 改 → 跑测试 → 按时张提交 → 推分支开 PR。main 不直推。',
+      );
+    }
+    const brief = await this.recordsFor(scope.isDirect ? 'direct' : scope.conversationId).brief();
+    if (brief) {
+      parts.push(`## 记录本摘要（开场先心里有数，不用逐条念）\n\n${brief}`);
+    }
+
     // 连着几次都用同一个词开头，一眼就是模板；点名那个词，别只说「换个说法」
     const openers = this.recentOpeners.get(scope.conversationId) ?? [];
     const repeated = repeatedOpener(openers);
@@ -847,7 +910,9 @@ export class ChatAgent {
       );
     }
 
-    const system = [PERSONA, ...parts].join('\n\n---\n\n');
+    const system = [resolvePersona(scope.isDirect ? undefined : scope.conversationId, this.config.dataRoot), ...parts].join(
+      '\n\n---\n\n',
+    );
     const history = renderBuffer(pending);
     const now = new Date();
     const stamp = `${String(now.getHours()).padStart(2, '0')}:${String(now.getMinutes()).padStart(2, '0')}`;
@@ -933,7 +998,7 @@ export class ChatAgent {
     const chatId = scope.isDirect ? undefined : scope.conversationId;
 
     try {
-      const reply = await this.converse(buildMessages(userText, true), opts, chatId);
+      const reply = await this.converse(buildMessages(userText, true), opts, chatId, 5, { tier, speaker });
       await send(reply);
     } catch (error) {
       // 带图请求失败（模型不支持 / 图太大被拒）就退回文字描述，别整条哑掉
@@ -949,7 +1014,7 @@ export class ChatAgent {
       try {
         const captions = await this.enrich(message, message.attachments ?? []);
         const fallbackBody = `${userText}\n${captions}`.trim();
-        const reply = await this.converse(buildMessages(fallbackBody, false), opts, chatId);
+        const reply = await this.converse(buildMessages(fallbackBody, false), opts, chatId, 5, { tier, speaker });
         await send(reply);
       } catch (retryError) {
         this.log.error('回复失败（退化后）', { conversationId: scope.conversationId, error: retryError });
