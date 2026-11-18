@@ -31,7 +31,7 @@ const TEXT_EXT = new Set([
 ]);
 
 export const MAX_READ_BYTES = 30_000;
-export const MAX_WRITE_BYTES = 120_000;
+export const MAX_WRITE_BYTES = 240_000;
 export const MAX_LIST_ENTRIES = 200;
 
 export class WorkspaceError extends Error {}

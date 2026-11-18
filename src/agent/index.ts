@@ -29,7 +29,9 @@ import { CONTEXT_FOOTER, CONTEXT_HEADER, resolvePersona } from './persona.js';
 import { capabilitiesFor, describeTier, resolveTier, type PolicyConfig, type Tier } from './policy.js';
 import { RecordStore } from './records.js';
 import { cleanQQText } from './text.js';
+import { parseBlacklist } from './exec.js';
 import { executeTool, toolDefinitionsFor, type ToolContext } from './tools.js';
+
 import { Workspace } from './workspace.js';
 import { appendFile, mkdir } from 'node:fs/promises';
 import { homedir } from 'node:os';
@@ -150,6 +152,8 @@ export function readAgentConfig(env: NodeJS.ProcessEnv): AgentConfig {
       workspace: env.AGENT_WORKSPACE ?? '/srv/kei/work',
       repo: env.AGENT_REPO ?? 'campus-nav-3d',
       repoSlug: env.AGENT_REPO_SLUG ?? 'mico-v/campus-nav-3d',
+      // 黑名单模式：默认空 = 全部放行；收紧时只改 .env，不改代码
+      cmdBlacklist: parseBlacklist(env.AGENT_CMD_BLACKLIST),
     },
   };
 }
@@ -519,6 +523,7 @@ export class ChatAgent {
       llm: { ...this.config.llm, purpose: 'expand' },
       tier: access.tier,
       capabilities: caps,
+      cmdBlacklist: this.config.policy.cmdBlacklist,
       workspace: caps.repoRead ? this.workspace : undefined,
       records: this.recordsFor(chatId ?? 'direct'),
       speaker: access.speaker,

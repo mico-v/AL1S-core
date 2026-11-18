@@ -58,7 +58,7 @@ src/scripts/webhook-check.ts  webhook 端到端自检
 | `index.ts` | 编排：@ 才回、私聊必回、`/` 开头忽略 |
 | `persona.ts` | 分群人格：`data/personas/<群>.md` 里写全文或 `use: <名字>`，没配就退回默认 Kei |
 | `policy.ts` | 权限三档（owner / dev / guest）与能力集，决定能看到哪些工具 |
-| `exec.ts` | 命令执行：工作区锁定、按档白名单、危险命令黑名单、超时杀进程组 |
+| `exec.ts` | 命令执行：工作区锁定、命令黑名单（`AGENT_CMD_BLACKLIST`，当前为空）、超时杀进程组 |
 | `workspace.ts` | 文件与仓库工具：读写/列目录/搜索、git 快照、CI 状态，路径绕不出工作区 |
 | `records.ts` | 记录本：决策/任务/里程碑/风险，只追加、状态追加覆盖，供简报与检索 |
 
@@ -190,16 +190,18 @@ Kei 不只是聊天：在工程群里它能看仓库、跑测试、记决策。�
 | 档位 | 谁 | 能做什么 |
 | --- | --- | --- |
 | `owner` | `AGENT_OWNER_OPENIDS` | 全部：读仓库、跑命令、改文件、提交、推分支、开 PR |
-| `dev` | `AGENT_DEV_OPENIDS` 且在 `AGENT_DEV_GROUPS` 里 | 读仓库、跑测试与构建、记项目条目；不能改仓库、不能提交 |
+| `dev` | `AGENT_DEV_OPENIDS` 且在 `AGENT_DEV_GROUPS` 里 | 与 owner 同权（2026-11-19 放宽，人多了再收） |
 | `guest` | 其他人 | 查聊天记录、查档案、联网、查本群记录本 |
 
 三层防护叠在一起：
 
 1. **能力集**：`toolDefinitionsFor()` 按档下发工具，guest 根本看不到 `run_command` / `write_file`；
-2. **命令策略**：`checkCommand()` 按档白名单 + 危险命令黑名单，管道逐段判；`git push` 直推 `main`、强推、`sudo`、`/etc` 一律拒；
-3. **系统层**：服务以 `User=kei` 运行，`ProtectSystem=strict` + `ReadWritePaths` 只放开 `data/`、`logs/`、`/srv/kei`。
+2. **命令策略**：`checkCommand()` 是**黑名单模式** —— 身份过了就放行，只拦 `AGENT_CMD_BLACKLIST` 里的正则（默认空 = 全放行）；要收紧只改 `.env`，不改代码；
+3. **系统层**：服务以 `User=kei` 运行，无 sudo，`ProtectSystem=strict` + `ReadWritePaths` 只放开 `data/`、`logs/`、`/srv/kei` —— 真正的边界在这一层，不在正则。
 
-代码工作区固定在 `AGENT_WORKSPACE`（默认 `/srv/kei/work`），仓库用独立部署密钥推送，权限只到那一个仓。
+代码工作区固定在 `AGENT_WORKSPACE`（默认 `/srv/kei/work`）。GitHub 走主人的 gh token
+（`KEI_GITHUB_TOKEN` / `/srv/kei/.config/gh/hosts.yml`）：`gh` 调 API、`git` 走 https 都可用，
+https 过本机代理 `socks5h://127.0.0.1:1080`（直连 `github.com:443` 在这台机器上不通）。
 
 分群人格：`data/personas/<群 openid>.md` 写整份提示词，或写一行 `use: project-lead` 指向
 仓库 `personas/` 下的共享人格。工程群用的是 `personas/project-lead.md`（项目管家）。

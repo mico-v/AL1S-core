@@ -1,14 +1,13 @@
 /**
  * 命令执行。
  *
- * Kei 要跟进开发就得有手：看 git 状态、跑测试、看构建日志。但「能跑命令」等于
- * 「能跑任意命令」，所以三件事一起做：
+ * 2026-11-19 起是**黑名单模式**：默认不拦任何命令（`AGENT_CMD_BLACKLIST` 为空），
+ * 判断只有三步 —— 身份够不够、命令是不是空的、有没有命中黑名单。
  *
- *   1. 工作区限制：cwd 必须是 workspace 里面的目录，`cd ..` 之后也出不去；
- *   2. 分档白名单：dev 档只放行读与测试类命令，owner 档才放开写与 git 写操作；
- *   3. 危险命令黑名单：连 owner 都不给 sudo / systemctl / mkfs / 直接写 /etc 这类。
- *
- * 进程本身以 kei 用户身份运行（systemd 的 User=），没有 sudo，越权也越不出去。
+ * 兜底不靠这层正则，靠系统层：进程以 `kei` 用户跑、没有 sudo，systemd 带
+ * `ProtectSystem=strict` + 只放行 `data / logs /srv/kei` 可写，越权也越不出去。
+ * cwd 仍然锁在工作区里。要收紧只改 `.env` 的 `AGENT_CMD_BLACKLIST`（正则，逗号或换行分隔），
+ * 不用动代码 —— 白名单时代那种「改代码才能放行一条命令」的摩擦已经去掉了。
  */
 
 import { spawn } from 'node:child_process';
@@ -35,50 +34,19 @@ export interface RunResult {
   denied?: string;
 }
 
-/** 任何档位都禁止：改系统、提权、动别的服务、往外吐密钥。 */
-const FORBIDDEN: Array<{ re: RegExp; why: string }> = [
-  { re: /\bsudo\b|\bsu\s+-|\bdoas\b/, why: '不能提权' },
-  { re: /\bsystemctl\b|\bservice\s+\w+\s+(start|stop|restart)\b/, why: '不能动系统服务' },
-  { re: /\b(shutdown|reboot|poweroff|halt|init\s+[06])\b/, why: '不能关机重启' },
-  { re: /\b(mkfs|fdisk|parted|dd\s+if=)/, why: '不能碰磁盘' },
-  { re: /\brm\s+(-[a-zA-Z]*\s+)*\/(\s|$)/, why: '不能删根目录' },
-  { re: /\/etc\/|\/boot\/|\/root\/|\.ssh\/|\.env\b|nanobot_secrets/, why: '不能读改写系统配置与密钥' },
-  { re: /\b(curl|wget)\b[^|;]*\|\s*(ba)?sh/, why: '不能把网络内容直接交给 shell' },
-  { re: /\b(useradd|userdel|usermod|passwd|visudo|chpasswd)\b/, why: '不能改用户与密码' },
-  { re: /\bcrontab\b|\bat\s+-f\b/, why: '不能装定时任务' },
-  { re: /\b(ssh|scp|rsync)\b.*@/, why: '不能连别的机器' },
-  { re: /\b(nc|ncat|netcat|socat)\b/, why: '不能开网络隧道' },
-  { re: /\bgit\s+push\b[^\n]*--force|\bgit\s+push\b[^\n]*\s-f(\s|$)/, why: '不能强推' },
-  { re: /\bgit\s+push\b[^\n]*\b(main|master)\b/, why: '不能直推 main，必须开分支走 PR' },
-  { re: /\bgit\s+(reset|checkout)\b[^\n]*--hard/, why: '不能硬回滚，会丢别人未提交的工作' },
-  { re: /\bnpm\s+publish\b|\bpnpm\s+publish\b/, why: '不能发版' },
-];
+/** 默认黑名单：空 —— 全部放行。收紧时只改 .env，不改这里。 */
+export const DEFAULT_BLACKLIST: string[] = [];
 
-/** dev 档只放行这些（读、查、跑测试与构建）。 */
-const DEV_ALLOW: RegExp[] = [
-  /^(pwd|whoami|date|uname|node\s+-v|npm\s+-v|pnpm\s+-v|git\s+--version)\s*$/,
-  /^(ls|cat|head|tail|wc|stat|file|du|df|tree|which|echo|sort|uniq|cut|column|jq)\b/,
-  /^(grep|rg|find|fd|ag)\b/,
-  /^git\s+(status|log|diff|show|branch|remote|ls-remote|rev-parse|describe|blame|shortlog|tag)\b/,
-  /^(npm|pnpm)\s+(test|run\s+(test|build|lint|typecheck|check|ci)[\w:-]*)\b/,
-  /^(npm|pnpm)\s+exec\s+(vitest|tsc|astro|vite)\b/,
-  /^(npx\s+)?(vitest|tsc)\b/,
-];
+/** 把 `AGENT_CMD_BLACKLIST` 解析成正则列表（逗号或换行分隔，空 = 不拦）。 */
+export function parseBlacklist(raw: string | undefined): string[] {
+  return (raw ?? '')
+    .split(/[\n,]/)
+    .map((v) => v.trim())
+    .filter(Boolean);
+}
 
 function collapsed(cmd: string): string {
   return cmd.replace(/\s+/g, ' ').trim();
-}
-
-/** 一段命令是不是全在 dev 白名单里（按 && ; | 切开，逐段判断）。 */
-export function devAllowed(cmd: string): boolean {
-  const segments = collapsed(cmd)
-    .split(/&&|\|\||;|\|/)
-    .map((part) => part.trim())
-    .filter(Boolean);
-  if (segments.length === 0) {
-    return false;
-  }
-  return segments.every((segment) => DEV_ALLOW.some((re) => re.test(segment)));
 }
 
 export interface CheckResult {
@@ -86,8 +54,14 @@ export interface CheckResult {
   why?: string;
 }
 
-/** 判一条命令能不能跑。不给理由就不许跑，便于日志定位。 */
-export function checkCommand(cmd: string, tier: Tier, workspace: string): CheckResult {
+/**
+ * 判一条命令能不能跑。
+ *
+ * 黑名单条目是正则（写错了就当没写，不因此拦人）。
+ * `workspace` 参数留给调用方做 cwd 锁定；这里不再扫命令里的绝对路径 ——
+ * 路径边界交给文件系统权限，正则扫路径只会误伤正常命令。
+ */
+export function checkCommand(cmd: string, tier: Tier, blacklist: string[] = DEFAULT_BLACKLIST): CheckResult {
   const text = collapsed(cmd);
   if (!text) {
     return { allowed: false, why: '空命令' };
@@ -96,24 +70,16 @@ export function checkCommand(cmd: string, tier: Tier, workspace: string): CheckR
   if (tier === 'guest') {
     return { allowed: false, why: '这个身份不能跑命令' };
   }
-  for (const rule of FORBIDDEN) {
-    if (rule.re.test(text)) {
-      return { allowed: false, why: rule.why };
+  for (const pattern of blacklist) {
+    let re: RegExp;
+    try {
+      re = new RegExp(pattern, 'i');
+    } catch {
+      continue;
     }
-  }
-  // 命令里出现的绝对路径必须落在工作区（或 /tmp、基础命令目录）里
-  const mentioned = text.match(/(?:^|\s)(\/[A-Za-z0-9._-]+(?:\/[^\s]*)?)/g) ?? [];
-  const harmless = new Set(['/tmp', '/dev/null', '/usr/bin', '/bin', '/usr/local/bin', '/usr/share']);
-  for (const raw of mentioned) {
-    const candidate = path.resolve(raw.trim());
-    const inside = candidate === workspace || candidate.startsWith(`${workspace}/`);
-    const tempZone = candidate === '/tmp' || candidate.startsWith('/tmp/');
-    if (!inside && !tempZone && !harmless.has(candidate)) {
-      return { allowed: false, why: `不能访问工作区外的路径：${candidate}` };
+    if (re.test(text)) {
+      return { allowed: false, why: `命中命令黑名单：${pattern}` };
     }
-  }
-  if (tier !== 'owner' && !devAllowed(text)) {
-    return { allowed: false, why: '这个身份只能跑读与测试类命令；改代码要主人来' };
   }
   return { allowed: true };
 }
@@ -126,6 +92,8 @@ export interface RunOptions {
   tier: Tier;
   home: string;
   limits?: RunLimits;
+  /** 命令黑名单（正则源），来自 `AGENT_CMD_BLACKLIST`；空数组 = 全放行。 */
+  blacklist?: string[];
   /** 额外环境变量（如 git 身份），不继承进程环境里的密钥。 */
   extraEnv?: Record<string, string>;
 }
@@ -156,7 +124,7 @@ export function resolveInside(workspace: string, rel: string): string | undefine
 }
 
 export async function runCommand(options: RunOptions): Promise<RunResult> {
-  const verdict = checkCommand(options.cmd, options.tier, path.resolve(options.workspace));
+  const verdict = checkCommand(options.cmd, options.tier, options.blacklist ?? DEFAULT_BLACKLIST);
   if (!verdict.allowed) {
     return {
       ok: false,

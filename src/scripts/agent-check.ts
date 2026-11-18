@@ -21,7 +21,7 @@ import { QuoteResolver } from '../agent/quote.js';
 import { quotaPauseFrom } from '../agent/llm.js';
 import { PERSONA, resolvePersona } from '../agent/persona.js';
 import { capabilitiesFor, resolveTier } from '../agent/policy.js';
-import { checkCommand, devAllowed } from '../agent/exec.js';
+import { checkCommand, parseBlacklist } from '../agent/exec.js';
 import { RecordStore } from '../agent/records.js';
 import { cleanQQText } from '../agent/text.js';
 import { matchCommand, renderStatus } from '../agent/commands.js';
@@ -875,6 +875,7 @@ async function main(): Promise<void> {
     workspace: '/tmp/ws',
     repo: 'campus-nav-3d',
     repoSlug: 'mico-v/campus-nav-3d',
+    cmdBlacklist: [] as string[],
   };
   check('主人 → owner', resolveTier('OWNER', 'G1', policy) === 'owner');
   check('工程群里的开发成员 → dev', resolveTier('DEV', 'G1', policy) === 'dev');
@@ -884,18 +885,21 @@ async function main(): Promise<void> {
   check('关掉代码工具后连主人也只剩聊天', capabilitiesFor('owner', { ...policy, codeTools: false }).exec === false);
   check('guest 没有仓库读权限', capabilitiesFor('guest', policy).repoRead === false);
   check('guest 没有写权限', capabilitiesFor('guest', policy).repoWrite === false);
-  check('dev 能读不能写', capabilitiesFor('dev', policy).repoRead && !capabilitiesFor('dev', policy).repoWrite);
+  check('dev 与 owner 同权（2026-11-19 放宽）', capabilitiesFor('dev', policy).repoWrite === true);
 
-  check('guest 不能跑命令', !checkCommand('git status', 'guest', '/tmp/ws').allowed);
-  check('dev 能跑测试', checkCommand('npm test', 'dev', '/tmp/ws').allowed);
-  check('dev 不能提交', !checkCommand('git commit -am x', 'dev', '/tmp/ws').allowed);
-  check('主人能推分支', checkCommand('git push -u origin feat/x', 'owner', '/tmp/ws').allowed);
-  check('主人也不能直推 main', !checkCommand('git push origin main', 'owner', '/tmp/ws').allowed);
-  check('不能提权', !checkCommand('sudo systemctl restart x', 'owner', '/tmp/ws').allowed);
-  check('不能碰 /etc', !checkCommand('cat /etc/shadow', 'owner', '/tmp/ws').allowed);
-  check('不能删根', !checkCommand('rm -rf /', 'owner', '/tmp/ws').allowed);
-  check('管道按段判', devAllowed('git log --oneline | head -5'));
-  check('带写操作的管道不放过', !devAllowed('git log --oneline | rm x'));
+  // 黑名单模式：黑名单为空时命令全放行，guest 除外；收紧只改 AGENT_CMD_BLACKLIST
+  check('黑名单为空就全放行', parseBlacklist(undefined).length === 0 && parseBlacklist('').length === 0);
+  check('黑名单按逗号换行切', parseBlacklist('sudo\nrm -rf /,systemctl').length === 3);
+  check('guest 不能跑命令', !checkCommand('git status', 'guest', []).allowed);
+  check('空命令拒', !checkCommand('   ', 'owner', []).allowed);
+  check('dev 能跑测试', checkCommand('npm test', 'dev', []).allowed);
+  check('dev 能提交', checkCommand('git commit -am x', 'dev', []).allowed);
+  check('主人能推分支', checkCommand('git push -u origin feat/x', 'owner', []).allowed);
+  check('黑名单为空时直推 main 也放行', checkCommand('git push origin main', 'owner', []).allowed);
+  check('黑名单为空时 npm install / gh 可用', checkCommand('npm ci && gh pr list', 'owner', []).allowed);
+  check('黑名单为空时绝对路径不再误伤', checkCommand('node /srv/kei/work/campus-nav-3d/scripts/x.mjs', 'owner', []).allowed);
+  check('配了黑名单就拦', !checkCommand('sudo systemctl restart x', 'owner', ['sudo', 'systemctl']).allowed);
+  check('黑名单写错正则不报错也不拦', checkCommand('ls', 'owner', ['([a-z']).allowed);
 
   const guestTools = JSON.stringify(toolDefinitionsFor(capabilitiesFor('guest', policy)));
   const ownerTools = JSON.stringify(toolDefinitionsFor(capabilitiesFor('owner', policy)));

@@ -27,6 +27,8 @@ export interface ToolContext {
   /** 当前说话人的权限档位与能力集，决定能调哪些工具。 */
   tier?: Tier;
   capabilities?: Capabilities;
+  /** 命令黑名单（正则源）；空 = 全放行。 */
+  cmdBlacklist?: string[];
   /** 代码工作区；没配就没有代码类工具。 */
   workspace?: Workspace;
   /** 这个群的记录本。 */
@@ -253,7 +255,7 @@ const REPO_READ_TOOLS: unknown[] = [
     function: {
       name: 'run_command',
       description:
-        '在工作区里跑一条命令：git status/log/diff、跑测试、看构建日志。只能用工作区内的路径，超时 120 秒。要写文件用 write_file。',
+        '在工作区里跑一条命令。当前是黑名单模式且黑名单为空：npm / git / gh / node 等常规开发命令都放行（能提交、推分支、开 PR、看 CI），cwd 锁在工作区内，超时默认 120 秒。要写整份文件用 write_file，要改一行用 sed/python 也行。',
       parameters: {
         type: 'object',
         properties: {
@@ -729,7 +731,8 @@ export async function executeTool(name: string, rawArgs: string, ctx: ToolContex
         workspace: ctx.workspace.root,
         tier: ctx.tier ?? 'guest',
         home: ctx.workspace.home,
-        limits: { timeoutMs: timeout, maxBytes: 8_000 },
+        blacklist: ctx.cmdBlacklist,
+        limits: { timeoutMs: timeout, maxBytes: 16_000 },
       });
       ctx.log.info('跑了命令', { cmd: cmd.slice(0, 120), code: result.code, denied: result.denied });
       return renderRunResult(result, cmd);
