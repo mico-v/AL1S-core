@@ -968,6 +968,9 @@ async function main(): Promise<void> {
   check('工具轮数可配', readAgentConfig({ AGENT_TOOL_ROUNDS: '80' } as NodeJS.ProcessEnv).toolRounds === 80);
   check('时间预算默认 8 分钟', readAgentConfig({} as NodeJS.ProcessEnv).turnBudgetMs === 480_000);
   check('时间预算可配', readAgentConfig({ AGENT_TURN_BUDGET_MS: '600000' } as NodeJS.ProcessEnv).turnBudgetMs === 600_000);
+  check('被动回复预算默认 250 秒', readAgentConfig({} as NodeJS.ProcessEnv).replyBudgetMs === 250_000);
+  check('被动回复预算可配', readAgentConfig({ AGENT_REPLY_BUDGET_MS: '300000' } as NodeJS.ProcessEnv).replyBudgetMs === 300_000);
+  check('被动回复预算短于 5 分钟窗口', readAgentConfig({} as NodeJS.ProcessEnv).replyBudgetMs < 300_000);
 
   console.log('\n[21] 长回合的进度播报与上下文瘦身');
   const prog = readAgentConfig({} as NodeJS.ProcessEnv).progress;
