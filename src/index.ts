@@ -118,6 +118,33 @@ try {
     }
   }
 
+  // 目标续跑巡检：重启后把线接上，也兑底定时器丢掉的群
+  if (agentConfig.enabled && agentConfig.goals.enabled && agentConfig.goals.auto) {
+    const goalSweepMs = Number(process.env.AGENT_GOAL_SWEEP_MS ?? 120_000);
+    if (goalSweepMs > 0) {
+      const timer = setInterval(() => {
+        void (async () => {
+          try {
+            const dir = path.join(agentConfig.dataRoot, 'goals');
+            const files = await readdir(dir).catch(() => [] as string[]);
+            const chats = files.filter((file) => file.endsWith('.json')).map((file) => file.slice(0, -5));
+            if (chats.length === 0) {
+              return;
+            }
+            const resumed = await agent.runGoalSweep(bot, chats);
+            if (resumed > 0) {
+              log.info('目标续跑巡检：已接上', { groups: resumed });
+            }
+          } catch (error) {
+            log.warn('目标续跑巡检失败', { error });
+          }
+        })();
+      }, goalSweepMs);
+      timer.unref();
+      log.info('已开启目标续跑巡检', { intervalMs: goalSweepMs });
+    }
+  }
+
   // 主动参与：默认关；开启后按冷却与断裂判据决定要不要接一句
   if (agentConfig.enabled && agentConfig.proactive.enabled) {
     const proactiveMs = Number(process.env.AGENT_PROACTIVE_INTERVAL_MS ?? 5 * 60 * 1000);

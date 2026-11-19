@@ -733,7 +733,7 @@ export class ChatAgent {
       }
       const timer = setTimeout(() => {
         this.goalTimers.delete(chatId);
-        void this.runGoalTick(scope, bot).catch((error) =>
+        void this.goalWake(scope, bot).catch((error) =>
           this.log.warn('自动续跑失败', { conversationId: chatId, error }),
         );
       }, this.config.goals.gapMs);
@@ -747,8 +747,81 @@ export class ChatAgent {
     })();
   }
 
+  /**
+   * 叫醒：先廉价探针，再决定开不开模型回合。
+   *
+   * 等 NPC 干活的时候，每一跳只读两个 CNB 接口（issue + PR 列表）：
+   * 指纹没变就继续睡，变了才把变化摘要喂回去。这样「NPC 一交货就接着干」
+   * 不用拿模型回合去轮询，一个子儿不花。
+   */
+  private async goalWake(scope: Scope, bot: Bot): Promise<void> {
+    const chatId = scope.conversationId;
+    const store = this.goalStoreFor(chatId);
+    const goal = await store.read();
+    if (!goal) {
+      return;
+    }
+    const awaiting = goal.awaiting;
+    if (!awaiting) {
+      await this.runGoalTick(scope, bot);
+      return;
+    }
+    if (!this.cnb) {
+      this.log.info('没 CNB 通道，探针退回直接续跑', { conversationId: chatId });
+      await this.runGoalTick(scope, bot);
+      return;
+    }
+    let probe;
+    try {
+      probe = await this.cnb.probeIssue(awaiting.issue);
+    } catch (error) {
+      this.log.warn('CNB 探针失败，下一跳再试', { conversationId: chatId, issue: awaiting.issue, error });
+      this.scheduleGoalTick(scope, bot);
+      return;
+    }
+    if (probe.sig === awaiting.sig) {
+      this.log.info('NPC 还没动，继续等', { conversationId: chatId, issue: awaiting.issue });
+      this.scheduleGoalTick(scope, bot);
+      return;
+    }
+    this.log.info('NPC 有动静，叫醒', { conversationId: chatId, issue: awaiting.issue });
+    await store.clearWatch('状态指纹变了');
+    await this.runGoalTick(scope, bot, `NPC 那边有变化：\n${probe.summary}`);
+  }
+
+  /** 启动/巡检兜底：有 active 目标的群把续跑接上（重启不丢线）。 */
+  async runGoalSweep(bot: Bot, chatIds: string[]): Promise<number> {
+    if (!this.config.goals.enabled || !this.config.goals.auto) {
+      return 0;
+    }
+    let resumed = 0;
+    for (const chatId of chatIds) {
+      if (!this.config.policy.devGroups.includes(chatId)) {
+        continue;
+      }
+      if (this.goalTimers.has(chatId) || this.goalRunning.has(chatId)) {
+        continue;
+      }
+      const goal = await this.goalStoreFor(chatId)
+        .read()
+        .catch(() => undefined);
+      if (!goal || goal.status !== 'active') {
+        continue;
+      }
+      const scope: Scope = {
+        conversationId: chatId,
+        memoryKey: chatId,
+        isDirect: false,
+        replyTarget: { scope: 'group', targetId: chatId },
+      };
+      this.scheduleGoalTick(scope, bot);
+      resumed += 1;
+    }
+    return resumed;
+  }
+
   /** 跑一轮自动续跑：记预算 → 把「继续推下一片」当成一条消息走完整回合。 */
-  private async runGoalTick(scope: Scope, bot: Bot): Promise<void> {
+  private async runGoalTick(scope: Scope, bot: Bot, notice?: string): Promise<void> {
     const chatId = scope.conversationId;
     if (this.goalRunning.has(chatId)) {
       return;
@@ -770,10 +843,15 @@ export class ChatAgent {
       }
       const goal = tick.goal;
       const slice = nextSlice(goal);
-      const text =
-        `（自动续跑 ${goal.budget.rounds}/${goal.budget.maxRounds}）接着推目标：${goal.objective.slice(0, 120)}\n` +
+      const text = [
+        notice ?? '',
+        `（自动续跑 ${goal.budget.rounds}/${goal.budget.maxRounds}）接着推目标：${goal.objective.slice(0, 120)}`,
         `这一轮只做一片 —— ${slice ? `${slice.id} ${slice.title}` : '没有待办切片'}。` +
-        '做完就 goal_step 标进度，做完所有切片再 goal_finish，卡住就 goal_block。';
+          '做完就 goal_step 标进度，做完所有切片再 goal_finish，卡住就 goal_block；' +
+          '要等 NPC 交货就 goal_watch 挂探针，别自己一轮轮去轮询。',
+      ]
+        .filter(Boolean)
+        .join('\n');
       // 用主人的身份跑，否则降成 guest 就什么工具都没了
       const synthetic = {
         kind: 'group',

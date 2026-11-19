@@ -77,6 +77,29 @@ export class CnbError extends Error {
   }
 }
 
+export interface CnbProbe {
+  /** 状态指纹：状态 / 评论数 / 更新时间 / 开着的 PR 都会变。 */
+  sig: string;
+  summary: string;
+}
+
+/**
+ * 状态指纹：用来判断「NPC 那边动没动」。
+ *
+ * 没变就一个字也不用回（不花模型钱），变了再把变化摘要喂回去。
+ */
+export function buildProbeSignature(
+  issue: { state?: string; comment_count?: number; updated_at?: string },
+  pulls: CnbPull[],
+): string {
+  const open = pulls
+    .filter((pull) => pull.state === 'open' || pull.merged)
+    .map((pull) => `${pull.number}:${pull.state}:${pull.updated_at ?? ''}`)
+    .sort()
+    .join(',');
+  return [issue.state ?? '', issue.comment_count ?? 0, issue.updated_at ?? '', open].join('|');
+}
+
 export class CnbClient {
   readonly repo: string;
   private readonly apiBase: string;
@@ -160,6 +183,28 @@ export class CnbClient {
       return data;
     }
     return data.list ?? [];
+  }
+
+  /** 轻量探针：只读两个接口，不花模型钱。 */
+  async probeIssue(number: number): Promise<CnbProbe> {
+    const issue = await this.getIssue(number);
+    const pulls = await this.listPulls('open');
+    const sig = buildProbeSignature(issue, pulls);
+    const lines = [
+      `#${issue.number} [${issue.state}] ${issue.title}`,
+      `评论 ${issue.comment_count ?? 0} 条 · 最近更新 ${shortTime(issue.updated_at)}`,
+    ];
+    if (pulls.length > 0) {
+      lines.push(
+        `open PR：${pulls
+          .slice(0, 5)
+          .map((pull) => `#${pull.number} ${pull.title}`)
+          .join(' / ')}`,
+      );
+    } else {
+      lines.push('open PR：无（NPC 还没提）');
+    }
+    return { sig, summary: lines.join('\n') };
   }
 }
 

@@ -249,6 +249,22 @@ const GOAL_TOOLS: unknown[] = [
   {
     type: 'function',
     function: {
+      name: 'goal_watch',
+      description:
+        '派工之后挂探针：盯这个 issue，NPC 有新评论 / 开了 PR / 关了 issue 就叫醒你继续；没变化就不开口，也不烧回合。盯到一个变化就自动解除，要接着等就再挂一次。',
+      parameters: {
+        type: 'object',
+        properties: {
+          issue: { type: 'number', description: 'CNB issue 号' },
+          note: { type: 'string', description: '在等它交付什么（一句话）' },
+        },
+        required: ['issue'],
+      },
+    },
+  },
+  {
+    type: 'function',
+    function: {
       name: 'goal_finish',
       description: '目标收尾：所有切片都验过了才调。recap 写清最终交付了什么、判据怎么验的。',
       parameters: {
@@ -871,6 +887,21 @@ export async function executeTool(name: string, rawArgs: string, ctx: ToolContex
         ...(asString(args.ref) ? { ref: asString(args.ref) } : {}),
         ...(ctx.speaker ? { by: ctx.speaker } : {}),
       });
+    }
+    if (name === 'goal_watch') {
+      if (!ctx.goals || !ctx.capabilities?.memoryWrite) {
+        return '当前身份不能改目标。';
+      }
+      const issue = asNumber(args.issue);
+      if (!issue) {
+        return '需要 issue 号。';
+      }
+      if (!ctx.cnb) {
+        return '没配 CNB 令牌，挂不了探针；只能自己按轮次看 cnb_issue_get。';
+      }
+      const probe = await ctx.cnb.probeIssue(issue);
+      ctx.log.info('挂上 CNB 探针', { issue, sig: probe.sig.slice(0, 60) });
+      return await ctx.goals.watch(issue, probe.sig, asString(args.note) || undefined);
     }
     if (name === 'goal_finish') {
       if (!ctx.goals || !ctx.capabilities?.memoryWrite) {

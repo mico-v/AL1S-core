@@ -63,6 +63,11 @@ export interface Goal {
   createdAt: string;
   updatedAt: string;
   recap?: string;
+  /**
+   * 正在等 NPC 干活：记下 issue 号与当时的状态指纹。
+   * 调度器先拿探针比对指纹，没变就不开模型回合（省额度），变了才叫醒。
+   */
+  awaiting?: { issue: number; sig: string; note?: string; since: string };
   budget: GoalBudget;
   log: GoalLogEntry[];
 }
@@ -282,8 +287,35 @@ export class GoalStore {
     return `${line}\n${renderGoal(goal)}`;
   }
 
-  async note(text: string, by?: string): Promise<string> {
+  /** 记下「在等这个 issue」：调度器从此只做廉价探针，不烧回合。 */
+  async watch(issue: number, sig: string, note?: string): Promise<string> {
     const goal = await this.read();
+    if (!goal) {
+      return '这个群还没有目标。';
+    }
+    goal.awaiting = { issue, sig, since: nowIso(), ...(note ? { note: clip(note, 300) } : {}) };
+    goal.updatedAt = nowIso();
+    goal.log.push({ at: goal.updatedAt, text: `等 #${issue} 的 NPC 交货${note ? `：${clip(note, 160)}` : ''}` });
+    goal.log = goal.log.slice(-80);
+    await this.save(goal);
+    return `已挂上探针：#${issue}。NPC 那边一有变化（新评论 / 开 PR / 关 issue）就叫醒我继续，期间不烧回合。`;
+  }
+
+  /** 等到了（或不等了）：清掉探针。 */
+  async clearWatch(reason?: string): Promise<void> {
+    const goal = await this.read();
+    if (!goal || !goal.awaiting) {
+      return;
+    }
+    const issue = goal.awaiting.issue;
+    delete goal.awaiting;
+    goal.updatedAt = nowIso();
+    goal.log.push({ at: goal.updatedAt, text: `#${issue} 等到了${reason ? `：${clip(reason, 160)}` : ''}` });
+    goal.log = goal.log.slice(-80);
+    await this.save(goal);
+  }
+
+  async note(text: string, by?: string): Promise<string> {    const goal = await this.read();
     if (!goal) {
       return '这个群还没有目标。';
     }
@@ -414,6 +446,9 @@ export function goalBrief(goal: Goal): string {
     lines.push(`下一片：${next.id} ${next.title}`);
   } else {
     lines.push('切片都处理完了：该 goal_finish 收尾，或 goal_block 说明卡点。');
+  }
+  if (goal.awaiting) {
+    lines.push(`在等 #${goal.awaiting.issue}：NPC 那边一动就叫醒你，别自己轮询。`);
   }
   const recent = goal.log.slice(-3).map((entry) => `- ${entry.at.slice(5, 16).replace('T', ' ')} ${entry.text}`);
   if (recent.length > 0) {

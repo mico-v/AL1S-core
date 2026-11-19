@@ -25,7 +25,7 @@ import { capabilitiesFor, resolveTier } from '../agent/policy.js';
 import { checkCommand, parseBlacklist } from '../agent/exec.js';
 import { RecordStore } from '../agent/records.js';
 import { GoalStore, canContinue, goalBrief, nextSlice, renderGoal } from '../agent/goals.js';
-import { readCnbConfig, renderIssues, renderPulls } from '../agent/cnb.js';
+import { readCnbConfig, buildProbeSignature, renderIssues, renderPulls } from '../agent/cnb.js';
 import { matchGoalCommand } from '../agent/commands.js';
 import { cleanQQText } from '../agent/text.js';
 import { matchCommand, renderStatus } from '../agent/commands.js';
@@ -1050,6 +1050,19 @@ async function main(): Promise<void> {
       (await blockedStore.block('等主人拍板')).includes('卡住') && (await blockedStore.read())?.status === 'blocked',
     );
     check('blocked 不再续跑', (await blockedStore.tick({ maxRounds: 5, maxWallMs: 60_000 }))?.ok === false);
+
+    // 等 NPC 交货：探针只在指纹变化时叫醒
+    const watchStore = new GoalStore(goalTmp, 'G3');
+    await watchStore.create(
+      { objective: '等 NPC 交 M2-1', criteria: ['PR 合入'], slices: ['派工', '复核'] },
+      { maxRounds: 5, maxWallMs: 3_600_000 },
+    );
+    check('挂上探针', (await watchStore.watch(21, 'sig-1', '等 M2-1')).includes('#21'));
+    check('账本记住在等谁', (await watchStore.read())?.awaiting?.issue === 21);
+    const watched = await watchStore.read();
+    check('简报提示在等 NPC', watched ? goalBrief(watched).includes('在等 #21') : false);
+    await watchStore.clearWatch('指纹变了');
+    check('叫醒后探针自动解除', (await watchStore.read())?.awaiting === undefined);
   } finally {
     await rm(goalTmp, { recursive: true, force: true });
   }
@@ -1068,11 +1081,26 @@ async function main(): Promise<void> {
   check('issue 视图带编号与状态', renderIssues([{ number: 3, title: 'M2-1 室内数据', state: 'open' }], 'r').includes('#3 [open]'));
   check('空列表给下一步提示', renderIssues([], 'r').includes('四段'));
   check('PR 视图标 merged', renderPulls([{ number: 9, title: 'x', state: 'closed', merged: true }], 'r').includes('[merged]'));
+  const baseIssue = { state: 'open', comment_count: 2, updated_at: '2026-11-19T05:00:00Z' };
+  check('没变化时指纹相同', buildProbeSignature(baseIssue, []) === buildProbeSignature({ ...baseIssue }, []));
+  check('多一条评论指纹变', buildProbeSignature(baseIssue, []) !== buildProbeSignature({ ...baseIssue, comment_count: 3 }, []));
+  check(
+    '开了 PR 指纹变',
+    buildProbeSignature(baseIssue, []) !==
+      buildProbeSignature(baseIssue, [{ number: 16, state: 'open', title: 'x', updated_at: 'u1' }]),
+  );
+  check(
+    'PR 改标题不动指纹',
+    buildProbeSignature(baseIssue, [{ number: 16, state: 'open', title: 'x', updated_at: 'u1' }]) ===
+      buildProbeSignature(baseIssue, [{ number: 16, state: 'open', title: 'y', updated_at: 'u1' }]),
+  );
+  check('关 issue 也算变化', buildProbeSignature(baseIssue, []) !== buildProbeSignature({ ...baseIssue, state: 'closed' }, []));
   check('目标指令认 /goal', matchGoalCommand('/goal') === 'status');
   check('目标指令认 /goal stop', matchGoalCommand('/goal stop') === 'stop');
   check('别的斜杠命令不误判', matchGoalCommand('/status') === undefined);
   check('owner 看得到 cnb_issue_create', ownerTools.includes('cnb_issue_create'));
   check('owner 看得到 goal_create', ownerTools.includes('goal_create'));
+  check('owner 看得到 goal_watch', ownerTools.includes('goal_watch'));
   check('guest 看不到 goal_create', !guestTools.includes('goal_create'));
   check('guest 看不到 cnb_issue_dispatch', !guestTools.includes('cnb_issue_dispatch'));
   check('目标自动续跑默认关', readAgentConfig({} as NodeJS.ProcessEnv).goals.auto === false);
