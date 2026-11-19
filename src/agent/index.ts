@@ -108,14 +108,6 @@ export interface AgentConfig {
   toolRounds: number;
   /** 一条消息的总时间预算（毫秒）：真正的闸门是时间，不是轮数。 */
   turnBudgetMs: number;
-  /**
-   * 被动回复窗口内的预算：有人 @ 时必须在这个时间里把话说出去。
-   *
-   * QQ 的被动回复只在收到消息后 5 分钟内有效，超时再发一律 400
-   * 「回复消息失败，被动回复时间或者次数超过限制」，整条结论凭空消失。
-   * 所以有人在等答案时压短回合（收尾 + 发送要留余量）；自动续跑走主动推送，才用 turnBudgetMs。
-   */
-  replyBudgetMs: number;
   /** 干活期间的进度播报：长回合不再一声不吭。 */
   progress: {
     enabled: boolean;
@@ -207,7 +199,6 @@ export function readAgentConfig(env: NodeJS.ProcessEnv): AgentConfig {
     // 5 分钟一刀切会把活切成两半（2026-11-19 日志：14~19 轮必然撞墙），
     // 配上进度播报之后可以放心放宽到 8 分钟。
     turnBudgetMs: Number(env.AGENT_TURN_BUDGET_MS ?? 480_000) || 480_000,
-    replyBudgetMs: Number(env.AGENT_REPLY_BUDGET_MS ?? 250_000) || 250_000,
     progress: {
       enabled: env.AGENT_PROGRESS !== 'false',
       gapMs: Number(env.AGENT_PROGRESS_GAP_MS ?? 75_000) || 75_000,
@@ -786,8 +777,6 @@ export class ChatAgent {
       onProgress?: (line: string) => void | Promise<void>;
       /** 回合结束后把完整对话交回去，供跨回合续用（前缀缓存靠它）。 */
       onConvo?: (convo: ChatMessage[], text: string) => void;
-      /** 这一回合的时间预算；不传就用 turnBudgetMs（自动续跑）。 */
-      budgetMs?: number;
     } = {
       tier: 'guest',
       speaker: '',
@@ -822,8 +811,7 @@ export class ChatAgent {
       speaker: access.speaker,
     };
 
-    const budgetMs = access.budgetMs ?? this.config.turnBudgetMs;
-    const deadline = Date.now() + budgetMs;
+    const deadline = Date.now() + this.config.turnBudgetMs;
     // 同一组调用重复出现 = 模型在原地打转，再给工具也是空转
     const repeats = new Map<string, number>();
     // 长回合也要有声音：头一轮不报（大多数消息一轮就完了，报了纯嗡嗡声）
@@ -837,7 +825,7 @@ export class ChatAgent {
         this.log.warn('时间预算用完，强制收尾', {
           conversationId: opts.conversationId,
           round,
-          budgetMs,
+          budgetMs: this.config.turnBudgetMs,
         });
         return finish(await this.wrapUp(convo, opts));
       }
@@ -1039,22 +1027,20 @@ export class ChatAgent {
   }
 
   /**
-   * 发一条文本：被动回复窗口不可用（msg_id 失效 / 5 分钟到点 / 条数超限）就退回主动推送。
+   * 发一条文本：默认走主动推送，带 msg_id 的被动回复只当退路。
    *
-   * 长回合必然撞这条：QQ 的被动回复只在收到消息后 5 分钟内有效，跑完再回就是
-   * 「回复消息msg_id已过期」或「回复消息失败，被动回复时间或者次数超过限制」，
-   * 整条结论凭空消失 —— 两种文案都得兜。
+   * QQ 的被动回复只在收到消息后 5 分钟内有效、条数也有限，长回合跑完再回就是
+   * 「msg_id已过期」/「被动回复时间或者次数超过限制」，整条结论凭空消失。
+   * 主动消息通道没这个窗口（本 bot 有权限，2026-11-19 私聊与群聊实测均 200）。
+   * 万一主动配额耗尽 / 临时无权限，再退回带 msg_id 的被动回复。
    */
   private async deliver(bot: Bot, target: Scope['replyTarget'], text: string): Promise<void> {
     try {
-      await bot.replyText(target, text);
+      await bot.pushText(target, text);
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);
-      if (!/已过期|expired|msg_id|被动回复|超过限制/i.test(message)) {
-        throw error;
-      }
-      this.log.warn('被动回复窗口不可用，改走主动推送', { message: message.slice(0, 120) });
-      await bot.pushText(target, text);
+      this.log.warn('主动推送失败，退回被动回复', { message: message.slice(0, 120) });
+      await bot.replyText(target, text);
     }
   }
 
@@ -1810,8 +1796,6 @@ export class ChatAgent {
       // 不按消息类型切换 —— 怎么答交给模型判断
     };
     const chatId = scope.isDirect ? undefined : scope.conversationId;
-    // 自动续跑没人等着，可以跑满 turnBudgetMs；有人 @ 就得压在被动回复窗口内
-    const autoTick = (message.messageId ?? '').startsWith('goal-');
 
     try {
       const reply = await this.converse(buildMessages(userText, true), opts, chatId, this.config.toolRounds, {
@@ -1819,13 +1803,13 @@ export class ChatAgent {
         speaker,
         onProgress,
         onConvo: remember,
-        budgetMs: autoTick ? undefined : this.config.replyBudgetMs,
       });
       await send(reply);
       // 回合结束：还有目标就安排下一轮自动续跑（人一插话就会被取消）
       this.scheduleGoalTick(scope, bot);
     } catch (error) {
       // 自动续跑失败不发「我卡住了」：下一跳会自己重试，群里只看到一堆广播反而更吓人。
+      const autoTick = (message.messageId ?? '').startsWith('goal-');
       // 带图请求失败（模型不支持 / 图太大被拒）就退回文字描述，别整条哑掉
       if (imageParts.length === 0) {
         this.log.error('回复失败', { conversationId: scope.conversationId, autoTick, error });
@@ -1847,7 +1831,6 @@ export class ChatAgent {
           speaker,
           onProgress,
           onConvo: remember,
-          budgetMs: autoTick ? undefined : this.config.replyBudgetMs,
         });
         await send(reply);
       } catch (retryError) {
