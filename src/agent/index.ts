@@ -101,8 +101,10 @@ export interface AgentConfig {
   };
   /** 权限分档、代码工作区、工程群。 */
   policy: PolicyConfig;
-  /** 一条消息最多几轮「模型→工具」往返。开发类问题要读好几个文件，5 轮不够。 */
+  /** 一条消息最多几轮「模型→工具」往返。开发类问题要读十几个文件，刻意给得宽。 */
   toolRounds: number;
+  /** 一条消息的总时间预算（毫秒）：真正的闸门是时间，不是轮数。 */
+  turnBudgetMs: number;
 }
 
 export function readAgentConfig(env: NodeJS.ProcessEnv): AgentConfig {
@@ -157,7 +159,8 @@ export function readAgentConfig(env: NodeJS.ProcessEnv): AgentConfig {
       // 黑名单模式：默认空 = 全部放行；收紧时只改 .env，不改代码
       cmdBlacklist: parseBlacklist(env.AGENT_CMD_BLACKLIST),
     },
-    toolRounds: Number(env.AGENT_TOOL_ROUNDS ?? 8) || 8,
+    toolRounds: Number(env.AGENT_TOOL_ROUNDS ?? 40) || 40,
+    turnBudgetMs: Number(env.AGENT_TURN_BUDGET_MS ?? 300_000) || 300_000,
   };
 }
 
@@ -501,14 +504,16 @@ export class ChatAgent {
   /**
    * 跑一轮对话，允许模型中途调工具。
    *
-   * 回合上限 3：查历史 / 查档案 / 再补一次，足够覆盖真实提问，
-   * 又不至于让一条群消息拖出十几秒。
+   * 上限有两个：轮数（`AGENT_TOOL_ROUNDS`，默认 40）与时间（`AGENT_TURN_BUDGET_MS`，
+   * 默认 5 分钟）。轮数是防死循环的粗网，真正拦住跑飞的是时间预算 ——
+   * 开发类任务读十几个文件很正常，卡死在 5 轮只会把活切成两份让人追问。
+   * 两个都得有个头：不然一条群消息能把队列堵一下午。
    */
   private async converse(
     messages: ChatMessage[],
     opts: LlmOptions,
     chatId?: string,
-    maxRounds = 5,
+    maxRounds = 40,
     access: { tier: Tier; speaker: string } = { tier: 'guest', speaker: '' },
   ): Promise<string> {
     if (!this.config.toolsEnabled) {
@@ -533,10 +538,30 @@ export class ChatAgent {
     };
 
     let convo = [...messages];
+    const deadline = Date.now() + this.config.turnBudgetMs;
+    // 同一组调用重复出现 = 模型在原地打转，再给工具也是空转
+    const repeats = new Map<string, number>();
     for (let round = 0; round < maxRounds; round += 1) {
+      if (Date.now() > deadline) {
+        this.log.warn('时间预算用完，强制收尾', {
+          conversationId: opts.conversationId,
+          round,
+          budgetMs: this.config.turnBudgetMs,
+        });
+        return this.wrapUp(convo, opts);
+      }
       const response = await this.completeRaw(convo, { ...opts, tools }, 1);
       if (response.toolCalls.length === 0) {
         return response.content;
+      }
+      const signature = response.toolCalls
+        .map((call) => `${call.function.name}:${call.function.arguments}`)
+        .join('|');
+      const times = (repeats.get(signature) ?? 0) + 1;
+      repeats.set(signature, times);
+      if (times >= 3) {
+        this.log.warn('工具调用原地打转，强制收尾', { conversationId: opts.conversationId, round });
+        return this.wrapUp(convo, opts);
       }
       this.log.info('工具调用', {
         round,
@@ -559,8 +584,8 @@ export class ChatAgent {
       }
     }
 
-    // 回合用完还没收敛：要一次纯文本，别把 tool_calls 暴露给群友
-    this.log.warn('工具回合超限，强制收尾', { conversationId: opts.conversationId, rounds: maxRounds });
+    // 轮数用完还没收敛：要一次纯文本，别把 tool_calls 暴露给群友
+    this.log.warn('工具轮数用尽，强制收尾', { conversationId: opts.conversationId, rounds: maxRounds });
     return this.wrapUp(convo, opts);
   }
 
@@ -571,23 +596,6 @@ export class ChatAgent {
    * 拿到的就是空正文，`chatComplete` 抛错，整条消息就吐不出来了（2026-11-19 真事）。
    * 现在明确告诉它工具阶段结束，并关掉思考 —— 只要文本。
    */
-  /**
-   * 整轮失败时也要出个声。
-   *
-   * 不发声等于「发了条消息没反应」—— 2026-11-19 就发生过一次：模型返回空正文，
-   * 日志里有 error，群里什么都没有，主人只能来问我。宁可说一句卡住了。
-   */
-  private async notifyFailure(
-    send: (text: string) => Promise<boolean>,
-    conversationId: string,
-  ): Promise<void> {
-    try {
-      await send('这条我这边卡住了（模型没返回可用内容），稍后再 @ 我一次试试。');
-    } catch (error) {
-      this.log.warn('失败提示也没发出去', { conversationId, error });
-    }
-  }
-
   private async wrapUp(convo: ChatMessage[], opts: LlmOptions): Promise<string> {
     const nudge: ChatMessage = {
       role: 'user',
@@ -602,6 +610,20 @@ export class ChatAgent {
       this.log.warn('收尾失败', { conversationId: opts.conversationId, error });
     }
     return '这条我做到一半就卡住了（工具回合用完了还没跑完），你把要的结果再说细一点，我重新跑一遍。';
+  }
+
+  /**
+   * 整轮失败时也要出个声。
+   *
+   * 不发声等于「发了条消息没反应」—— 2026-11-19 就发生过一次：模型返回空正文，
+   * 日志里有 error，群里什么都没有，主人只能来问我。宁可说一句卡住了。
+   */
+  private async notifyFailure(send: (text: string) => Promise<boolean>, conversationId: string): Promise<void> {
+    try {
+      await send('这条我这边卡住了（模型没返回可用内容），稍后再 @ 我一次试试。');
+    } catch (error) {
+      this.log.warn('失败提示也没发出去', { conversationId, error });
+    }
   }
 
   private memory(groupOpenid: string): GroupMemory {
