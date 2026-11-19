@@ -16,11 +16,6 @@ import { pruneMediaCache } from './chat-log.js';
 import { ConfigError, loadConfig } from './config.js';
 import { createLogger } from './logger.js';
 
-// 本机没有全局 IPv6：解析器偶尔把 AAAA 排到前面，Node 的 fetch 就直接 ETIMEDOUT，
-// 账本里表现成一条「fetch failed」（2026-11-19 实测：默认顺序超时，ipv4first 立即 200）。
-// 进进程就固定下来，别让每次模型调用抷骰子。
-setDefaultResultOrder('ipv4first');
-
 let bot: Bot;
 let agent: ChatAgent;
 

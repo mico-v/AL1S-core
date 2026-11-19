@@ -104,7 +104,8 @@ export function canContinue(
     return { ok: false, reason: `目标状态是 ${goal.status}` };
   }
   const maxRounds = options.maxRounds ?? goal.budget.maxRounds;
-  if (goal.budget.rounds >= maxRounds) {
+  // 0 = 不限轮数，只剩墙钟闸门（长任务跟进想要它一直跑）
+  if (maxRounds > 0 && goal.budget.rounds >= maxRounds) {
     return { ok: false, reason: `自动续跑用满 ${maxRounds} 轮` };
   }
   const now = options.now ?? Date.now();
@@ -427,7 +428,9 @@ export function renderGoal(goal: Goal): string {
     })
     .join('\n');
   return [
-    `目标 ${goal.id} · 状态 ${goal.status} · 进度 ${goalProgress(goal)} · 自动续跑 ${goal.budget.rounds}/${goal.budget.maxRounds}`,
+    `目标 ${goal.id} · 状态 ${goal.status} · 进度 ${goalProgress(goal)} · 自动续跑 ${
+      goal.budget.maxRounds > 0 ? `${goal.budget.rounds}/${goal.budget.maxRounds}` : `${goal.budget.rounds}（不限轮数）`
+    }`,
     goal.objective,
     `完成判据：\n${goal.criteria.map((item) => `- ${item}`).join('\n')}`,
     `切片：\n${slices}`,
@@ -440,7 +443,9 @@ export function goalBrief(goal: Goal): string {
   const next = nextSlice(goal);
   const lines = [
     `目标：${goal.objective.slice(0, 200)}`,
-    `状态 ${goal.status} · 进度 ${goalProgress(goal)} · 自动续跑 ${goal.budget.rounds}/${goal.budget.maxRounds}`,
+    `状态 ${goal.status} · 进度 ${goalProgress(goal)} · 自动续跑 ${
+      goal.budget.maxRounds > 0 ? `${goal.budget.rounds}/${goal.budget.maxRounds}` : `${goal.budget.rounds}（不限轮数）`
+    }`,
   ];
   if (next) {
     lines.push(`下一片：${next.id} ${next.title}`);

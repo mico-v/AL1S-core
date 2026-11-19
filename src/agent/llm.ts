@@ -6,12 +6,18 @@
  */
 
 import { randomUUID } from 'node:crypto';
+import { setDefaultResultOrder } from 'node:dns';
 import { setTimeout as sleep } from 'node:timers/promises';
 import { parseNativeToolCalls } from './dsml.js';
 import { buildRecord, recordCall } from './telemetry.js';
 
 /** opencode-go 要求带上会话标识，否则拒收请求（MissingSessionID）。 */
 const PROCESS_SESSION_ID = randomUUID();
+
+// 本机没有全局 IPv6：解析器偶尔把 AAAA 排前面，Node 的 fetch 直接 ETIMEDOUT
+// （账本里就是一条「fetch failed」）。放在这里而不是 index.ts：
+// agent-try / agent-learn / agent-daily 这些脚本不经过主入口，也得同样对待。
+setDefaultResultOrder('ipv4first');
 
 export type ContentPart =
   | { type: 'text'; text: string }

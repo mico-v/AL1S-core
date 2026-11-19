@@ -118,6 +118,11 @@ export interface AgentConfig {
   };
   /** 工具输出预算：单条多大、保留几条、累计多少就瘦身。 */
   toolOutput: ToolOutputPolicy;
+  /** 跨回合会话链：同一会话的消息追加推进，不每轮重渲（前缀缓存靠它）。 */
+  thread: {
+    /** 超过多少估算 token 就压缩一次。 */
+    maxTokens: number;
+  };
   /**
    * 前几轮开思考，之后关掉。
    *
@@ -205,12 +210,16 @@ export function readAgentConfig(env: NodeJS.ProcessEnv): AgentConfig {
       clearAtChars: Number(env.AGENT_TOOL_CLEAR_AT ?? 14_000) || 14_000,
     },
     thinkingRounds: Number(env.AGENT_THINKING_ROUNDS ?? 2),
+    thread: {
+      maxTokens: Number(env.AGENT_THREAD_MAX_TOKENS ?? 60_000) || 60_000,
+    },
     goals: {
       enabled: env.AGENT_GOAL_ENABLED !== 'false',
       auto: env.AGENT_GOAL_AUTO === 'true',
       gapMs: Number(env.AGENT_GOAL_GAP_MS ?? 90_000) || 90_000,
-      maxRounds: Number(env.AGENT_GOAL_MAX_ROUNDS ?? 24) || 24,
-      maxWallMs: Number(env.AGENT_GOAL_MAX_WALL_MS ?? 4 * 60 * 60 * 1000) || 4 * 60 * 60 * 1000,
+      // 0 = 不按轮数限，只剩墙钟闸门（长任务跟进需要它一直跑）
+      maxRounds: Number(env.AGENT_GOAL_MAX_ROUNDS ?? 0) || 0,
+      maxWallMs: Number(env.AGENT_GOAL_MAX_WALL_MS ?? 12 * 60 * 60 * 1000) || 12 * 60 * 60 * 1000,
     },
   };
 }
@@ -310,6 +319,47 @@ const PARALLEL_SAFE_TOOLS = new Set([
   'cnb_issue_get',
   'cnb_pull_list',
 ]);
+
+/** 跨回合会话链：system 之外的完整消息，追加式推进。 */
+export interface ThreadState {
+  /** 建链时的 system（人格/身份/工作区），一变就重建。 */
+  system: string;
+  messages: ChatMessage[];
+  /** 已经追进链里的最后一条群消息 id，下次只追加它之后的。 */
+  lastMessageId?: string;
+  turns: number;
+}
+
+/** 粗估 token：中文按 3 字/token 算，图按 2000 字等价。 */
+export function approxTokens(messages: ChatMessage[]): number {
+  let chars = 0;
+  for (const message of messages) {
+    const content = message.content;
+    if (typeof content === 'string') {
+      chars += content.length;
+    } else {
+      for (const part of content) {
+        chars += part.type === 'text' ? part.text.length : 2_000;
+      }
+    }
+    if (message.reasoning_content) {
+      chars += message.reasoning_content.length;
+    }
+  }
+  return Math.round(chars / 3);
+}
+
+const COMPACT_NOTE =
+  '（此前对话已归档到此。接着按记录本、当前目标与仓库现状往下推，别重问我上面已经说过的事；缺信息就去看文件或翻记录本。）';
+
+/** 只抽 pending 里 lastMessageId 之后的新行；找不到（窗口滚出去了）就当没有新的。 */
+function linesAfter<T extends { messageId?: string }>(lines: T[], lastMessageId?: string): T[] {
+  if (!lastMessageId) {
+    return lines;
+  }
+  const index = lines.findIndex((line) => line.messageId === lastMessageId);
+  return index >= 0 ? lines.slice(index + 1) : [];
+}
 
 const PROGRESS_VERBS: Record<string, string> = {
   run_command: '跑命令',
@@ -572,6 +622,8 @@ export class ChatAgent {
   private readonly goalStopReason = new Map<string, string>();
   /** 已经发过「预算用满」提示的目标，一个目标只说一次。 */
   private readonly goalNotices = new Set<string>();
+  /** 每个会话的追加式消息链（不含 system），跨回合复用前缀缓存。 */
+  private readonly threads = new Map<string, ThreadState>();
   private readonly cnb?: CnbClient;
 
   constructor(
@@ -717,13 +769,25 @@ export class ChatAgent {
     opts: LlmOptions,
     chatId?: string,
     maxRounds = 40,
-    access: { tier: Tier; speaker: string; onProgress?: (line: string) => void | Promise<void> } = {
+    access: {
+      tier: Tier;
+      speaker: string;
+      onProgress?: (line: string) => void | Promise<void>;
+      /** 回合结束后把完整对话交回去，供跨回合续用（前缀缓存靠它）。 */
+      onConvo?: (convo: ChatMessage[], text: string) => void;
+    } = {
       tier: 'guest',
       speaker: '',
     },
   ): Promise<string> {
+    let convo = [...messages];
+    const finish = (text: string): string => {
+      access.onConvo?.(convo, text);
+      return text;
+    };
     if (!this.config.toolsEnabled) {
-      return this.complete(messages, opts, 1);
+      const text = await this.complete(messages, opts, 1);
+      return finish(text);
     }
 
     const caps = capabilitiesFor(access.tier, this.config.policy);
@@ -745,7 +809,6 @@ export class ChatAgent {
       speaker: access.speaker,
     };
 
-    let convo = [...messages];
     const deadline = Date.now() + this.config.turnBudgetMs;
     // 同一组调用重复出现 = 模型在原地打转，再给工具也是空转
     const repeats = new Map<string, number>();
@@ -762,7 +825,7 @@ export class ChatAgent {
           round,
           budgetMs: this.config.turnBudgetMs,
         });
-        return this.wrapUp(convo, opts);
+        return finish(await this.wrapUp(convo, opts));
       }
       const tick = await this.reportProgress(access.onProgress, {
         round,
@@ -787,7 +850,9 @@ export class ChatAgent {
         1,
       );
       if (response.toolCalls.length === 0) {
-        return response.content;
+        // 终回复也要留在串里，下一回合才能接着往下聊
+        convo = [...convo, { role: 'assistant', content: response.content }];
+        return finish(response.content);
       }
       const signature = response.toolCalls
         .map((call) => `${call.function.name}:${call.function.arguments}`)
@@ -796,7 +861,7 @@ export class ChatAgent {
       repeats.set(signature, times);
       if (times >= 3) {
         this.log.warn('工具调用原地打转，强制收尾', { conversationId: opts.conversationId, round });
-        return this.wrapUp(convo, opts);
+        return finish(await this.wrapUp(convo, opts));
       }
       this.log.info('工具调用', {
         round,
@@ -831,7 +896,7 @@ export class ChatAgent {
 
     // 轮数用完还没收敛：要一次纯文本，别把 tool_calls 暴露给群友
     this.log.warn('工具轮数用尽，强制收尾', { conversationId: opts.conversationId, rounds: maxRounds });
-    return this.wrapUp(convo, opts);
+    return finish(await this.wrapUp(convo, opts));
   }
 
   /**
@@ -1592,7 +1657,15 @@ export class ChatAgent {
       '\n\n---\n\n',
     );
     const tailBlock = tailParts.length > 0 ? `${tailParts.join('\n\n')}\n\n` : '';
-    const history = renderBuffer(pending);
+
+    // 跨回合会话链：同一会话不再每轮从头重建，而是追加推进 ——
+    // 前缀一字不差才能命中 provider 的 KV 缓存（Codex 的 history 也是 append-only）。
+    const threadKey = scope.conversationId;
+    const cachedThread = this.threads.get(threadKey);
+    const usable = cachedThread && cachedThread.system === system ? cachedThread : undefined;
+    const prior = usable ? usable.messages : [];
+    const deltaLines = usable ? linesAfter(pending, usable.lastMessageId) : pending;
+    const history = renderBuffer(deltaLines);
     const now = new Date();
     const stamp = `${String(now.getHours()).padStart(2, '0')}:${String(now.getMinutes()).padStart(2, '0')}`;
     const quoted = scope.isDirect ? undefined : await this.resolveQuote(scope.conversationId, message);
@@ -1609,6 +1682,7 @@ export class ChatAgent {
 
     const buildMessages = (body: string, withImages: boolean): ChatMessage[] => [
       { role: 'system', content: system },
+      ...prior,
       {
         role: 'user',
         content:
@@ -1617,6 +1691,31 @@ export class ChatAgent {
             : body,
       },
     ];
+
+    // 回合结束后把整条串存回去，下一轮接在尾巴上（只追加，不改前文）
+    const lastMessageId =
+      (pending.length > 0 ? pending[pending.length - 1]?.messageId : undefined) ?? message.messageId;
+    const remember = (convo: ChatMessage[]): void => {
+      const rest = convo[0]?.role === 'system' ? convo.slice(1) : convo;
+      let next: ThreadState = {
+        system,
+        messages: rest,
+        lastMessageId,
+        turns: (usable?.turns ?? 0) + 1,
+      };
+      const tokens = approxTokens(next.messages);
+      if (tokens > this.config.thread.maxTokens) {
+        const kept = next.messages.slice(-6);
+        next = { ...next, messages: [{ role: 'user', content: COMPACT_NOTE }, ...kept] };
+        this.log.info('对话链压缩', {
+          conversationId: threadKey,
+          tokens,
+          kept: kept.length,
+          turns: next.turns,
+        });
+      }
+      this.threads.set(threadKey, next);
+    };
 
     const startedAt = Date.now();
     const send = async (raw: string): Promise<boolean> => {
@@ -1699,6 +1798,7 @@ export class ChatAgent {
         tier,
         speaker,
         onProgress,
+        onConvo: remember,
       });
       await send(reply);
       // 回合结束：还有目标就安排下一轮自动续跑（人一插话就会被取消）
@@ -1722,6 +1822,7 @@ export class ChatAgent {
           tier,
           speaker,
           onProgress,
+          onConvo: remember,
         });
         await send(reply);
       } catch (retryError) {

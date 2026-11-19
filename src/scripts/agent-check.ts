@@ -10,7 +10,7 @@ import { existsSync } from 'node:fs';
 import { mkdir, mkdtemp, rm, utimes, appendFile, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
-import { ChatAgent, clipToolOutput, describeProgress, isBotMentioned, MAX_REPLY_CHARS, MAX_REPLY_CHUNKS, pruneToolResults, readAgentConfig, repeatedOpener, splitReply } from '../agent/index.js';
+import { ChatAgent, approxTokens, clipToolOutput, describeProgress, isBotMentioned, MAX_REPLY_CHARS, MAX_REPLY_CHUNKS, pruneToolResults, readAgentConfig, repeatedOpener, splitReply } from '../agent/index.js';
 import { pruneMediaCache } from '../chat-log.js';
 import type { ChatMessage } from '../agent/llm.js';
 import { GroupBuffer, renderBuffer } from '../agent/context.js';
@@ -998,6 +998,34 @@ async function main(): Promise<void> {
     '不超阈值就不动',
     pruneToolResults(toolConvo, { ...outPolicy, clearAtChars: 10_000 }).every((m, i) => m.content === toolConvo[i]?.content),
   );
+
+  console.log('\n[22] 追加式会话链（前缀缓存）');
+  check('token 粗估按字符量算', approxTokens([{ role: 'user', content: '一'.repeat(300) }]) === 100);
+  const seen: ChatMessage[][] = [];
+  const threadTmp = await mkdtemp(path.join(tmpdir(), 'al1s-thread-'));
+  const threadAgent = new ChatAgent(
+    { ...config, dataRoot: threadTmp, toolsEnabled: false },
+    quietLogger,
+    async (msgs: ChatMessage[]) => {
+      seen.push(msgs.map((m) => ({ ...m })));
+      return '嗯';
+    },
+  );
+  const sayOnce = async (body: string): Promise<void> => {
+    await threadAgent.handle(
+      makeMessage({ content: body, mentions: [{ member_openid: BOT_OPENID, bot: true }] }),
+      { replyText: async () => undefined } as unknown as Bot,
+    );
+  };
+  await sayOnce('第一句');
+  await sayOnce('第二句');
+  check('第二轮消息变多', seen[1]!.length > seen[0]!.length, `${seen[0]?.length} → ${seen[1]?.length}`);
+  check('系统提示两轮一字不差', seen[0]![0]?.content === seen[1]![0]?.content);
+  const prefixSame = seen[1]!.slice(0, seen[0]!.length).every(
+    (m, i) => m.role === seen[0]![i]?.role && m.content === seen[0]![i]?.content,
+  );
+  check('前文只追加不改写（前缀可命中缓存）', prefixSame);
+  await rm(threadTmp, { recursive: true, force: true });
 
   // 上游漏解析时，把 DeepSeek 原生标记归一成标准 tool_calls
   const dsmlText =
