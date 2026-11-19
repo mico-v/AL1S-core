@@ -23,6 +23,7 @@ import {
   type ChatResponse,
   type ContentPart,
   type LlmOptions,
+  type ToolCall,
 } from './llm.js';
 import { GroupMemory } from './memory.js';
 import { CONTEXT_FOOTER, CONTEXT_HEADER, resolvePersona } from './persona.js';
@@ -107,6 +108,16 @@ export interface AgentConfig {
   toolRounds: number;
   /** 一条消息的总时间预算（毫秒）：真正的闸门是时间，不是轮数。 */
   turnBudgetMs: number;
+  /** 干活期间的进度播报：长回合不再一声不吭。 */
+  progress: {
+    enabled: boolean;
+    /** 两条进度之间至少隔多久。 */
+    gapMs: number;
+    /** 一个回合最多播报几条，防刷屏。 */
+    max: number;
+  };
+  /** 工具输出预算：单条多大、保留几条、累计多少就瘦身。 */
+  toolOutput: ToolOutputPolicy;
   /** 持续目标：切片账本 + 自动续跑。 */
   goals: {
     enabled: boolean;
@@ -172,7 +183,19 @@ export function readAgentConfig(env: NodeJS.ProcessEnv): AgentConfig {
       cmdBlacklist: parseBlacklist(env.AGENT_CMD_BLACKLIST),
     },
     toolRounds: Number(env.AGENT_TOOL_ROUNDS ?? 40) || 40,
-    turnBudgetMs: Number(env.AGENT_TURN_BUDGET_MS ?? 300_000) || 300_000,
+    // 5 分钟一刀切会把活切成两半（2026-11-19 日志：14~19 轮必然撞墙），
+    // 配上进度播报之后可以放心放宽到 8 分钟。
+    turnBudgetMs: Number(env.AGENT_TURN_BUDGET_MS ?? 480_000) || 480_000,
+    progress: {
+      enabled: env.AGENT_PROGRESS !== 'false',
+      gapMs: Number(env.AGENT_PROGRESS_GAP_MS ?? 75_000) || 75_000,
+      max: Number(env.AGENT_PROGRESS_MAX ?? 3) || 3,
+    },
+    toolOutput: {
+      maxChars: Number(env.AGENT_TOOL_OUTPUT_MAX ?? 6_000) || 6_000,
+      keepRecent: Number(env.AGENT_TOOL_KEEP_RECENT ?? 4) || 4,
+      clearAtChars: Number(env.AGENT_TOOL_CLEAR_AT ?? 24_000) || 24_000,
+    },
     goals: {
       enabled: env.AGENT_GOAL_ENABLED !== 'false',
       auto: env.AGENT_GOAL_AUTO === 'true',
@@ -181,6 +204,121 @@ export function readAgentConfig(env: NodeJS.ProcessEnv): AgentConfig {
       maxWallMs: Number(env.AGENT_GOAL_MAX_WALL_MS ?? 4 * 60 * 60 * 1000) || 4 * 60 * 60 * 1000,
     },
   };
+}
+
+export interface ToolOutputPolicy {
+  /** 单条工具结果上限（字符）。 */
+  maxChars: number;
+  /** 最近几条原样保留。 */
+  keepRecent: number;
+  /** 累计多少字符就清一次；一次清完，别每轮清（每清一次都作废 KV 缓存）。 */
+  clearAtChars: number;
+}
+
+const CLEARED_PREFIX = '［已清理］';
+
+/**
+ * 把老的工具结果折成一行摘要。
+ *
+ * Anthropic《Effective context engineering》：工具结果被调用过一阵之后模型不会再回头看原文，
+ * 但它照样占着注意力与 prefill。所以最近 keepRecent 条原样留着，其余换成
+ * 「头部 160 字 + 原文多少字」—— 可恢复的压缩，不是丢信息。
+ */
+export function pruneToolResults(
+  convo: ChatMessage[],
+  policy: ToolOutputPolicy,
+  log?: AppLogger,
+  conversationId?: string,
+): ChatMessage[] {
+  const toolIndexes = convo.flatMap((message, index) => (message.role === 'tool' ? [index] : []));
+  if (toolIndexes.length <= policy.keepRecent) {
+    return convo;
+  }
+  const total = toolIndexes.reduce((sum, index) => {
+    const content = convo[index]?.content;
+    if (typeof content !== 'string' || content.startsWith(CLEARED_PREFIX)) {
+      return sum;
+    }
+    return sum + content.length;
+  }, 0);
+  if (total <= policy.clearAtChars) {
+    return convo;
+  }
+  const keep = new Set(toolIndexes.slice(-policy.keepRecent));
+  let cleared = 0;
+  let freed = 0;
+  const next = convo.map((message, index) => {
+    if (message.role !== 'tool' || keep.has(index)) {
+      return message;
+    }
+    const raw = typeof message.content === 'string' ? message.content : '';
+    if (!raw || raw.startsWith(CLEARED_PREFIX)) {
+      return message;
+    }
+    cleared += 1;
+    freed += raw.length;
+    return {
+      ...message,
+      content: `${CLEARED_PREFIX}${raw.slice(0, 160).replace(/\s+/g, ' ')} …（原文 ${raw.length} 字，要用就重跑一次）`,
+    };
+  });
+  if (cleared > 0) {
+    log?.info('工具输出瘦身', { conversationId, cleared, freedChars: freed, kept: policy.keepRecent });
+  }
+  return next;
+}
+
+/** 单条工具输出剪到上限：保留头与尾，中间标注截了多少。 */
+export function clipToolOutput(text: string, maxChars: number): string {
+  if (maxChars <= 0 || text.length <= maxChars) {
+    return text;
+  }
+  const head = Math.floor(maxChars * 0.7);
+  const tail = Math.max(0, maxChars - head - 40);
+  const dropped = text.length - head - tail;
+  return `${text.slice(0, head)}\n…（中间 ${dropped} 字已截断，要看就用更精确的命令取片段）…\n${
+    tail > 0 ? text.slice(-tail) : ''
+  }`;
+}
+
+const PROGRESS_VERBS: Record<string, string> = {
+  run_command: '跑命令',
+  read_file: '读文件',
+  write_file: '写文件',
+  list_dir: '看目录',
+  search_files: '搜文件',
+  repo_status: '看仓库',
+  ci_status: '查 CI',
+  memory_query: '翻记忆',
+  member_profile: '查群友档',
+  goal_step: '记进度',
+  goal_watch: '挂探针',
+  goal_status: '看目标',
+};
+
+function progressArg(raw: string): string {
+  try {
+    const args = JSON.parse(raw || '{}') as Record<string, unknown>;
+    const pick = args.cmd ?? args.path ?? args.query ?? args.title ?? args.slice ?? args.issue;
+    return typeof pick === 'string' ? pick.replace(/\s+/g, ' ').trim().slice(0, 40) : '';
+  } catch {
+    return '';
+  }
+}
+
+/** 一行进度：「⏳ 第 8 步 · 跑命令：npm test」。 */
+export function describeProgress(round: number, calls: ToolCall[]): string {
+  if (calls.length === 0) {
+    return '';
+  }
+  const first = calls[0];
+  if (!first) {
+    return '';
+  }
+  const verb = PROGRESS_VERBS[first.function.name] ?? first.function.name;
+  const arg = progressArg(first.function.arguments);
+  const more = calls.length > 1 ? ` 等 ${calls.length} 个动作` : '';
+  return `⏳ 第 ${round} 步 · ${verb}${arg ? `：${arg}` : ''}${more}`;
 }
 
 interface MentionLike {
@@ -400,6 +538,10 @@ export class ChatAgent {
   private readonly goalTimers = new Map<string, NodeJS.Timeout>();
   /** 正在跑自动续跑的群，防止重入。 */
   private readonly goalRunning = new Set<string>();
+  /** 上次不续跑的原因：同一条理由不重复刷日志。 */
+  private readonly goalStopReason = new Map<string, string>();
+  /** 已经发过「预算用满」提示的目标，一个目标只说一次。 */
+  private readonly goalNotices = new Set<string>();
   private readonly cnb?: CnbClient;
 
   constructor(
@@ -544,7 +686,10 @@ export class ChatAgent {
     opts: LlmOptions,
     chatId?: string,
     maxRounds = 40,
-    access: { tier: Tier; speaker: string } = { tier: 'guest', speaker: '' },
+    access: { tier: Tier; speaker: string; onProgress?: (line: string) => void | Promise<void> } = {
+      tier: 'guest',
+      speaker: '',
+    },
   ): Promise<string> {
     if (!this.config.toolsEnabled) {
       return this.complete(messages, opts, 1);
@@ -573,6 +718,12 @@ export class ChatAgent {
     const deadline = Date.now() + this.config.turnBudgetMs;
     // 同一组调用重复出现 = 模型在原地打转，再给工具也是空转
     const repeats = new Map<string, number>();
+    // 长回合也要有声音：头一轮不报（大多数消息一轮就完了，报了纯嗡嗡声）
+    const progress = this.config.progress;
+    const startedAt = Date.now();
+    let progressSent = 0;
+    let progressAt = 0;
+    let lastCalls: ToolCall[] = [];
     for (let round = 0; round < maxRounds; round += 1) {
       if (Date.now() > deadline) {
         this.log.warn('时间预算用完，强制收尾', {
@@ -582,6 +733,20 @@ export class ChatAgent {
         });
         return this.wrapUp(convo, opts);
       }
+      const tick = await this.reportProgress(access.onProgress, {
+        round,
+        calls: lastCalls,
+        state: {
+          sent: progressSent,
+          at: progressAt,
+          startedAt,
+          gapMs: progress.gapMs,
+          max: progress.max,
+          enabled: progress.enabled,
+        },
+      });
+      progressSent = tick.sent;
+      progressAt = tick.at;
       const response = await this.completeRaw(convo, { ...opts, tools }, 1);
       if (response.toolCalls.length === 0) {
         return response.content;
@@ -600,6 +765,7 @@ export class ChatAgent {
         tools: response.toolCalls.map((call) => call.function.name),
         conversationId: opts.conversationId,
       });
+      lastCalls = response.toolCalls;
       convo = [
         ...convo,
         {
@@ -612,13 +778,54 @@ export class ChatAgent {
       ];
       for (const call of response.toolCalls) {
         const output = await executeTool(call.function.name, call.function.arguments, ctx);
-        convo = [...convo, { role: 'tool', tool_call_id: call.id, content: output }];
+        convo = [...convo, { role: 'tool', tool_call_id: call.id, content: clipToolOutput(output, this.config.toolOutput.maxChars) }];
       }
+      // 上下文瘦身：老的整段输出折成一行，别让 17 轮命令回显把 prompt 塞到 70k
+      convo = pruneToolResults(convo, this.config.toolOutput, this.log, opts.conversationId);
     }
 
     // 轮数用完还没收敛：要一次纯文本，别把 tool_calls 暴露给群友
     this.log.warn('工具轮数用尽，强制收尾', { conversationId: opts.conversationId, rounds: maxRounds });
     return this.wrapUp(convo, opts);
+  }
+
+  /**
+   * 进度播报：长回合里每隔一段报一句在干什么。
+   *
+   * 一条群消息跑 5 分钟一件事都不说，群里只会以为它死了（2026-11-19 的反馈）。
+   * 播报本身很便宜（一条纯文本，不过模型），失败不能影响回合，所以全程兜住。
+   */
+  private async reportProgress(
+    onProgress: ((line: string) => void | Promise<void>) | undefined,
+    input: {
+      round: number;
+      calls: ToolCall[];
+      state: { sent: number; at: number; startedAt: number; gapMs: number; max: number; enabled: boolean };
+    },
+  ): Promise<{ sent: number; at: number }> {
+    const { state } = input;
+    const current = { sent: state.sent, at: state.at };
+    if (!onProgress || !state.enabled || state.sent >= state.max || input.round < 2) {
+      return current;
+    }
+    const now = Date.now();
+    // 第一句从「回合开始」算间隔，之后按上一句算 —— 两三步就完的短回合一句都不发
+    const since = state.at || state.startedAt;
+    if (now - since < state.gapMs) {
+      return current;
+    }
+    const line = describeProgress(input.round, input.calls);
+    if (!line) {
+      return current;
+    }
+    current.sent = state.sent + 1;
+    current.at = now;
+    try {
+      await onProgress(line);
+    } catch (error) {
+      this.log.warn('进度播报失败', { error });
+    }
+    return current;
   }
 
   /**
@@ -631,7 +838,7 @@ export class ChatAgent {
   private async wrapUp(convo: ChatMessage[], opts: LlmOptions): Promise<string> {
     const nudge: ChatMessage = {
       role: 'user',
-      content: '（系统）工具调用阶段结束。现在只用一两句话给结论：已经确认了什么、下一步建议怎么做。不要再调用任何工具。',
+      content: '（系统）工具调用阶段结束。现在只用一两句话给结论：做到哪一步、已经确认了什么、下一步建议怎么做。不要再调用任何工具。',
     };
     try {
       const text = await this.complete([...convo, nudge], { ...opts, tools: undefined, disableThinking: true }, 1);
@@ -725,7 +932,21 @@ export class ChatAgent {
         maxWallMs: this.config.goals.maxWallMs,
       });
       if (!verdict.ok) {
-        this.log.info('不续跑', { conversationId: chatId, reason: verdict.reason });
+        // 同一个理由不要每 2 分钟刷一遍（之前一天几百行「不续跑」就是这么来的）
+        if (this.goalStopReason.get(chatId) !== verdict.reason) {
+          this.log.info('不续跑', { conversationId: chatId, reason: verdict.reason });
+          this.goalStopReason.set(chatId, verdict.reason ?? '');
+        }
+        // 预算用满就停，但必须说一句 —— 不然群里看到的就是「干到一半人没了」
+        if (!this.goalNotices.has(goal.id) && /用满|墙钟/.test(verdict.reason ?? '')) {
+          this.goalNotices.add(goal.id);
+          void bot
+            .replyText(
+              scope.replyTarget,
+              `⏸ ${verdict.reason}，目标「${goal.objective.slice(0, 40)}…」先停在这；要接着推就 @ 我说一声。`,
+            )
+            .catch((error) => this.log.warn('停跑提示发送失败', { conversationId: chatId, error }));
+        }
         return;
       }
       if (this.goalTimers.has(chatId) || this.goalRunning.has(chatId)) {
@@ -1223,7 +1444,12 @@ export class ChatAgent {
     if (tier !== 'guest' && this.workspace) {
       parts.push(
         `## 工作区\n\n${this.workspace.describe()}\n` +
-          '动作顺序：先 repo_status 看清现状 → 读相关文件 → 改 → 跑测试 → 按时张提交 → 推分支开 PR。main 不直推。',
+          '动作顺序：先 repo_status 看清现状 → 读相关文件 → 改 → 跑测试 → 按时张提交 → 推分支开 PR。main 不直推。\n\n' +
+          '怎么用工具（回合有预算，往返次数就是预帚）：\n' +
+          '· 一条 run_command 里用 && / ; 把多条命令串起来（看状态 + 读文件 + 跑测试一次干完），别一条一条试 —— 每次往返都要重新过一遍模型。\n' +
+          '· 输出先收敛再读：长日志用 head / tail / grep -c，别把整份 npm test 回显抱进上下文。\n' +
+          '· 要反复看的东西先落到文件里，下次用 sed -n 取片段，不要重复整文输出。\n' +
+          '· 一轮只推一片，推完当场 goal_step 标 done，不要攒到最后一起记。',
       );
     }
     const brief = await this.recordsFor(scope.isDirect ? 'direct' : scope.conversationId).brief();
@@ -1331,6 +1557,24 @@ export class ChatAgent {
       return true;
     };
 
+    // 干活期间的短播报：直接发，不走 send（否则会被记成一条「已回复」并污染开头词统计）
+    const onProgress = async (line: string): Promise<void> => {
+      try {
+        await bot.replyText(scope.replyTarget, line);
+        if (!scope.isDirect) {
+          this.buffer.push(scope.conversationId, {
+            senderName: this.config.botUsernames[0] ?? 'Kei',
+            text: line,
+            timestamp: Date.now(),
+            isSelf: true,
+          });
+        }
+        this.log.info('进度播报', { conversationId: scope.conversationId, line });
+      } catch (error) {
+        this.log.warn('进度播报失败', { conversationId: scope.conversationId, error });
+      }
+    };
+
     const opts = {
       ...this.config.llm,
       purpose: 'chat' as const,
@@ -1345,6 +1589,7 @@ export class ChatAgent {
       const reply = await this.converse(buildMessages(userText, true), opts, chatId, this.config.toolRounds, {
         tier,
         speaker,
+        onProgress,
       });
       await send(reply);
       // 回合结束：还有目标就安排下一轮自动续跑（人一插话就会被取消）
@@ -1367,6 +1612,7 @@ export class ChatAgent {
         const reply = await this.converse(buildMessages(fallbackBody, false), opts, chatId, this.config.toolRounds, {
           tier,
           speaker,
+          onProgress,
         });
         await send(reply);
       } catch (retryError) {

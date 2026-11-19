@@ -1037,7 +1037,7 @@ export async function executeTool(name: string, rawArgs: string, ctx: ToolContex
         tier: ctx.tier ?? 'guest',
         home: ctx.workspace.home,
         blacklist: ctx.cmdBlacklist,
-        limits: { timeoutMs: timeout, maxBytes: 16_000 },
+        limits: { timeoutMs: timeout, maxBytes: 6_000 },
       });
       ctx.log.info('跑了命令', { cmd: cmd.slice(0, 120), code: result.code, denied: result.denied });
       return renderRunResult(result, cmd);

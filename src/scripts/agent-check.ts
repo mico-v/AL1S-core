@@ -10,7 +10,7 @@ import { existsSync } from 'node:fs';
 import { mkdir, mkdtemp, rm, utimes, appendFile, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
-import { ChatAgent, isBotMentioned, MAX_REPLY_CHARS, MAX_REPLY_CHUNKS, readAgentConfig, repeatedOpener, splitReply } from '../agent/index.js';
+import { ChatAgent, clipToolOutput, describeProgress, isBotMentioned, MAX_REPLY_CHARS, MAX_REPLY_CHUNKS, pruneToolResults, readAgentConfig, repeatedOpener, splitReply } from '../agent/index.js';
 import { pruneMediaCache } from '../chat-log.js';
 import type { ChatMessage } from '../agent/llm.js';
 import { GroupBuffer, renderBuffer } from '../agent/context.js';
@@ -612,7 +612,8 @@ async function main(): Promise<void> {
     const tmp3 = await mkdtemp(path.join(tmpdir(), 'al1s-digest-'));
     const digestChat = path.join(tmp3, 'chats', 'group', GROUP);
     await mkdir(digestChat, { recursive: true });
-    const base = Date.parse('2026-10-20T20:00:00+08:00');
+    // 固定日期会过期：2026-11-19 这天刚好超了 recent_digests 的 30 天窗口。改成「十天前」相对时间。
+    const base = Date.now() - 10 * 24 * 60 * 60 * 1000;
     const conversation = Array.from({ length: 12 }, (_, i) =>
       JSON.stringify({
         messageId: `d${i}`,
@@ -965,8 +966,38 @@ async function main(): Promise<void> {
   check('maxTokens 有值才发', JSON.parse(buildRequestBody(msg, { ...llmBase, maxTokens: 300 })).max_tokens === 300);
   check('工具轮数默认 40', readAgentConfig({} as NodeJS.ProcessEnv).toolRounds === 40);
   check('工具轮数可配', readAgentConfig({ AGENT_TOOL_ROUNDS: '80' } as NodeJS.ProcessEnv).toolRounds === 80);
-  check('时间预算默认 5 分钟', readAgentConfig({} as NodeJS.ProcessEnv).turnBudgetMs === 300_000);
+  check('时间预算默认 8 分钟', readAgentConfig({} as NodeJS.ProcessEnv).turnBudgetMs === 480_000);
   check('时间预算可配', readAgentConfig({ AGENT_TURN_BUDGET_MS: '600000' } as NodeJS.ProcessEnv).turnBudgetMs === 600_000);
+
+  console.log('\n[21] 长回合的进度播报与上下文瘦身');
+  const prog = readAgentConfig({} as NodeJS.ProcessEnv).progress;
+  check('进度播报默认开', prog.enabled && prog.max === 3 && prog.gapMs === 75_000);
+  check('进度可关', readAgentConfig({ AGENT_PROGRESS: 'false' } as NodeJS.ProcessEnv).progress.enabled === false);
+  const line = describeProgress(8, [{ id: '1', type: 'function', function: { name: 'run_command', arguments: '{"cmd":"npm test"}' } }]);
+  check('进度带步数与命令', line.includes('第 8 步') && line.includes('npm test'), line);
+  check('多个动作标出个数', describeProgress(3, [
+    { id: '1', type: 'function', function: { name: 'read_file', arguments: '{"path":"a.ts"}' } },
+    { id: '2', type: 'function', function: { name: 'run_command', arguments: '{"cmd":"ls"}' } },
+  ]).includes('2 个动作'));
+  check('没动作就不报', describeProgress(1, []) === '');
+
+  const outPolicy = { maxChars: 40, keepRecent: 1, clearAtChars: 60 };
+  const longOut = 'x'.repeat(80);
+  const clipped = clipToolOutput(longOut, outPolicy.maxChars);
+  check('单条输出超限就剪', clipped.length < longOut.length && clipped.includes('已截断'));
+  const toolConvo: ChatMessage[] = [
+    { role: 'user', content: 'go' },
+    { role: 'tool', tool_call_id: 'a', content: longOut },
+    { role: 'tool', tool_call_id: 'b', content: longOut },
+    { role: 'tool', tool_call_id: 'c', content: longOut },
+  ];
+  const pruned = pruneToolResults(toolConvo, outPolicy);
+  check('老的工具结果折成一行', String(pruned[1]?.content).startsWith('［已清理］'));
+  check('最近一条原样保留', pruned[3]?.content === longOut);
+  check(
+    '不超阈值就不动',
+    pruneToolResults(toolConvo, { ...outPolicy, clearAtChars: 10_000 }).every((m, i) => m.content === toolConvo[i]?.content),
+  );
 
   // 上游漏解析时，把 DeepSeek 原生标记归一成标准 tool_calls
   const dsmlText =

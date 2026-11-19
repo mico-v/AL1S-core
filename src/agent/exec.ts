@@ -20,7 +20,7 @@ export interface RunLimits {
   maxBytes: number;
 }
 
-export const DEFAULT_LIMITS: RunLimits = { timeoutMs: 120_000, maxBytes: 8_000 };
+export const DEFAULT_LIMITS: RunLimits = { timeoutMs: 120_000, maxBytes: 6_000 };
 
 export interface RunResult {
   ok: boolean;
