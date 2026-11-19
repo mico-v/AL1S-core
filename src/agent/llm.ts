@@ -37,6 +37,75 @@ export interface ChatResponse {
   finishReason?: string;
 }
 
+/**
+ * DeepSeek 系模型的 DSML 标记：服务端没把工具调用解析成 `tool_calls` 时，
+ * 原生文本格式会原样落在 content 里（`<｜DSML｜ invoke name="run_command">…`）。
+ * 实测 opencode-go 上的 deepseek-v4.1-flash 会间歇这样，同一进程里有时正常有时漏。
+ * 所以客户端自己兼容一层，不指望上游。
+ */
+const DSML_MARK = /<[｜|]\s*DSML\s*[｜|]/;
+const INVOKE_BLOCK = /<[｜|]\s*DSML\s*[｜|]\s*(?:tool_)?invoke\s+name\s*=\s*["']([^"']+)["'][^>]*>([\s\S]*?)<\/[｜|]\s*DSML\s*[｜|]\s*(?:tool_)?invoke\s*>/g;
+const PARAM_BLOCK = /<[｜|]\s*DSML\s*[｜|]\s*(?:tool_)?parameter\s+name\s*=\s*["']([^"']+)["']([^>]*)>([\s\S]*?)<\/[｜|]\s*DSML\s*[｜|]\s*(?:tool_)?parameter\s*>/g;
+
+export interface DsmlParse {
+  /** 去掉标记后的正文。 */
+  content: string;
+  /** 解析出来的调用；解析不出来就是空数组。 */
+  toolCalls: ToolCall[];
+  /** 正文里有没有 DSML 标记（不管解没解析出来）。 */
+  found: boolean;
+}
+
+/**
+ * 把 DSML 文本还原成标准 tool_calls。
+ *
+ * 标记长这样（`｜` 是全角竖线，也容忍半角）：
+ *   <｜DSML｜ calls><｜DSML｜ invoke name="run_command">
+ *   <｜DSML｜ parameter name="cmd" string="true">ls</｜DSML｜ parameter>
+ *   </｜DSML｜ invoke></｜DSML｜ calls>
+ * 写错格式不抛错：把标记剔掉、当成纯文本回复，不能让用户看到这堆东西。
+ */
+export function extractDsmlCalls(text: string): DsmlParse {
+  if (!DSML_MARK.test(text)) {
+    return { content: text, toolCalls: [], found: false };
+  }
+  const toolCalls: ToolCall[] = [];
+  for (const match of text.matchAll(INVOKE_BLOCK)) {
+    const name = (match[1] ?? '').trim();
+    const body = match[2] ?? '';
+    const args: Record<string, unknown> = {};
+    for (const param of body.matchAll(PARAM_BLOCK)) {
+      const key = (param[1] ?? '').trim();
+      if (!key) {
+        continue;
+      }
+      const meta = param[2] ?? '';
+      const raw = (param[3] ?? '').trim();
+      if (/string\s*=\s*["']?false/.test(meta)) {
+        try {
+          args[key] = JSON.parse(raw);
+          continue;
+        } catch {
+          // 不是合法 JSON 就按字符串收，别丢参数
+        }
+      }
+      args[key] = raw;
+    }
+    if (name) {
+      toolCalls.push({
+        id: `dsml_${toolCalls.length + 1}`,
+        type: 'function',
+        function: { name, arguments: JSON.stringify(args) },
+      });
+    }
+  }
+  const content = text
+    .replace(/<[｜|]\s*DSML\s*[｜|][\s\S]*?<\/[｜|]\s*DSML\s*[｜|]\s*(?:tool_)?calls\s*>/gi, '')
+    .replace(/<\/?[｜|]\s*DSML\s*[｜|][^>]*>/gi, '')
+    .trim();
+  return { content, toolCalls, found: true };
+}
+
 export interface LlmOptions {
   baseUrl: string;
   apiKey: string;
@@ -226,8 +295,16 @@ export async function chatCompleteRaw(
         usage?: UsageLike;
       };
       const choice = data.choices?.[0];
-      const text = choice?.message?.content ?? '';
-      const toolCalls = choice?.message?.tool_calls ?? [];
+      let text = choice?.message?.content ?? '';
+      let toolCalls = choice?.message?.tool_calls ?? [];
+      // 上游没把 DSML 解析成 tool_calls 时自己兼容一层（见 extractDsmlCalls）
+      const dsml = extractDsmlCalls(text);
+      if (dsml.found) {
+        if (toolCalls.length === 0 && dsml.toolCalls.length > 0) {
+          toolCalls = dsml.toolCalls;
+        }
+        text = dsml.content;
+      }
       if (!text.trim() && toolCalls.length === 0) {
         // 推理模型可能把预算全烧在 reasoning 上，content 就是空的
         lastError = new LlmError(`空回复（finish_reason=${choice?.finish_reason ?? '未知'}）`);

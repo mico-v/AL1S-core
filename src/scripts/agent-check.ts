@@ -19,6 +19,7 @@ import { parseBraveHtml, renderHits as renderWebHits } from '../agent/web.js';
 import { blockingWindow, renderQuota } from '../agent/quota.js';
 import { QuoteResolver } from '../agent/quote.js';
 import { quotaPauseFrom } from '../agent/llm.js';
+import { extractDsmlCalls } from '../agent/llm.js';
 import { PERSONA, resolvePersona } from '../agent/persona.js';
 import { capabilitiesFor, resolveTier } from '../agent/policy.js';
 import { checkCommand, parseBlacklist } from '../agent/exec.js';
@@ -945,6 +946,29 @@ async function main(): Promise<void> {
   } finally {
     await rm(recTmp, { recursive: true, force: true });
   }
+
+  console.log('\n[20] DSML 工具调用兼容（上游没解析时自己还原）');
+  const dsmlText =
+    '<｜DSML｜ calls>\n<｜DSML｜ invoke name="run_command">\n' +
+    '<｜DSML｜ parameter name="cmd" string="true">sed -n 1,80p docs/agent/pipeline.md</｜DSML｜ parameter>\n' +
+    '</｜DSML｜ invoke>\n</｜DSML｜ calls>';
+  const parsed = extractDsmlCalls(dsmlText);
+  check('认出 DSML 标记', parsed.found);
+  check('还原出调用名', parsed.toolCalls[0]?.function.name === 'run_command', parsed.toolCalls[0]?.function.name);
+  check(
+    '参数还原成 JSON',
+    JSON.parse(parsed.toolCalls[0]?.function.arguments ?? '{}').cmd === 'sed -n 1,80p docs/agent/pipeline.md',
+  );
+  check('正文里不留标记', !parsed.content.includes('DSML') && parsed.content === '');
+  const two = extractDsmlCalls(
+    '<｜DSML｜ calls><｜DSML｜ invoke name="read_file"><｜DSML｜ parameter name="path" string="true">a.ts</｜DSML｜ parameter></｜DSML｜ invoke>' +
+      '<｜DSML｜ invoke name="run_command"><｜DSML｜ parameter name="cmd" string="true">npm test</｜DSML｜ parameter></｜DSML｜ invoke></｜DSML｜ calls>',
+  );
+  check('一次多个调用都能拆', two.toolCalls.length === 2 && two.toolCalls[1]?.function.name === 'run_command');
+  check('半角竖线也认', extractDsmlCalls('<|DSML| invoke name="repo_status"></|DSML| invoke>').toolCalls.length === 1);
+  const mixed = extractDsmlCalls('先看看仓库\n<｜DSML｜ invoke name="repo_status"></｜DSML｜ invoke>');
+  check('正文保留、标记剔掉', mixed.content.includes('先看看仓库') && !mixed.content.includes('DSML'));
+  check('没标记就不动', extractDsmlCalls('普通回复').found === false);
 
   console.log(failures === 0 ? '\n全部通过\n' : `\n${failures} 项失败\n`);
   process.exit(failures === 0 ? 0 : 1);
