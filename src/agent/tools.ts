@@ -755,6 +755,13 @@ export async function expandQuery(ctx: ToolContext, query: string): Promise<stri
 }
 
 export async function executeTool(name: string, rawArgs: string, ctx: ToolContext): Promise<string> {
+  const startedAt = Date.now();
+  const output = await executeToolInner(name, rawArgs, ctx);
+  ctx.log.info('工具耗时', { name, ms: Date.now() - startedAt, chars: output.length });
+  return output;
+}
+
+async function executeToolInner(name: string, rawArgs: string, ctx: ToolContext): Promise<string> {
   const args = safeParse(rawArgs);
   try {
     if (name === 'search_messages') {

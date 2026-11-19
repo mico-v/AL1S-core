@@ -118,6 +118,14 @@ export interface AgentConfig {
   };
   /** 工具输出预算：单条多大、保留几条、累计多少就瘦身。 */
   toolOutput: ToolOutputPolicy;
+  /**
+   * 前几轮开思考，之后关掉。
+   *
+   * 账本里推理超过 500 token 的调用中位耗时 17.5s（不开思考的只有 5.6s），
+   * 而工具轮的任务由工具结果限定得很死，不需要每轮从头推理。
+   * -1 表示全程不干预（回到旧行为）。
+   */
+  thinkingRounds: number;
   /** 持续目标：切片账本 + 自动续跑。 */
   goals: {
     enabled: boolean;
@@ -192,15 +200,16 @@ export function readAgentConfig(env: NodeJS.ProcessEnv): AgentConfig {
       max: Number(env.AGENT_PROGRESS_MAX ?? 3) || 3,
     },
     toolOutput: {
-      maxChars: Number(env.AGENT_TOOL_OUTPUT_MAX ?? 6_000) || 6_000,
-      keepRecent: Number(env.AGENT_TOOL_KEEP_RECENT ?? 4) || 4,
-      clearAtChars: Number(env.AGENT_TOOL_CLEAR_AT ?? 24_000) || 24_000,
+      maxChars: Number(env.AGENT_TOOL_OUTPUT_MAX ?? 4_000) || 4_000,
+      keepRecent: Number(env.AGENT_TOOL_KEEP_RECENT ?? 3) || 3,
+      clearAtChars: Number(env.AGENT_TOOL_CLEAR_AT ?? 14_000) || 14_000,
     },
+    thinkingRounds: Number(env.AGENT_THINKING_ROUNDS ?? 2),
     goals: {
       enabled: env.AGENT_GOAL_ENABLED !== 'false',
       auto: env.AGENT_GOAL_AUTO === 'true',
       gapMs: Number(env.AGENT_GOAL_GAP_MS ?? 90_000) || 90_000,
-      maxRounds: Number(env.AGENT_GOAL_MAX_ROUNDS ?? 12) || 12,
+      maxRounds: Number(env.AGENT_GOAL_MAX_ROUNDS ?? 24) || 24,
       maxWallMs: Number(env.AGENT_GOAL_MAX_WALL_MS ?? 4 * 60 * 60 * 1000) || 4 * 60 * 60 * 1000,
     },
   };
@@ -280,6 +289,27 @@ export function clipToolOutput(text: string, maxChars: number): string {
     tail > 0 ? text.slice(-tail) : ''
   }`;
 }
+
+/** 只读、无副作用，可以同一轮并行跑的工具。 */
+const PARALLEL_SAFE_TOOLS = new Set([
+  'read_file',
+  'list_dir',
+  'grep_files',
+  'search_files',
+  'repo_status',
+  'ci_status',
+  'memory_query',
+  'memory_status',
+  'search_messages',
+  'search_topics',
+  'recent_digests',
+  'member_profile',
+  'chat_stats',
+  'goal_status',
+  'cnb_issue_list',
+  'cnb_issue_get',
+  'cnb_pull_list',
+]);
 
 const PROGRESS_VERBS: Record<string, string> = {
   run_command: '跑命令',
@@ -748,7 +778,14 @@ export class ChatAgent {
       });
       progressSent = tick.sent;
       progressAt = tick.at;
-      const response = await this.completeRaw(convo, { ...opts, tools }, 1);
+      // 工具轮默认不开思考：账本里推理 >500 token 的调用中位 17.5s，≤500 的只有 5.6s；
+      // 工具轮的下一步由工具结果限定得很死，不需要每轮从头推理。
+      const thinkingOff = this.config.thinkingRounds >= 0 && round >= this.config.thinkingRounds;
+      const response = await this.completeRaw(
+        convo,
+        { ...opts, tools, ...(thinkingOff ? { disableThinking: true } : {}) },
+        1,
+      );
       if (response.toolCalls.length === 0) {
         return response.content;
       }
@@ -777,10 +814,17 @@ export class ChatAgent {
           ...(response.reasoningContent ? { reasoning_content: response.reasoningContent } : {}),
         },
       ];
-      for (const call of response.toolCalls) {
-        const output = await executeTool(call.function.name, call.function.arguments, ctx);
-        convo = [...convo, { role: 'tool', tool_call_id: call.id, content: clipToolOutput(output, this.config.toolOutput.maxChars) }];
-      }
+      const outputs = await this.runToolCalls(response.toolCalls, ctx);
+      response.toolCalls.forEach((call, index) => {
+        convo = [
+          ...convo,
+          {
+            role: 'tool',
+            tool_call_id: call.id,
+            content: clipToolOutput(outputs[index] ?? '', this.config.toolOutput.maxChars),
+          },
+        ];
+      });
       // 上下文瘦身：老的整段输出折成一行，别让 17 轮命令回显把 prompt 塞到 70k
       convo = pruneToolResults(convo, this.config.toolOutput, this.log, opts.conversationId);
     }
@@ -827,6 +871,46 @@ export class ChatAgent {
       this.log.warn('进度播报失败', { error });
     }
     return current;
+  }
+
+  /**
+   * 跑一组的工具调用：只读的并行跑，有副作用的按顺序串行。
+   *
+   * 一轮里发三个 read_file / grep 是常态，串行等于是白招两次往返的延迟。
+   * run_command / write_file / goal_* / cnb_* 会把世界改掉，顺序不能乱，保持串行。
+   */
+  private async runToolCalls(calls: ToolCall[], ctx: ToolContext): Promise<string[]> {
+    const results: string[] = new Array(calls.length).fill('');
+    let batch: number[] = [];
+    const flush = async (): Promise<void> => {
+      if (batch.length === 0) {
+        return;
+      }
+      const pending = batch;
+      batch = [];
+      await Promise.all(
+        pending.map(async (index) => {
+          const call = calls[index];
+          if (!call) {
+            return;
+          }
+          results[index] = await executeTool(call.function.name, call.function.arguments, ctx);
+        }),
+      );
+    };
+    for (let index = 0; index < calls.length; index += 1) {
+      const call = calls[index];
+      if (call && PARALLEL_SAFE_TOOLS.has(call.function.name)) {
+        batch.push(index);
+        continue;
+      }
+      await flush();
+      if (call) {
+        results[index] = await executeTool(call.function.name, call.function.arguments, ctx);
+      }
+    }
+    await flush();
+    return results;
   }
 
   /**
@@ -964,7 +1048,7 @@ export class ChatAgent {
             .deliver(
               bot,
               scope.replyTarget,
-              `⏸ ${verdict.reason}，目标「${goal.objective.slice(0, 40)}…」先停在这；要接着推就 @ 我说一声。`,
+              `⏸ ${verdict.reason}，目标「${goal.objective.slice(0, 40)}…」先停在这。回 /goal resume 我就续上（预算重置）。`,
             )
             .catch((error) => this.log.warn('停跑提示发送失败', { conversationId: chatId, error }));
         }
@@ -1450,6 +1534,9 @@ export class ChatAgent {
     // 注意：memory 不放进 system。它在每轮都可能变，放在最前面会整段击穿提示词缓存；
     // 放到 user 消息末尾，前面的人格与群聊记录就能命中缓存。
     const parts: string[] = [];
+    // 会变的那些（记录本、目标、开头词）不进 system：system 一动，前缀缓存全作废，
+    // 而且它们在尾部才拿得到注意力（Manus 的 recitation：把目标重念到上下文末尾）。
+    const tailParts: string[] = [];
     // 怎么答由模型自己判断（人格里已经写清楚了），代码不预分类
     if (scope.isDirect) {
       parts.push('## 提示\n\n现在是私聊，不是群里，可以放开一点聊。');
@@ -1475,14 +1562,14 @@ export class ChatAgent {
     }
     const brief = await this.recordsFor(scope.isDirect ? 'direct' : scope.conversationId).brief();
     if (brief) {
-      parts.push(`## 记录本摘要（开场先心里有数，不用逐条念）\n\n${brief}`);
+      tailParts.push(`## 记录本摘要（开场先心里有数，不用逐条念）\n\n${brief}`);
     }
 
     // 当前目标：长活的切片账本。每轮只推一片，不然会一口气做完就断在半路。
     if (this.config.goals.enabled) {
       const goal = await this.goalStoreFor(scope.isDirect ? 'direct' : scope.conversationId).read();
       if (goal && goal.status !== 'cancelled') {
-        parts.push(
+        tailParts.push(
           `## 当前目标\n\n${goalBrief(goal)}\n\n` +
             '一轮只推一片：看清现状 → 做 → 自己验 → goal_step 标进度（done/review/blocked 都要一句结论与出处）。' +
             '所有切片都验过才 goal_finish；缺权限或等人拍板就 goal_block，别硬往下做。',
@@ -1494,7 +1581,7 @@ export class ChatAgent {
     const openers = this.recentOpeners.get(scope.conversationId) ?? [];
     const repeated = repeatedOpener(openers);
     if (repeated) {
-      parts.push(
+      tailParts.push(
         `## 别重复自己\n\n你最近 ${openers.length} 次是这样开头的：「${openers.join('」「')}」。` +
           `其中「${repeated.word}」已经用了 ${repeated.count} 次 —— 这次不要用「${repeated.word}」开头，` +
           '直接从一个动作、一句判断或一句追问切进去；结尾也别每次都挂同一个表情。',
@@ -1504,6 +1591,7 @@ export class ChatAgent {
     const system = [resolvePersona(scope.isDirect ? undefined : scope.conversationId, this.config.dataRoot), ...parts].join(
       '\n\n---\n\n',
     );
+    const tailBlock = tailParts.length > 0 ? `${tailParts.join('\n\n')}\n\n` : '';
     const history = renderBuffer(pending);
     const now = new Date();
     const stamp = `${String(now.getHours()).padStart(2, '0')}:${String(now.getMinutes()).padStart(2, '0')}`;
@@ -1516,8 +1604,8 @@ export class ChatAgent {
     const current = `[${stamp}] ${speaker}${scope.isDirect ? '' : ' → Kei'}：${quotedPrefix}${text}`;
     const memoryBlock = remembered ? `## 你记得的 ${speaker}\n\n${remembered}\n\n` : '';
     const userText = history
-      ? `${CONTEXT_HEADER}\n${history}\n${CONTEXT_FOOTER}\n\n${memoryBlock}${current}`
-      : `${memoryBlock}${current}`;
+      ? `${CONTEXT_HEADER}\n${history}\n${CONTEXT_FOOTER}\n\n${tailBlock}${memoryBlock}${current}`
+      : `${tailBlock}${memoryBlock}${current}`;
 
     const buildMessages = (body: string, withImages: boolean): ChatMessage[] => [
       { role: 'system', content: system },
