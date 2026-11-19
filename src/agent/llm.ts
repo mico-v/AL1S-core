@@ -7,6 +7,7 @@
 
 import { randomUUID } from 'node:crypto';
 import { setTimeout as sleep } from 'node:timers/promises';
+import { parseNativeToolCalls } from './dsml.js';
 import { buildRecord, recordCall } from './telemetry.js';
 
 /** opencode-go 要求带上会话标识，否则拒收请求（MissingSessionID）。 */
@@ -29,81 +30,20 @@ export interface ChatMessage {
   tool_calls?: ToolCall[];
   /** role=tool 时指向对应的调用 */
   tool_call_id?: string;
+  /**
+   * 思考模式下模型返回的思维链。按 DeepSeek 手册：请求带 tools 时，
+   * 历史里每条 assistant 消息都必须把 reasoning_content 原样回传，
+   * 否则模型会丢掉自己上一轮的推理（官方 API 直接 400）。
+   */
+  reasoning_content?: string;
 }
 
 export interface ChatResponse {
   content: string;
   toolCalls: ToolCall[];
+  /** 思维链；带 tools 的下一轮要回传。 */
+  reasoningContent?: string;
   finishReason?: string;
-}
-
-/**
- * DeepSeek 系模型的 DSML 标记：服务端没把工具调用解析成 `tool_calls` 时，
- * 原生文本格式会原样落在 content 里（`<｜DSML｜ invoke name="run_command">…`）。
- * 实测 opencode-go 上的 deepseek-v4.1-flash 会间歇这样，同一进程里有时正常有时漏。
- * 所以客户端自己兼容一层，不指望上游。
- */
-const DSML_MARK = /<[｜|]\s*DSML\s*[｜|]/;
-const INVOKE_BLOCK = /<[｜|]\s*DSML\s*[｜|]\s*(?:tool_)?invoke\s+name\s*=\s*["']([^"']+)["'][^>]*>([\s\S]*?)<\/[｜|]\s*DSML\s*[｜|]\s*(?:tool_)?invoke\s*>/g;
-const PARAM_BLOCK = /<[｜|]\s*DSML\s*[｜|]\s*(?:tool_)?parameter\s+name\s*=\s*["']([^"']+)["']([^>]*)>([\s\S]*?)<\/[｜|]\s*DSML\s*[｜|]\s*(?:tool_)?parameter\s*>/g;
-
-export interface DsmlParse {
-  /** 去掉标记后的正文。 */
-  content: string;
-  /** 解析出来的调用；解析不出来就是空数组。 */
-  toolCalls: ToolCall[];
-  /** 正文里有没有 DSML 标记（不管解没解析出来）。 */
-  found: boolean;
-}
-
-/**
- * 把 DSML 文本还原成标准 tool_calls。
- *
- * 标记长这样（`｜` 是全角竖线，也容忍半角）：
- *   <｜DSML｜ calls><｜DSML｜ invoke name="run_command">
- *   <｜DSML｜ parameter name="cmd" string="true">ls</｜DSML｜ parameter>
- *   </｜DSML｜ invoke></｜DSML｜ calls>
- * 写错格式不抛错：把标记剔掉、当成纯文本回复，不能让用户看到这堆东西。
- */
-export function extractDsmlCalls(text: string): DsmlParse {
-  if (!DSML_MARK.test(text)) {
-    return { content: text, toolCalls: [], found: false };
-  }
-  const toolCalls: ToolCall[] = [];
-  for (const match of text.matchAll(INVOKE_BLOCK)) {
-    const name = (match[1] ?? '').trim();
-    const body = match[2] ?? '';
-    const args: Record<string, unknown> = {};
-    for (const param of body.matchAll(PARAM_BLOCK)) {
-      const key = (param[1] ?? '').trim();
-      if (!key) {
-        continue;
-      }
-      const meta = param[2] ?? '';
-      const raw = (param[3] ?? '').trim();
-      if (/string\s*=\s*["']?false/.test(meta)) {
-        try {
-          args[key] = JSON.parse(raw);
-          continue;
-        } catch {
-          // 不是合法 JSON 就按字符串收，别丢参数
-        }
-      }
-      args[key] = raw;
-    }
-    if (name) {
-      toolCalls.push({
-        id: `dsml_${toolCalls.length + 1}`,
-        type: 'function',
-        function: { name, arguments: JSON.stringify(args) },
-      });
-    }
-  }
-  const content = text
-    .replace(/<[｜|]\s*DSML\s*[｜|][\s\S]*?<\/[｜|]\s*DSML\s*[｜|]\s*(?:tool_)?calls\s*>/gi, '')
-    .replace(/<\/?[｜|]\s*DSML\s*[｜|][^>]*>/gi, '')
-    .trim();
-  return { content, toolCalls, found: true };
 }
 
 export interface LlmOptions {
@@ -190,6 +130,31 @@ export class LlmError extends Error {
   }
 }
 
+/**
+ * 组请求体（纯函数，便于断言）。参数按 DeepSeek 手册定：
+ *
+ *   - 思考模式默认开，这里显式写 `thinking.type`，不靠默认值；
+ *   - 思考模式下 `temperature` 无效（传了也不报错，但属于噪声），只在关掉时发；
+ *   - `max_tokens` 为 0 就不传，长度交给模型；
+ *   - 带 tools 时一并给 `tool_choice`，缺省 auto。
+ */
+export function buildRequestBody(messages: ChatMessage[], opts: LlmOptions): string {
+  const maxTokens = opts.maxTokens && opts.maxTokens > 0 ? opts.maxTokens : undefined;
+  const temperature = opts.temperature ?? 0.9;
+  const thinkingOn = !opts.disableThinking;
+  return JSON.stringify({
+    model: opts.model,
+    messages,
+    ...(thinkingOn ? {} : { temperature }),
+    ...(maxTokens ? { max_tokens: maxTokens } : {}),
+    stream: false,
+    thinking: { type: thinkingOn ? 'enabled' : 'disabled' },
+    ...(opts.tools && opts.tools.length > 0
+      ? { tools: opts.tools, tool_choice: opts.toolChoice ?? 'auto' }
+      : {}),
+  });
+}
+
 /** 调一次 chat completions，返回纯文本。失败按退避重试。 */
 export async function chatCompleteRaw(
   messages: ChatMessage[],
@@ -198,20 +163,9 @@ export async function chatCompleteRaw(
 ): Promise<ChatResponse> {
   guardQuota(opts.purpose);
   const url = `${opts.baseUrl.replace(/\/+$/, '')}/chat/completions`;
-  // 不传就不设上限：由模型自己决定生成多长
   const maxTokens = opts.maxTokens && opts.maxTokens > 0 ? opts.maxTokens : undefined;
   const temperature = opts.temperature ?? 0.9;
-  const body = JSON.stringify({
-    model: opts.model,
-    messages,
-    temperature,
-    ...(maxTokens ? { max_tokens: maxTokens } : {}),
-    stream: false,
-    ...(opts.disableThinking ? { thinking: { type: 'disabled' } } : {}),
-    ...(opts.tools && opts.tools.length > 0
-      ? { tools: opts.tools, tool_choice: opts.toolChoice ?? 'auto' }
-      : {}),
-  });
+  const body = buildRequestBody(messages, opts);
 
   const startedAt = Date.now();
   const stack = new Error().stack;
@@ -289,22 +243,22 @@ export async function chatCompleteRaw(
       }
       const data = (await res.json()) as {
         choices?: Array<{
-          message?: { content?: string; tool_calls?: ToolCall[] };
+          message?: { content?: string; tool_calls?: ToolCall[]; reasoning_content?: string };
           finish_reason?: string;
         }>;
         usage?: UsageLike;
       };
       const choice = data.choices?.[0];
-      let text = choice?.message?.content ?? '';
-      let toolCalls = choice?.message?.tool_calls ?? [];
-      // 上游没把 DSML 解析成 tool_calls 时自己兼容一层（见 extractDsmlCalls）
-      const dsml = extractDsmlCalls(text);
-      if (dsml.found) {
-        if (toolCalls.length === 0 && dsml.toolCalls.length > 0) {
-          toolCalls = dsml.toolCalls;
-        }
-        text = dsml.content;
-      }
+      const message = choice?.message ?? {};
+      // 响应边界只认标准 tool_calls：上游没解析的原生格式在这里归一（dsml.ts）
+      const native = parseNativeToolCalls(typeof message.content === 'string' ? message.content : '');
+      const toolCalls =
+        message.tool_calls && message.tool_calls.length > 0 ? message.tool_calls : native.toolCalls;
+      const text = native.content;
+      const reasoningContent =
+        typeof message.reasoning_content === 'string' && message.reasoning_content.trim()
+          ? message.reasoning_content
+          : undefined;
       if (!text.trim() && toolCalls.length === 0) {
         // 推理模型可能把预算全烧在 reasoning 上，content 就是空的
         lastError = new LlmError(`空回复（finish_reason=${choice?.finish_reason ?? '未知'}）`);
@@ -325,7 +279,7 @@ export async function chatCompleteRaw(
           contextWindow: opts.contextWindow,
         }),
       );
-      return { content: text.trim(), toolCalls, finishReason: choice?.finish_reason };
+      return { content: text.trim(), toolCalls, reasoningContent, finishReason: choice?.finish_reason };
     } catch (error) {
       if (error instanceof LlmError && error.status && error.status < 500) {
         await recordFailure(error);

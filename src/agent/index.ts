@@ -540,7 +540,16 @@ export class ChatAgent {
         tools: response.toolCalls.map((call) => call.function.name),
         conversationId: opts.conversationId,
       });
-      convo = [...convo, { role: 'assistant', content: response.content, tool_calls: response.toolCalls }];
+      convo = [
+        ...convo,
+        {
+          role: 'assistant',
+          content: response.content,
+          tool_calls: response.toolCalls,
+          // 手册：带 tools 的请求里，assistant 消息必须把思维链原样回传
+          ...(response.reasoningContent ? { reasoning_content: response.reasoningContent } : {}),
+        },
+      ];
       for (const call of response.toolCalls) {
         const output = await executeTool(call.function.name, call.function.arguments, ctx);
         convo = [...convo, { role: 'tool', tool_call_id: call.id, content: output }];

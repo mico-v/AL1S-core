@@ -18,8 +18,8 @@ import { GroupMemory, applyProfileChanges, readNewRecordsFrom } from '../agent/m
 import { parseBraveHtml, renderHits as renderWebHits } from '../agent/web.js';
 import { blockingWindow, renderQuota } from '../agent/quota.js';
 import { QuoteResolver } from '../agent/quote.js';
-import { quotaPauseFrom } from '../agent/llm.js';
-import { extractDsmlCalls } from '../agent/llm.js';
+import { buildRequestBody, quotaPauseFrom } from '../agent/llm.js';
+import { parseNativeToolCalls } from '../agent/dsml.js';
 import { PERSONA, resolvePersona } from '../agent/persona.js';
 import { capabilitiesFor, resolveTier } from '../agent/policy.js';
 import { checkCommand, parseBlacklist } from '../agent/exec.js';
@@ -947,28 +947,48 @@ async function main(): Promise<void> {
     await rm(recTmp, { recursive: true, force: true });
   }
 
-  console.log('\n[20] DSML 工具调用兼容（上游没解析时自己还原）');
+  console.log('\n[20] LLM 请求体与原生工具调用格式');
+  const llmBase = { baseUrl: 'https://x/v1', apiKey: 'k', model: 'm', temperature: 0.7, maxTokens: 0 };
+  const msg: ChatMessage[] = [{ role: 'user', content: 'hi' }];
+  const thinkOn = JSON.parse(buildRequestBody(msg, llmBase));
+  check('思考模式显式声明开启', thinkOn.thinking?.type === 'enabled');
+  check('思考模式不发 temperature（手册：不生效）', !('temperature' in thinkOn));
+  const thinkOff = JSON.parse(buildRequestBody(msg, { ...llmBase, disableThinking: true }));
+  check('关掉思考时显式声明且发 temperature', thinkOff.thinking?.type === 'disabled' && thinkOff.temperature === 0.7);
+  const withTools = JSON.parse(buildRequestBody(msg, { ...llmBase, tools: [{ type: 'function' }] }));
+  check('带 tools 时补 tool_choice', withTools.tool_choice === 'auto' && withTools.tools.length === 1);
+  check('不带 tools 就不发', !('tools' in thinkOn));
+  check('maxTokens 为 0 不设上限', !('max_tokens' in thinkOn));
+  check('maxTokens 有值才发', JSON.parse(buildRequestBody(msg, { ...llmBase, maxTokens: 300 })).max_tokens === 300);
+
+  // 上游漏解析时，把 DeepSeek 原生标记归一成标准 tool_calls
   const dsmlText =
-    '<｜DSML｜ calls>\n<｜DSML｜ invoke name="run_command">\n' +
-    '<｜DSML｜ parameter name="cmd" string="true">sed -n 1,80p docs/agent/pipeline.md</｜DSML｜ parameter>\n' +
-    '</｜DSML｜ invoke>\n</｜DSML｜ calls>';
-  const parsed = extractDsmlCalls(dsmlText);
-  check('认出 DSML 标记', parsed.found);
+    '<｜DSML｜tool_calls>\n<｜DSML｜invoke name="run_command">\n' +
+    '<｜DSML｜parameter name="cmd" string="true">sed -n 1,80p docs/agent/pipeline.md</｜DSML｜parameter>\n' +
+    '</｜DSML｜invoke>\n</｜DSML｜tool_calls>';
+  const parsed = parseNativeToolCalls(dsmlText);
+  check('认出原生标记', parsed.found);
   check('还原出调用名', parsed.toolCalls[0]?.function.name === 'run_command', parsed.toolCalls[0]?.function.name);
   check(
     '参数还原成 JSON',
     JSON.parse(parsed.toolCalls[0]?.function.arguments ?? '{}').cmd === 'sed -n 1,80p docs/agent/pipeline.md',
   );
-  check('正文里不留标记', !parsed.content.includes('DSML') && parsed.content === '');
-  const two = extractDsmlCalls(
-    '<｜DSML｜ calls><｜DSML｜ invoke name="read_file"><｜DSML｜ parameter name="path" string="true">a.ts</｜DSML｜ parameter></｜DSML｜ invoke>' +
-      '<｜DSML｜ invoke name="run_command"><｜DSML｜ parameter name="cmd" string="true">npm test</｜DSML｜ parameter></｜DSML｜ invoke></｜DSML｜ calls>',
+  check('正文里不留标记', parsed.content === '');
+  const two = parseNativeToolCalls(
+    '<｜DSML｜tool_calls><｜DSML｜invoke name="read_file"><｜DSML｜parameter name="path" string="true">a.ts</｜DSML｜parameter></｜DSML｜invoke>' +
+      '<｜DSML｜invoke name="run_command"><｜DSML｜parameter name="cmd" string="true">npm test</｜DSML｜parameter></｜DSML｜invoke></｜DSML｜tool_calls>',
   );
-  check('一次多个调用都能拆', two.toolCalls.length === 2 && two.toolCalls[1]?.function.name === 'run_command');
-  check('半角竖线也认', extractDsmlCalls('<|DSML| invoke name="repo_status"></|DSML| invoke>').toolCalls.length === 1);
-  const mixed = extractDsmlCalls('先看看仓库\n<｜DSML｜ invoke name="repo_status"></｜DSML｜ invoke>');
-  check('正文保留、标记剔掉', mixed.content.includes('先看看仓库') && !mixed.content.includes('DSML'));
-  check('没标记就不动', extractDsmlCalls('普通回复').found === false);
+  check('一次多个调用都拆得开', two.toolCalls.length === 2 && two.toolCalls[1]?.function.name === 'run_command');
+  check('半角竖线也认', parseNativeToolCalls('<|DSML|invoke name="repo_status"></|DSML|invoke>').toolCalls.length === 1);
+  const mixed = parseNativeToolCalls('先看看仓库\n<｜DSML｜invoke name="repo_status"></｜DSML｜invoke>\n然后再说');
+  check('标记外的正文保留', mixed.content === '先看看仓库\n\n然后再说', JSON.stringify(mixed.content));
+  const boolParam = parseNativeToolCalls(
+    '<｜DSML｜invoke name="t"><｜DSML｜parameter name="limit" string="false">20</｜DSML｜parameter></｜DSML｜invoke>',
+  );
+  check('string=false 按 JSON 还原', JSON.parse(boolParam.toolCalls[0]?.function.arguments ?? '{}').limit === 20);
+  const truncated = parseNativeToolCalls('<｜DSML｜invoke name="run_command"><｜DSML｜parameter name="cmd" string="true">ls');
+  check('截断时不产出半截调用', truncated.found && truncated.toolCalls.length === 0);
+  check('没标记不动正文', parseNativeToolCalls('普通回复').found === false);
 
   console.log(failures === 0 ? '\n全部通过\n' : `\n${failures} 项失败\n`);
   process.exit(failures === 0 ? 0 : 1);

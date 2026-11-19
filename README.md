@@ -48,7 +48,8 @@ src/scripts/webhook-check.ts  webhook 端到端自检
 
 | 模块 | 作用 |
 | --- | --- |
-| `llm.ts` | OpenAI 兼容客户端（默认 opencode-go；`x-opencode-session` 头是必需的） |
+| `llm.ts` | OpenAI 兼容客户端（默认 opencode-go；`x-opencode-session` 头是必需的）；请求体按 DeepSeek 手册组（`thinking.type` 显式声明、思考模式不发 `temperature`），`reasoning_content` 带 tools 时回传 |
+| `dsml.ts` | DeepSeek 原生工具调用标记（DSML）解析：上游漏解析时在响应边界归一成标准 `tool_calls` |
 | `persona.ts` | 人格提示词（从历史实战聊天记录提炼的语感） |
 | `context.ts` | 群聊滚动缓冲：非 @ 消息不进模型 |
 | `text.ts` | 清掉 QQ 协议标记（`<@openid>`、`<faceType=…>`） |
