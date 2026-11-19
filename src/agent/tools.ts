@@ -14,6 +14,8 @@ import { renderHits as renderWebHits, searchWeb } from './web.js';
 import { renderRunResult, runCommand } from './exec.js';
 import type { Capabilities, Tier } from './policy.js';
 import { isKind, isStatus, type RecordStore } from './records.js';
+import { isSliceStatus, renderGoal, type GoalStore } from './goals.js';
+import { renderIssue, renderIssues, renderPulls, type CnbClient } from './cnb.js';
 import type { Workspace } from './workspace.js';
 
 export interface ToolContext {
@@ -33,6 +35,10 @@ export interface ToolContext {
   workspace?: Workspace;
   /** 这个群的记录本。 */
   records?: RecordStore;
+  /** 这个群的持续目标（长活的切片账本）。 */
+  goals?: GoalStore;
+  /** CNB 接口：issue 协作通道。 */
+  cnb?: CnbClient;
   /** 说话人昵称，记条目时当 by。 */
   speaker?: string;
 }
@@ -187,6 +193,170 @@ const RECORD_WRITE_TOOLS: unknown[] = [
   },
 ];
 
+/** 持续目标：开发成员与主人。长活写成 JSON，每轮推一片。 */
+const GOAL_TOOLS: unknown[] = [
+  {
+    type: 'function',
+    function: {
+      name: 'goal_create',
+      description:
+        '把一件跨多轮的长活立成目标：一句正文 + 可判定的完成判据 + 3~5 个切片。立完就能自动续跑，每轮推一片。写不出判据就别立 —— 那说明还没想清楚。',
+      parameters: {
+        type: 'object',
+        properties: {
+          objective: { type: 'string', description: '一句话说清要交付什么（不超过 4000 字）' },
+          criteria: {
+            type: 'array',
+            items: { type: 'string' },
+            description: '完成判据，要能验证：`npx vitest run` 全绿 / PR 合并 / 页面能打开',
+          },
+          slices: {
+            type: 'array',
+            items: { type: 'string' },
+            description: '切片（一片一个 PR），按依赖顺序，最多 12 片',
+          },
+        },
+        required: ['objective', 'criteria', 'slices'],
+      },
+    },
+  },
+  {
+    type: 'function',
+    function: {
+      name: 'goal_status',
+      description: '看当前目标：正文、判据、各片状态、下一片、自动续跑用了几轮。回答「做到哪了」先看它。',
+      parameters: { type: 'object', properties: {} },
+    },
+  },
+  {
+    type: 'function',
+    function: {
+      name: 'goal_step',
+      description:
+        '改一片的进度（todo / doing / review / done / blocked / dropped），顺手记一句结论和出处。做完一片就在同一轮里标 done，别攒着。',
+      parameters: {
+        type: 'object',
+        properties: {
+          slice: { type: 'string', description: '切片编号（s1）或标题片段；留空 = 当前该推的那片' },
+          status: { type: 'string', enum: ['todo', 'doing', 'review', 'done', 'blocked', 'dropped'] },
+          note: { type: 'string', description: '一句话：改了什么、验了什么' },
+          ref: { type: 'string', description: '出处：issue 号、PR 链接、commit' },
+        },
+        required: ['status'],
+      },
+    },
+  },
+  {
+    type: 'function',
+    function: {
+      name: 'goal_finish',
+      description: '目标收尾：所有切片都验过了才调。recap 写清最终交付了什么、判据怎么验的。',
+      parameters: {
+        type: 'object',
+        properties: { recap: { type: 'string', description: '交付结论与验证方式' } },
+        required: ['recap'],
+      },
+    },
+  },
+  {
+    type: 'function',
+    function: {
+      name: 'goal_block',
+      description: '卡住了就明说：缺权限、等主人拍板、等 NPC 回话。写清卡在谁身上，自动续跑会停。',
+      parameters: {
+        type: 'object',
+        properties: { reason: { type: 'string', description: '卡点 + 卡在谁身上' } },
+        required: ['reason'],
+      },
+    },
+  },
+];
+
+/** CNB issue 协作通道：能写仓库的角色才看得到。 */
+const CNB_TOOLS: unknown[] = [
+  {
+    type: 'function',
+    function: {
+      name: 'cnb_issue_list',
+      description: '列 CNB 仓库的 issue（默认 open）。开工前先看有没有现成的切片，别重复开。',
+      parameters: {
+        type: 'object',
+        properties: { state: { type: 'string', enum: ['open', 'closed'] } },
+      },
+    },
+  },
+  {
+    type: 'function',
+    function: {
+      name: 'cnb_issue_get',
+      description: '读一条 issue 的正文（切片的目标 / 范围 / 验收 / 风险四段）。',
+      parameters: {
+        type: 'object',
+        properties: { number: { type: 'number' } },
+        required: ['number'],
+      },
+    },
+  },
+  {
+    type: 'function',
+    function: {
+      name: 'cnb_issue_create',
+      description:
+        '按切片模板开 issue：正文四段 —— 目标（一句话）、范围（可改目录 + 明确不动什么）、验收（可粘贴的命令与期望）、风险（回滚与依赖）。',
+      parameters: {
+        type: 'object',
+        properties: {
+          title: { type: 'string', description: '切片编号 + 一句话' },
+          body: { type: 'string', description: '四段正文' },
+        },
+        required: ['title', 'body'],
+      },
+    },
+  },
+  {
+    type: 'function',
+    function: {
+      name: 'cnb_issue_dispatch',
+      description:
+        '在 issue 里发派工评论并带 work_mode，让 NPC/CodeBuddy 下场写代码、推分支、开 PR。评论要写清分支名、可改目录、自测命令、PR 标题前缀。',
+      parameters: {
+        type: 'object',
+        properties: {
+          number: { type: 'number' },
+          comment: { type: 'string', description: '派工说明（不包含 @，会自动带上 @CodeBuddy）' },
+        },
+        required: ['number', 'comment'],
+      },
+    },
+  },
+  {
+    type: 'function',
+    function: {
+      name: 'cnb_issue_close',
+      description: '关 issue（复核通过、PR 合并之后）。可以顺手贴一句结论。',
+      parameters: {
+        type: 'object',
+        properties: {
+          number: { type: 'number' },
+          comment: { type: 'string', description: '收尾结论，可留空' },
+        },
+        required: ['number'],
+      },
+    },
+  },
+  {
+    type: 'function',
+    function: {
+      name: 'cnb_pull_list',
+      description: '列 CNB 的 PR。派工后看 PR 出来没有、合没合。',
+      parameters: {
+        type: 'object',
+        properties: { state: { type: 'string', enum: ['open', 'closed', 'all'] } },
+      },
+    },
+  },
+];
+
 /** 读仓库：开发成员与主人。 */
 const REPO_READ_TOOLS: unknown[] = [
   {
@@ -295,10 +465,10 @@ export function toolDefinitionsFor(caps: Capabilities): unknown[] {
     tools.push(...REPO_READ_TOOLS);
   }
   if (caps.memoryWrite) {
-    tools.push(...RECORD_WRITE_TOOLS);
+    tools.push(...RECORD_WRITE_TOOLS, ...GOAL_TOOLS);
   }
   if (caps.repoWrite) {
-    tools.push(...REPO_WRITE_TOOLS);
+    tools.push(...REPO_WRITE_TOOLS, ...CNB_TOOLS);
   }
   return tools;
 }
@@ -666,6 +836,110 @@ export async function executeTool(name: string, rawArgs: string, ctx: ToolContex
         return '当前身份不能改记录状态。';
       }
       return await ctx.records.setStatus(asString(args.id), asString(args.status), ctx.speaker);
+    }
+    if (name === 'goal_create') {
+      if (!ctx.goals || !ctx.capabilities?.memoryWrite) {
+        return '当前身份不能立目标。';
+      }
+      return await ctx.goals.create(
+        {
+          objective: asString(args.objective),
+          criteria: arrayOf(args.criteria) ?? [],
+          slices: arrayOf(args.slices) ?? [],
+          ...(ctx.speaker ? { by: ctx.speaker } : {}),
+        },
+        { maxRounds: 12, maxWallMs: 4 * 60 * 60 * 1000 },
+      );
+    }
+    if (name === 'goal_status') {
+      if (!ctx.goals) {
+        return '这个会话没有目标账本。';
+      }
+      const goal = await ctx.goals.read();
+      return goal ? renderGoal(goal) : '还没有目标。要开工就用 goal_create 立一个。';
+    }
+    if (name === 'goal_step') {
+      if (!ctx.goals || !ctx.capabilities?.memoryWrite) {
+        return '当前身份不能改目标。';
+      }
+      const status = args.status;
+      if (!isSliceStatus(status)) {
+        return 'status 只能是 todo / doing / review / done / blocked / dropped。';
+      }
+      return await ctx.goals.step(asString(args.slice), status, {
+        ...(asString(args.note) ? { note: asString(args.note) } : {}),
+        ...(asString(args.ref) ? { ref: asString(args.ref) } : {}),
+        ...(ctx.speaker ? { by: ctx.speaker } : {}),
+      });
+    }
+    if (name === 'goal_finish') {
+      if (!ctx.goals || !ctx.capabilities?.memoryWrite) {
+        return '当前身份不能收尾目标。';
+      }
+      return await ctx.goals.finish(asString(args.recap), ctx.speaker);
+    }
+    if (name === 'goal_block') {
+      if (!ctx.goals || !ctx.capabilities?.memoryWrite) {
+        return '当前身份不能改目标。';
+      }
+      return await ctx.goals.block(asString(args.reason), ctx.speaker);
+    }
+    if (name === 'cnb_issue_list' || name === 'cnb_pull_list' || name === 'cnb_issue_get') {
+      if (!ctx.cnb || !ctx.capabilities?.repoRead) {
+        return '当前身份不能用 CNB 通道。';
+      }
+      if (name === 'cnb_issue_list') {
+        const state = asString(args.state) === 'closed' ? 'closed' : 'open';
+        return renderIssues(await ctx.cnb.listIssues(state), ctx.cnb.repo);
+      }
+      if (name === 'cnb_issue_get') {
+        const number = asNumber(args.number);
+        if (!number) {
+          return '需要 issue 号。';
+        }
+        return renderIssue(await ctx.cnb.getIssue(number), ctx.cnb.repo);
+      }
+      const state = asString(args.state);
+      const normalized = state === 'closed' || state === 'all' ? state : 'open';
+      return renderPulls(await ctx.cnb.listPulls(normalized), ctx.cnb.repo);
+    }
+    if (name === 'cnb_issue_create') {
+      if (!ctx.cnb || !ctx.capabilities?.repoWrite) {
+        return '当前身份不能开 issue。';
+      }
+      const title = asString(args.title).trim();
+      const body = asString(args.body).trim();
+      if (!title || !body) {
+        return '开 issue 需要 title 和 body（body 走四段模板）。';
+      }
+      const issue = await ctx.cnb.createIssue({ title, body });
+      ctx.log.info('开了 CNB issue', { repo: ctx.cnb.repo, number: issue.number });
+      return `已开 issue #${issue.number}：${title}`;
+    }
+    if (name === 'cnb_issue_dispatch') {
+      if (!ctx.cnb || !ctx.capabilities?.repoWrite) {
+        return '当前身份不能派工。';
+      }
+      const number = asNumber(args.number);
+      const comment = asString(args.comment).trim();
+      if (!number || !comment) {
+        return '派工需要 issue 号和说明。';
+      }
+      await ctx.cnb.commentIssue(number, `@CodeBuddy\n\n${comment}`, true);
+      ctx.log.info('CNB 派工', { repo: ctx.cnb.repo, number });
+      return `已派工 #${number}（work_mode）。等它推分支开 PR，回来用 cnb_pull_list 看。`;
+    }
+    if (name === 'cnb_issue_close') {
+      if (!ctx.cnb || !ctx.capabilities?.repoWrite) {
+        return '当前身份不能关 issue。';
+      }
+      const number = asNumber(args.number);
+      if (!number) {
+        return '需要 issue 号。';
+      }
+      await ctx.cnb.closeIssue(number, asString(args.comment) || undefined);
+      ctx.log.info('关了 CNB issue', { repo: ctx.cnb.repo, number });
+      return `已关闭 #${number}。`;
     }
     if (name === 'repo_status') {
       if (!ctx.workspace || !ctx.capabilities?.repoRead) {

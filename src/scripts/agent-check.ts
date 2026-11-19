@@ -24,6 +24,9 @@ import { PERSONA, resolvePersona } from '../agent/persona.js';
 import { capabilitiesFor, resolveTier } from '../agent/policy.js';
 import { checkCommand, parseBlacklist } from '../agent/exec.js';
 import { RecordStore } from '../agent/records.js';
+import { GoalStore, canContinue, goalBrief, nextSlice, renderGoal } from '../agent/goals.js';
+import { readCnbConfig, renderIssues, renderPulls } from '../agent/cnb.js';
+import { matchGoalCommand } from '../agent/commands.js';
 import { cleanQQText } from '../agent/text.js';
 import { matchCommand, renderStatus } from '../agent/commands.js';
 import { DigestEngine, DRIFT_THRESHOLD, topicDrift } from '../agent/digest.js';
@@ -993,6 +996,88 @@ async function main(): Promise<void> {
   const truncated = parseNativeToolCalls('<｜DSML｜invoke name="run_command"><｜DSML｜parameter name="cmd" string="true">ls');
   check('截断时不产出半截调用', truncated.found && truncated.toolCalls.length === 0);
   check('没标记不动正文', parseNativeToolCalls('普通回复').found === false);
+
+  console.log('\n[21] 持续目标（goal 模式）');
+  const goalTmp = await mkdtemp(path.join(tmpdir(), 'goals-'));
+  try {
+    const store = new GoalStore(goalTmp, 'G1');
+    check('空账本没有目标', (await store.read()) === undefined);
+    check(
+      '没判据不许立目标',
+      (await store.create({ objective: 'x', criteria: [], slices: ['a'] }, { maxRounds: 3, maxWallMs: 60_000 })).includes('完成判据'),
+    );
+    check(
+      '没切片不许立目标',
+      (await store.create({ objective: 'x', criteria: ['能跑'], slices: [] }, { maxRounds: 3, maxWallMs: 60_000 })).includes('至少切成一片'),
+    );
+    const created = await store.create(
+      { objective: '把 M2 室内做出来', criteria: ['vitest 全绿', '页面能打开'], slices: ['室内数据规范', '楼层渲染', '真机验收'], by: '謎矢' },
+      { maxRounds: 2, maxWallMs: 3_600_000 },
+    );
+    check('立起目标后指向第一片', created.includes('▶ s1'), created.slice(0, 40));
+    check('目标写进账本', (await store.read())?.objective === '把 M2 室内做出来');
+    const again = await store.create(
+      { objective: '另一个目标', criteria: ['x'], slices: ['y'] },
+      { maxRounds: 2, maxWallMs: 60_000 },
+    );
+    check('同时只允许一个进行中的目标', again.includes('已经有一个进行中的目标'));
+    const stepped = await store.step('s1', 'done', { note: 'schema 落地', ref: '#21' });
+    check('标进度带出处', stepped.includes('#21'), stepped.slice(0, 60));
+    const afterStep = await store.read();
+    check('下一片换成 s2', afterStep ? nextSlice(afterStep)?.id === 's2' : false);
+    check('找不到的切片不乱改', (await store.step('zzz', 'done')).includes('找不到切片'));
+
+    const round1 = await store.tick({ maxRounds: 2, maxWallMs: 3_600_000 });
+    check('续跑记一轮', round1?.ok === true && round1.goal.budget.rounds === 1);
+    await store.tick({ maxRounds: 2, maxWallMs: 3_600_000 });
+    const overflow = await store.tick({ maxRounds: 2, maxWallMs: 3_600_000 });
+    check('轮数用满就停', overflow?.ok === false && String(overflow.reason).includes('2'), String(overflow?.reason));
+
+    const live = await store.read();
+    check('预算耗尽时 canContinue 返回 false', live ? !canContinue(live, { maxRounds: 2, maxWallMs: 3_600_000 }).ok : false);
+    check('简报含下一片', live ? goalBrief(live).includes('下一片') : false);
+    check('视图列出每片状态', live ? renderGoal(live).includes('s2 楼层渲染') : false);
+
+    const finished = await store.finish('做完两片');
+    check('收尾提醒未完成切片', finished.includes('没标完成'), finished.slice(0, 40));
+    check('收尾后状态是 done', (await store.read())?.status === 'done');
+    check('done 后不再续跑', (await store.tick({ maxRounds: 5, maxWallMs: 3_600_000 }))?.ok === false);
+
+    const blockedStore = new GoalStore(goalTmp, 'G2');
+    await blockedStore.create({ objective: '等主人拍板', criteria: ['确认'], slices: ['问主人'] }, { maxRounds: 3, maxWallMs: 60_000 });
+    check(
+      '卡住后自动续跑停',
+      (await blockedStore.block('等主人拍板')).includes('卡住') && (await blockedStore.read())?.status === 'blocked',
+    );
+    check('blocked 不再续跑', (await blockedStore.tick({ maxRounds: 5, maxWallMs: 60_000 }))?.ok === false);
+  } finally {
+    await rm(goalTmp, { recursive: true, force: true });
+  }
+
+  console.log('\n[22] CNB issue 协作通道');
+  const noToken = readCnbConfig({ AGENT_CNB_TOKEN_FILE: '/nonexistent/cnb-token' } as NodeJS.ProcessEnv);
+  check('没令牌就不挂通道', noToken === undefined);
+  const inline = readCnbConfig({
+    KEI_CNB_TOKEN: ' t0k ',
+    AGENT_CNB_REPO: 'mico-v/demo',
+    AGENT_CNB_API_BASE: 'https://api.cnb.cool/',
+    AGENT_CNB_TOKEN_FILE: '/nonexistent/cnb-token',
+  } as NodeJS.ProcessEnv);
+  check('内联令牌优先且去空白', inline?.token === 't0k');
+  check('仓库与端点可配、尾部斜杠去掉', inline?.repo === 'mico-v/demo' && inline?.apiBase === 'https://api.cnb.cool');
+  check('issue 视图带编号与状态', renderIssues([{ number: 3, title: 'M2-1 室内数据', state: 'open' }], 'r').includes('#3 [open]'));
+  check('空列表给下一步提示', renderIssues([], 'r').includes('四段'));
+  check('PR 视图标 merged', renderPulls([{ number: 9, title: 'x', state: 'closed', merged: true }], 'r').includes('[merged]'));
+  check('目标指令认 /goal', matchGoalCommand('/goal') === 'status');
+  check('目标指令认 /goal stop', matchGoalCommand('/goal stop') === 'stop');
+  check('别的斜杠命令不误判', matchGoalCommand('/status') === undefined);
+  check('owner 看得到 cnb_issue_create', ownerTools.includes('cnb_issue_create'));
+  check('owner 看得到 goal_create', ownerTools.includes('goal_create'));
+  check('guest 看不到 goal_create', !guestTools.includes('goal_create'));
+  check('guest 看不到 cnb_issue_dispatch', !guestTools.includes('cnb_issue_dispatch'));
+  check('目标自动续跑默认关', readAgentConfig({} as NodeJS.ProcessEnv).goals.auto === false);
+  check('目标自动续跑可开', readAgentConfig({ AGENT_GOAL_AUTO: 'true' } as NodeJS.ProcessEnv).goals.auto === true);
+  check('轮数预算可配', readAgentConfig({ AGENT_GOAL_MAX_ROUNDS: '6' } as NodeJS.ProcessEnv).goals.maxRounds === 6);
 
   console.log(failures === 0 ? '\n全部通过\n' : `\n${failures} 项失败\n`);
   process.exit(failures === 0 ? 0 : 1);

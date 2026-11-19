@@ -27,6 +27,23 @@ export function matchCommand(text: string): CommandName | undefined {
   return undefined;
 }
 
+export type GoalCommand = 'status' | 'stop' | 'resume';
+
+/** 目标指令：不走模型，立刻回，不花钱。 */
+export function matchGoalCommand(text: string): GoalCommand | undefined {
+  const normalized = text.trim().toLowerCase().replace(/\s+/g, ' ');
+  if (normalized === '/goal' || normalized === 'goal' || normalized === '/goal status' || normalized === '/目标') {
+    return 'status';
+  }
+  if (normalized === '/goal stop' || normalized === '/goal 停' || normalized === '/目标 停') {
+    return 'stop';
+  }
+  if (normalized === '/goal resume' || normalized === '/goal 继续' || normalized === '/目标 继续') {
+    return 'resume';
+  }
+  return undefined;
+}
+
 export interface StatusInput {
   chatId: string;
   dataRoot: string;

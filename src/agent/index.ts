@@ -10,7 +10,7 @@
 import type { QQBotInboundMessage } from '@tencent-connect/qqbot-nodejs';
 import type { Bot } from '../bot.js';
 import type { AppLogger } from '../logger.js';
-import { matchCommand, renderStatus } from './commands.js';
+import { matchCommand, matchGoalCommand, renderStatus } from './commands.js';
 import { GroupBuffer, renderBuffer } from './context.js';
 import { DigestEngine } from './digest.js';
 import { judgeProactive } from './proactive.js';
@@ -28,6 +28,8 @@ import { GroupMemory } from './memory.js';
 import { CONTEXT_FOOTER, CONTEXT_HEADER, resolvePersona } from './persona.js';
 import { capabilitiesFor, describeTier, resolveTier, type PolicyConfig, type Tier } from './policy.js';
 import { RecordStore } from './records.js';
+import { GoalStore, canContinue, goalBrief, nextSlice, renderGoal } from './goals.js';
+import { CnbClient, readCnbConfig } from './cnb.js';
 import { cleanQQText } from './text.js';
 import { parseBlacklist } from './exec.js';
 import { executeTool, toolDefinitionsFor, type ToolContext } from './tools.js';
@@ -105,6 +107,16 @@ export interface AgentConfig {
   toolRounds: number;
   /** 一条消息的总时间预算（毫秒）：真正的闸门是时间，不是轮数。 */
   turnBudgetMs: number;
+  /** 持续目标：切片账本 + 自动续跑。 */
+  goals: {
+    enabled: boolean;
+    /** 自动续跑（没有任何人发话也自己往下推）。 */
+    auto: boolean;
+    /** 两轮自动续跑之间至少隔多久，给群友插话的机会。 */
+    gapMs: number;
+    maxRounds: number;
+    maxWallMs: number;
+  };
 }
 
 export function readAgentConfig(env: NodeJS.ProcessEnv): AgentConfig {
@@ -161,6 +173,13 @@ export function readAgentConfig(env: NodeJS.ProcessEnv): AgentConfig {
     },
     toolRounds: Number(env.AGENT_TOOL_ROUNDS ?? 40) || 40,
     turnBudgetMs: Number(env.AGENT_TURN_BUDGET_MS ?? 300_000) || 300_000,
+    goals: {
+      enabled: env.AGENT_GOAL_ENABLED !== 'false',
+      auto: env.AGENT_GOAL_AUTO === 'true',
+      gapMs: Number(env.AGENT_GOAL_GAP_MS ?? 90_000) || 90_000,
+      maxRounds: Number(env.AGENT_GOAL_MAX_ROUNDS ?? 12) || 12,
+      maxWallMs: Number(env.AGENT_GOAL_MAX_WALL_MS ?? 4 * 60 * 60 * 1000) || 4 * 60 * 60 * 1000,
+    },
   };
 }
 
@@ -376,6 +395,12 @@ export class ChatAgent {
   private readonly workspace?: Workspace;
   /** 每个群一个记录本（直接对话也一个）。 */
   private readonly recordStores = new Map<string, RecordStore>();
+  private readonly goalStores = new Map<string, GoalStore>();
+  /** 待执行的自动续跑定时器（每群最多一个）。 */
+  private readonly goalTimers = new Map<string, NodeJS.Timeout>();
+  /** 正在跑自动续跑的群，防止重入。 */
+  private readonly goalRunning = new Set<string>();
+  private readonly cnb?: CnbClient;
 
   constructor(
     config: AgentConfig,
@@ -397,6 +422,11 @@ export class ChatAgent {
         config.policy.repoSlug,
         homedir(),
       );
+    }
+    // CNB 通道：没配令牌就不挂工具（模型看不到就不会去试）
+    const cnbConfig = readCnbConfig(process.env);
+    if (cnbConfig) {
+      this.cnb = new CnbClient(cnbConfig, log);
     }
     this.digest = new DigestEngine({
       dataRoot: config.dataRoot,
@@ -534,6 +564,8 @@ export class ChatAgent {
       cmdBlacklist: this.config.policy.cmdBlacklist,
       workspace: caps.repoRead ? this.workspace : undefined,
       records: this.recordsFor(chatId ?? 'direct'),
+      goals: this.config.goals.enabled ? this.goalStoreFor(chatId ?? 'direct') : undefined,
+      cnb: caps.repoWrite ? this.cnb : undefined,
       speaker: access.speaker,
     };
 
@@ -645,6 +677,124 @@ export class ChatAgent {
     return store;
   }
 
+  private goalStoreFor(key: string): GoalStore {
+    let store = this.goalStores.get(key);
+    if (!store) {
+      store = new GoalStore(this.config.dataRoot, key);
+      this.goalStores.set(key, store);
+    }
+    return store;
+  }
+
+  /** 取消排队中的自动续跑（有人说话、或目标已收尾时）。 */
+  private cancelGoalTick(chatId: string): void {
+    const timer = this.goalTimers.get(chatId);
+    if (timer) {
+      clearTimeout(timer);
+      this.goalTimers.delete(chatId);
+      this.log.debug('取消自动续跑', { conversationId: chatId });
+    }
+  }
+
+  /**
+   * 回合结束后安排下一轮自动续跑。
+   *
+   * 四道闸门：开关、工程群、目标状态/预算、每群只排一个。
+   * 目的不是让它自己无限干活，而是让长活跨过上下文窗口不断线 ——
+   * 所以轮数与墙钟都由预算管，到点就停，等人接手。
+   */
+  private scheduleGoalTick(scope: Scope, bot: Bot): void {
+    if (!this.config.goals.enabled || !this.config.goals.auto || scope.isDirect) {
+      return;
+    }
+    const chatId = scope.conversationId;
+    if (!this.config.policy.devGroups.includes(chatId)) {
+      return;
+    }
+    if (this.goalTimers.has(chatId) || this.goalRunning.has(chatId)) {
+      return;
+    }
+    const store = this.goalStoreFor(chatId);
+    void (async () => {
+      const goal = await store.read();
+      if (!goal) {
+        return;
+      }
+      const verdict = canContinue(goal, {
+        maxRounds: this.config.goals.maxRounds,
+        maxWallMs: this.config.goals.maxWallMs,
+      });
+      if (!verdict.ok) {
+        this.log.info('不续跑', { conversationId: chatId, reason: verdict.reason });
+        return;
+      }
+      if (this.goalTimers.has(chatId) || this.goalRunning.has(chatId)) {
+        return;
+      }
+      const timer = setTimeout(() => {
+        this.goalTimers.delete(chatId);
+        void this.runGoalTick(scope, bot).catch((error) =>
+          this.log.warn('自动续跑失败', { conversationId: chatId, error }),
+        );
+      }, this.config.goals.gapMs);
+      timer.unref();
+      this.goalTimers.set(chatId, timer);
+      this.log.info('安排自动续跑', {
+        conversationId: chatId,
+        gapMs: this.config.goals.gapMs,
+        slice: nextSlice(goal)?.id,
+      });
+    })();
+  }
+
+  /** 跑一轮自动续跑：记预算 → 把「继续推下一片」当成一条消息走完整回合。 */
+  private async runGoalTick(scope: Scope, bot: Bot): Promise<void> {
+    const chatId = scope.conversationId;
+    if (this.goalRunning.has(chatId)) {
+      return;
+    }
+    this.goalRunning.add(chatId);
+    let keepGoing = false;
+    try {
+      const store = this.goalStoreFor(chatId);
+      const tick = await store.tick({
+        maxRounds: this.config.goals.maxRounds,
+        maxWallMs: this.config.goals.maxWallMs,
+      });
+      if (!tick) {
+        return;
+      }
+      if (!tick.ok) {
+        this.log.info('自动续跑停止', { conversationId: chatId, reason: tick.reason });
+        return;
+      }
+      const goal = tick.goal;
+      const slice = nextSlice(goal);
+      const text =
+        `（自动续跑 ${goal.budget.rounds}/${goal.budget.maxRounds}）接着推目标：${goal.objective.slice(0, 120)}\n` +
+        `这一轮只做一片 —— ${slice ? `${slice.id} ${slice.title}` : '没有待办切片'}。` +
+        '做完就 goal_step 标进度，做完所有切片再 goal_finish，卡住就 goal_block。';
+      // 用主人的身份跑，否则降成 guest 就什么工具都没了
+      const synthetic = {
+        kind: 'group',
+        groupOpenid: chatId,
+        senderId: this.config.ownerOpenids[0] ?? goal.by ?? '',
+        senderName: '（goal 自动续跑）',
+        senderIsBot: false,
+        content: text,
+        messageId: `goal-${goal.id}-${goal.budget.rounds}`,
+      } as unknown as QQBotInboundMessage;
+      this.log.info('自动续跑开跑', { conversationId: chatId, round: goal.budget.rounds, slice: slice?.id });
+      await this.reply(synthetic, bot, scope, text);
+      keepGoing = true;
+    } finally {
+      this.goalRunning.delete(chatId);
+      if (keepGoing) {
+        this.scheduleGoalTick(scope, bot);
+      }
+    }
+  }
+
   /** 记下这次的开头词（前 1-3 个字）。 */
   private noteOpener(conversationId: string, text: string): void {
     const match = /^[\s「"'（(]*([^\s，。！？,.!?~～]{1,3})/.exec(text);
@@ -753,6 +903,10 @@ export class ChatAgent {
     if (!scope) {
       return;
     }
+    // 有人说话就是最高优先级：先把排队中的自动续跑取消，等这一轮完再安排
+    if (!scope.isDirect) {
+      this.cancelGoalTick(scope.conversationId);
+    }
 
     const raw = (message.content ?? '').trim();
     const withoutMentions = raw.replace(/<@!?[0-9A-Fa-f]{16,}>/g, '').trim();
@@ -782,8 +936,7 @@ export class ChatAgent {
       return;
     }
     // 自己的指令：不走模型，立刻回
-    const command = matchCommand(withoutMentions);
-    if (command !== undefined) {
+    const command = matchCommand(withoutMentions);    if (command !== undefined) {
       const body = await renderStatus({
         chatId: scope.conversationId,
         dataRoot: this.config.dataRoot,
@@ -800,9 +953,31 @@ export class ChatAgent {
       return;
     }
 
+    // 目标指令：/goal 看状态，/goal stop 停，/goal resume 恢复。不走模型。
+    if (!scope.isDirect && this.config.goals.enabled) {
+      const goalCommand = matchGoalCommand(withoutMentions);
+      if (goalCommand) {
+        const store = this.goalStoreFor(scope.conversationId);
+        let body: string;
+        if (goalCommand === 'stop') {
+          this.cancelGoalTick(scope.conversationId);
+          body = await store.cancel(`/goal stop（${message.senderName ?? '某人'}）`);
+        } else if (goalCommand === 'resume') {
+          body = await store.resume();
+        } else {
+          const goal = await store.read();
+          body = goal
+            ? renderGoal(goal)
+            : '这个群还没有目标。要立就用 goal_create（正文 + 判据 + 3~5 片），或者直接说「把这个做成目标」。';
+        }
+        await bot.replyText(scope.replyTarget, body);
+        this.log.info('目标指令', { command: goalCommand, conversationId: scope.conversationId });
+        return;
+      }
+    }
+
     // 别的机器人的命令（@课表Bot /课表 也算）
-    if (withoutMentions.startsWith('/')) {
-      this.modes.drop += 1;
+    if (withoutMentions.startsWith('/')) {      this.modes.drop += 1;
       this.log.debug('忽略命令类消息', { conversationId: scope.conversationId, text: withoutMentions.slice(0, 40) });
       return;
     }
@@ -978,6 +1153,18 @@ export class ChatAgent {
       parts.push(`## 记录本摘要（开场先心里有数，不用逐条念）\n\n${brief}`);
     }
 
+    // 当前目标：长活的切片账本。每轮只推一片，不然会一口气做完就断在半路。
+    if (this.config.goals.enabled) {
+      const goal = await this.goalStoreFor(scope.isDirect ? 'direct' : scope.conversationId).read();
+      if (goal && goal.status !== 'cancelled') {
+        parts.push(
+          `## 当前目标\n\n${goalBrief(goal)}\n\n` +
+            '一轮只推一片：看清现状 → 做 → 自己验 → goal_step 标进度（done/review/blocked 都要一句结论与出处）。' +
+            '所有切片都验过才 goal_finish；缺权限或等人拍板就 goal_block，别硬往下做。',
+        );
+      }
+    }
+
     // 连着几次都用同一个词开头，一眼就是模板；点名那个词，别只说「换个说法」
     const openers = this.recentOpeners.get(scope.conversationId) ?? [];
     const repeated = repeatedOpener(openers);
@@ -1082,6 +1269,8 @@ export class ChatAgent {
         speaker,
       });
       await send(reply);
+      // 回合结束：还有目标就安排下一轮自动续跑（人一插话就会被取消）
+      this.scheduleGoalTick(scope, bot);
     } catch (error) {
       // 带图请求失败（模型不支持 / 图太大被拒）就退回文字描述，别整条哑掉
       if (imageParts.length === 0) {
