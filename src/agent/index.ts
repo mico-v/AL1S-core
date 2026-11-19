@@ -353,12 +353,14 @@ const COMPACT_NOTE =
   '（此前对话已归档到此。接着按记录本、当前目标与仓库现状往下推，别重问我上面已经说过的事；缺信息就去看文件或翻记录本。）';
 
 /** 只抽 pending 里 lastMessageId 之后的新行；找不到（窗口滚出去了）就当没有新的。 */
-function linesAfter<T extends { messageId?: string }>(lines: T[], lastMessageId?: string): T[] {
+/** 只抽 pending 里 lastMessageId 之后的新行；找不到（窗口滚出去了）返回 undefined = 整条重建。 */
+function linesAfter<T extends { messageId?: string }>(lines: T[], lastMessageId?: string): T[] | undefined {
   if (!lastMessageId) {
     return lines;
   }
   const index = lines.findIndex((line) => line.messageId === lastMessageId);
-  return index >= 0 ? lines.slice(index + 1) : [];
+  // 窗口已经滚过这一条：发言丢失不可接受，宁可整条重建（最多多吃一次缓存未命中）
+  return index >= 0 ? lines.slice(index + 1) : undefined;
 }
 
 const PROGRESS_VERBS: Record<string, string> = {
@@ -1662,9 +1664,12 @@ export class ChatAgent {
     // 前缀一字不差才能命中 provider 的 KV 缓存（Codex 的 history 也是 append-only）。
     const threadKey = scope.conversationId;
     const cachedThread = this.threads.get(threadKey);
-    const usable = cachedThread && cachedThread.system === system ? cachedThread : undefined;
+    const cachedUsable = cachedThread && cachedThread.system === system ? cachedThread : undefined;
+    const delta = cachedUsable ? linesAfter(pending, cachedUsable.lastMessageId) : undefined;
+    // delta === undefined 说明要么没链、要么窗口滚过了旧锚点：这一轮重建
+    const usable = delta === undefined ? undefined : cachedUsable;
     const prior = usable ? usable.messages : [];
-    const deltaLines = usable ? linesAfter(pending, usable.lastMessageId) : pending;
+    const deltaLines = delta ?? pending;
     const history = renderBuffer(deltaLines);
     const now = new Date();
     const stamp = `${String(now.getHours()).padStart(2, '0')}:${String(now.getMinutes()).padStart(2, '0')}`;

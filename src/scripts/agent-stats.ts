@@ -47,6 +47,40 @@ console.log(
 );
 console.log(`最大上下文占用 ${pct(summary.maxContextRate)}`);
 
+// 缓存要看两层：回合首调（跨回合延续的命中）与回合内（追加增长的命中）。
+// 首调低于 90% = 前缀在变，去看看 system 里是不是又塞了会动的东西。
+const chatCalls = records
+  .filter((r) => r.purpose === 'chat' && r.ok)
+  .sort((a, b) => a.at.localeCompare(b.at));
+const median = (values: number[]): number => {
+  if (values.length === 0) {
+    return 0;
+  }
+  const sorted = [...values].sort((a, b) => a - b);
+  return sorted[Math.floor(sorted.length / 2)] ?? 0;
+};
+const turnFirst: number[] = [];
+const turnRest: number[] = [];
+let previous: CallRecord | undefined;
+for (const record of chatCalls) {
+  const gap = previous ? Date.parse(record.at) - Date.parse(previous.at) : Number.POSITIVE_INFINITY;
+  const sameChat = previous?.conversationId === record.conversationId;
+  if (!previous || !sameChat || gap > 60_000) {
+    turnFirst.push(record.cacheRate);
+  } else {
+    turnRest.push(record.cacheRate);
+  }
+  previous = record;
+}
+console.log(
+  `缓存分层  首调 p50 ${pct(median(turnFirst))}（${turnFirst.length} 次）   ` +
+    `回合内 p50 ${pct(median(turnRest))}（${turnRest.length} 次）   ` +
+    `零缓存 ${pct(turnFirst.filter((v) => v < 0.05).length / Math.max(1, turnFirst.length))}`,
+);
+if (median(turnFirst) < 0.9) {
+  console.log('提示：首调命中偏低 —— system 里可能又放进了会变的内容（记录本/目标/时间/工作区状态）。');
+}
+
 function groupBy(pick: (record: CallRecord) => string): Map<string, CallRecord[]> {
   const map = new Map<string, CallRecord[]>();
   for (const record of records) {
