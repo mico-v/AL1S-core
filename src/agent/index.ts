@@ -655,7 +655,8 @@ export class ChatAgent {
       try {
         const chunks = splitReply(decision.text);
         for (let i = 0; i < chunks.length; i += 1) {
-          await bot.replyText(
+          await this.deliver(
+            bot,
             { scope: 'group', targetId: chatId } as unknown as Parameters<Bot['replyText']>[0],
             chunks[i] as string,
           );
@@ -874,6 +875,25 @@ export class ChatAgent {
     return store;
   }
 
+  /**
+   * 发一条文本：被动回复窗口过期（msg_id 失效）就退回主动推送。
+   *
+   * 长回合必然撞这条：QQ 的 msg_id 只在收到消息后几分钟内可用，
+   * 跑完再回就成「回复消息msg_id已过期」，整条结论凭空消失。
+   */
+  private async deliver(bot: Bot, target: Scope['replyTarget'], text: string): Promise<void> {
+    try {
+      await bot.replyText(target, text);
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      if (!/已过期|expired|msg_id/i.test(message)) {
+        throw error;
+      }
+      this.log.warn('被动回复窗口过期，改走主动推送', { message: message.slice(0, 120) });
+      await bot.pushText(target, text);
+    }
+  }
+
   /** 记录本按会话分开：群用自己的 openid，私聊用 direct。 */
   private recordsFor(key: string): RecordStore {
     let store = this.recordStores.get(key);
@@ -940,8 +960,9 @@ export class ChatAgent {
         // 预算用满就停，但必须说一句 —— 不然群里看到的就是「干到一半人没了」
         if (!this.goalNotices.has(goal.id) && /用满|墙钟/.test(verdict.reason ?? '')) {
           this.goalNotices.add(goal.id);
-          void bot
-            .replyText(
+          void this
+            .deliver(
+              bot,
               scope.replyTarget,
               `⏸ ${verdict.reason}，目标「${goal.objective.slice(0, 40)}…」先停在这；要接着推就 @ 我说一声。`,
             )
@@ -1247,7 +1268,7 @@ export class ChatAgent {
         modes: this.modes,
         quota: renderQuota(await currentQuota(this.config.llm, this.log)),
       });
-      await bot.replyText(scope.replyTarget, body);
+      await this.deliver(bot, scope.replyTarget, body);
       this.log.info('指令', { command, conversationId: scope.conversationId });
       return;
     }
@@ -1269,7 +1290,7 @@ export class ChatAgent {
             ? renderGoal(goal)
             : '这个群还没有目标。要立就用 goal_create（正文 + 判据 + 3~5 片），或者直接说「把这个做成目标」。';
         }
-        await bot.replyText(scope.replyTarget, body);
+        await this.deliver(bot, scope.replyTarget, body);
         this.log.info('目标指令', { command: goalCommand, conversationId: scope.conversationId });
         return;
       }
@@ -1522,7 +1543,7 @@ export class ChatAgent {
       }
       const chunks = splitReply(cleaned);
       for (let i = 0; i < chunks.length; i += 1) {
-        await bot.replyText(scope.replyTarget, chunks[i] as string);
+        await this.deliver(bot, scope.replyTarget, chunks[i] as string);
         if (i < chunks.length - 1) {
           await new Promise((resolve) => setTimeout(resolve, 350));
         }
@@ -1560,7 +1581,7 @@ export class ChatAgent {
     // 干活期间的短播报：直接发，不走 send（否则会被记成一条「已回复」并污染开头词统计）
     const onProgress = async (line: string): Promise<void> => {
       try {
-        await bot.replyText(scope.replyTarget, line);
+        await this.deliver(bot, scope.replyTarget, line);
         if (!scope.isDirect) {
           this.buffer.push(scope.conversationId, {
             senderName: this.config.botUsernames[0] ?? 'Kei',

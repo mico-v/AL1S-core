@@ -181,6 +181,18 @@ export class Bot {
     this.client.stop();
   }
 
+  /**
+   * 主动推送文本（丢挱 msgId）。
+   *
+   * 被动回复窗口很短：一条消息跑五六分钟，msg_id 早过期，
+   * /messages 会直接回「回复消息msg_id已过期」，整条回复就丢了。
+   */
+  pushText(target: ReplyTarget, content: string): Promise<MessageResponse> {
+    const copy = { ...(target as unknown as Record<string, unknown>) };
+    delete copy.msgId;
+    return this.replyText(copy as unknown as ReplyTarget, content);
+  }
+
   /** 回复文本（有 msgId 时为被动回复，否则为主动推送）。 */
   replyText(
     target: ReplyTarget,
