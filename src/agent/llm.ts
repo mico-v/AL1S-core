@@ -302,8 +302,16 @@ export async function chatComplete(
 ): Promise<string> {
   guardQuota(opts.purpose);
   const response = await chatCompleteRaw(messages, opts, retries);
-  if (!response.content) {
-    throw new LlmError('空回复');
+  if (response.content) {
+    return response.content;
   }
-  return response.content;
+  // 思考模式可能把预算全烧在思维链上，正文空着回来（手册：思考模式默认开）。
+  // 关掉思考再要一次纯文本，比直接抛错让整条消息哑掉强。
+  if (!opts.disableThinking) {
+    const plain = await chatCompleteRaw(messages, { ...opts, disableThinking: true }, 1);
+    if (plain.content) {
+      return plain.content;
+    }
+  }
+  throw new LlmError('空回复');
 }

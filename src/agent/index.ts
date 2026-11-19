@@ -101,6 +101,8 @@ export interface AgentConfig {
   };
   /** 权限分档、代码工作区、工程群。 */
   policy: PolicyConfig;
+  /** 一条消息最多几轮「模型→工具」往返。开发类问题要读好几个文件，5 轮不够。 */
+  toolRounds: number;
 }
 
 export function readAgentConfig(env: NodeJS.ProcessEnv): AgentConfig {
@@ -155,6 +157,7 @@ export function readAgentConfig(env: NodeJS.ProcessEnv): AgentConfig {
       // 黑名单模式：默认空 = 全部放行；收紧时只改 .env，不改代码
       cmdBlacklist: parseBlacklist(env.AGENT_CMD_BLACKLIST),
     },
+    toolRounds: Number(env.AGENT_TOOL_ROUNDS ?? 8) || 8,
   };
 }
 
@@ -557,8 +560,48 @@ export class ChatAgent {
     }
 
     // 回合用完还没收敛：要一次纯文本，别把 tool_calls 暴露给群友
-    this.log.warn('工具回合超限，强制收尾', { conversationId: opts.conversationId });
-    return this.complete(convo, { ...opts, tools: undefined }, 1);
+    this.log.warn('工具回合超限，强制收尾', { conversationId: opts.conversationId, rounds: maxRounds });
+    return this.wrapUp(convo, opts);
+  }
+
+  /**
+   * 收尾：不要再给工具，只要一句结论。
+   *
+   * 之前这里是直接 `complete()`：模型还想调工具、或者思考把预算吃光，
+   * 拿到的就是空正文，`chatComplete` 抛错，整条消息就吐不出来了（2026-11-19 真事）。
+   * 现在明确告诉它工具阶段结束，并关掉思考 —— 只要文本。
+   */
+  /**
+   * 整轮失败时也要出个声。
+   *
+   * 不发声等于「发了条消息没反应」—— 2026-11-19 就发生过一次：模型返回空正文，
+   * 日志里有 error，群里什么都没有，主人只能来问我。宁可说一句卡住了。
+   */
+  private async notifyFailure(
+    send: (text: string) => Promise<boolean>,
+    conversationId: string,
+  ): Promise<void> {
+    try {
+      await send('这条我这边卡住了（模型没返回可用内容），稍后再 @ 我一次试试。');
+    } catch (error) {
+      this.log.warn('失败提示也没发出去', { conversationId, error });
+    }
+  }
+
+  private async wrapUp(convo: ChatMessage[], opts: LlmOptions): Promise<string> {
+    const nudge: ChatMessage = {
+      role: 'user',
+      content: '（系统）工具调用阶段结束。现在只用一两句话给结论：已经确认了什么、下一步建议怎么做。不要再调用任何工具。',
+    };
+    try {
+      const text = await this.complete([...convo, nudge], { ...opts, tools: undefined, disableThinking: true }, 1);
+      if (text.trim()) {
+        return text;
+      }
+    } catch (error) {
+      this.log.warn('收尾失败', { conversationId: opts.conversationId, error });
+    }
+    return '这条我做到一半就卡住了（工具回合用完了还没跑完），你把要的结果再说细一点，我重新跑一遍。';
   }
 
   private memory(groupOpenid: string): GroupMemory {
@@ -1012,12 +1055,16 @@ export class ChatAgent {
     const chatId = scope.isDirect ? undefined : scope.conversationId;
 
     try {
-      const reply = await this.converse(buildMessages(userText, true), opts, chatId, 5, { tier, speaker });
+      const reply = await this.converse(buildMessages(userText, true), opts, chatId, this.config.toolRounds, {
+        tier,
+        speaker,
+      });
       await send(reply);
     } catch (error) {
       // 带图请求失败（模型不支持 / 图太大被拒）就退回文字描述，别整条哑掉
       if (imageParts.length === 0) {
         this.log.error('回复失败', { conversationId: scope.conversationId, error });
+        await this.notifyFailure(send, scope.conversationId);
         return;
       }
       this.log.warn('带图对话失败，退回文字描述重试', {
@@ -1028,10 +1075,14 @@ export class ChatAgent {
       try {
         const captions = await this.enrich(message, message.attachments ?? []);
         const fallbackBody = `${userText}\n${captions}`.trim();
-        const reply = await this.converse(buildMessages(fallbackBody, false), opts, chatId, 5, { tier, speaker });
+        const reply = await this.converse(buildMessages(fallbackBody, false), opts, chatId, this.config.toolRounds, {
+          tier,
+          speaker,
+        });
         await send(reply);
       } catch (retryError) {
         this.log.error('回复失败（退化后）', { conversationId: scope.conversationId, error: retryError });
+        await this.notifyFailure(send, scope.conversationId);
       }
     }
   }

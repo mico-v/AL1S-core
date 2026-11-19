@@ -960,6 +960,8 @@ async function main(): Promise<void> {
   check('不带 tools 就不发', !('tools' in thinkOn));
   check('maxTokens 为 0 不设上限', !('max_tokens' in thinkOn));
   check('maxTokens 有值才发', JSON.parse(buildRequestBody(msg, { ...llmBase, maxTokens: 300 })).max_tokens === 300);
+  check('工具回合默认 8', readAgentConfig({} as NodeJS.ProcessEnv).toolRounds === 8);
+  check('工具回合可配', readAgentConfig({ AGENT_TOOL_ROUNDS: '12' } as NodeJS.ProcessEnv).toolRounds === 12);
 
   // 上游漏解析时，把 DeepSeek 原生标记归一成标准 tool_calls
   const dsmlText =
