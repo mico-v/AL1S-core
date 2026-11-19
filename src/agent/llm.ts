@@ -214,6 +214,9 @@ export async function chatCompleteRaw(
     );
   };
 
+  // 网络层的抖动（fetch failed）不消耗正常重试额度：本机实测偶发 1~2 秒连不上
+  // 模型端点，两次快速重试全落在同一段抖动里，整条回复就成了「我卡住了」（2026-11-19）。
+  let networkRetries = 0;
   for (let attempt = 0; attempt <= retries; attempt += 1) {
     attemptsUsed = attempt;
     if (attempt > 0) {
@@ -291,7 +294,23 @@ export async function chatCompleteRaw(
         await recordFailure(error);
         throw error;
       }
-      lastError = error;
+      // 把底层原因（ENETUNREACH / ECONNRESET / ETIMEDOUT …）带进错误文案，
+      // 不然账本里永远只有一句 fetch failed，猜不透是 DNS 还是对方拒接。
+      const cause = (error as { cause?: { code?: string; message?: string } }).cause;
+      const code = cause?.code ?? cause?.message;
+      const wrapped =
+        error instanceof Error
+          ? new LlmError(`${error.message}${code ? ` (${code})` : ''}`)
+          : new LlmError(String(error));
+      const transient = !(error instanceof LlmError && error.status);
+      if (transient && networkRetries < 3) {
+        networkRetries += 1;
+        clearTimeout(timer);
+        await sleep(700 * networkRetries + Math.floor(Math.random() * 300));
+        attempt -= 1;
+        continue;
+      }
+      lastError = wrapped;
     } finally {
       clearTimeout(timer);
     }

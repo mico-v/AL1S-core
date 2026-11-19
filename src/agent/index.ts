@@ -1809,10 +1809,14 @@ export class ChatAgent {
       // 回合结束：还有目标就安排下一轮自动续跑（人一插话就会被取消）
       this.scheduleGoalTick(scope, bot);
     } catch (error) {
+      // 自动续跑失败不发「我卡住了」：下一跳会自己重试，群里只看到一堆广播反而更吓人。
+      const autoTick = (message.messageId ?? '').startsWith('goal-');
       // 带图请求失败（模型不支持 / 图太大被拒）就退回文字描述，别整条哑掉
       if (imageParts.length === 0) {
-        this.log.error('回复失败', { conversationId: scope.conversationId, error });
-        await this.notifyFailure(send, scope.conversationId);
+        this.log.error('回复失败', { conversationId: scope.conversationId, autoTick, error });
+        if (!autoTick) {
+          await this.notifyFailure(send, scope.conversationId);
+        }
         return;
       }
       this.log.warn('带图对话失败，退回文字描述重试', {
@@ -1831,8 +1835,10 @@ export class ChatAgent {
         });
         await send(reply);
       } catch (retryError) {
-        this.log.error('回复失败（退化后）', { conversationId: scope.conversationId, error: retryError });
-        await this.notifyFailure(send, scope.conversationId);
+        this.log.error('回复失败（退化后）', { conversationId: scope.conversationId, autoTick, error: retryError });
+        if (!autoTick) {
+          await this.notifyFailure(send, scope.conversationId);
+        }
       }
     }
   }

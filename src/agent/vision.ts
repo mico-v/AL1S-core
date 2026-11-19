@@ -248,6 +248,14 @@ export function looksLikeImage(item: AttachmentLike): boolean {
   return !type && Boolean(item.url?.includes('multimedia'));
 }
 
+/** 把 fetch 的底层原因（ENETUNREACH / ECONNRESET …）带进日志，别只留一句 fetch failed。 */
+function fetchHint(error: unknown): string {
+  const cause = (error as { cause?: { code?: string; message?: string } }).cause;
+  const code = cause?.code ?? cause?.message;
+  const message = error instanceof Error ? error.message : String(error);
+  return code ? `${message} (${code})` : message;
+}
+
 async function download(url: string, timeoutMs = 30_000): Promise<Uint8Array> {
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), timeoutMs);
@@ -461,7 +469,7 @@ export async function describeImage(
     );
     return text.trim() || undefined;
   } catch (error) {
-    log.warn('看图失败', { mime, bytes: bytes.byteLength, error });
+    log.warn('看图失败', { mime, bytes: bytes.byteLength, error: fetchHint(error) });
     return undefined;
   }
 }
