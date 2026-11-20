@@ -21,11 +21,13 @@ import { QuoteResolver } from '../agent/quote.js';
 import { buildRequestBody, quotaPauseFrom } from '../agent/llm.js';
 import { parseNativeToolCalls } from '../agent/dsml.js';
 import { PERSONA, resolvePersona } from '../agent/persona.js';
-import { capabilitiesFor, resolveTier } from '../agent/policy.js';
+import { capabilitiesFor, resolveTier, GUEST_CAPS, OWNER_CAPS } from '../agent/policy.js';
 import { checkCommand, parseBlacklist } from '../agent/exec.js';
 import { RecordStore } from '../agent/records.js';
 import { GoalStore, canContinue, goalBrief, nextSlice, renderGoal } from '../agent/goals.js';
 import { readCnbConfig, buildProbeSignature, renderIssues, renderPulls } from '../agent/cnb.js';
+import { renderHandoff, shouldRotateThread, writeHandoff } from '../agent/thread.js';
+import { kindPack } from '../agent/kinds.js';
 import { matchGoalCommand } from '../agent/commands.js';
 import { cleanQQText } from '../agent/text.js';
 import { matchCommand, renderStatus } from '../agent/commands.js';
@@ -1208,6 +1210,80 @@ async function main(): Promise<void> {
   check('目标自动续跑默认关', readAgentConfig({} as NodeJS.ProcessEnv).goals.auto === false);
   check('目标自动续跑可开', readAgentConfig({ AGENT_GOAL_AUTO: 'true' } as NodeJS.ProcessEnv).goals.auto === true);
   check('轮数预算可配', readAgentConfig({ AGENT_GOAL_MAX_ROUNDS: '6' } as NodeJS.ProcessEnv).goals.maxRounds === 6);
+
+  console.log('\n[23] 能力包（kind）、独立复核与会话续航');
+  const toolNames = (caps: typeof OWNER_CAPS, kind?: 'code' | 'research' | 'ops' | 'review'): string[] =>
+    (toolDefinitionsFor(caps, kind) as Array<{ function: { name: string } }>).map((tool) => tool.function.name);
+  const codeTools = toolNames(OWNER_CAPS, 'code');
+  check('code 拿全部工具', codeTools.includes('write_file') && codeTools.includes('run_command'));
+  check('review 不能写仓库', !toolNames(OWNER_CAPS, 'review').includes('write_file'));
+  check('research 能联网搜', toolNames(OWNER_CAPS, 'research').includes('web_search'));
+  check('ops 能跑命令', toolNames(OWNER_CAPS, 'ops').includes('run_command'));
+  check('guest 收窄后仍无写工具', !toolNames(GUEST_CAPS, 'code').includes('write_file'));
+  check('四类活都有提示词', ['code', 'research', 'ops', 'review'].every((kind) => kindPack(kind as 'code').prompt.length > 10));
+
+  const kindTmp = await mkdtemp(path.join(tmpdir(), 'kinds-'));
+  try {
+    const kindStore = new GoalStore(kindTmp, 'K1');
+    await kindStore.create(
+      { objective: '调研同类项目', criteria: ['每条结论有出处'], slices: ['查 GitHub'], kind: 'research' },
+      { maxRounds: 3, maxWallMs: 60_000 },
+    );
+    const kindGoal = await kindStore.read();
+    check('目标记住类型', kindGoal?.kind === 'research');
+    check('视图标出类型', kindGoal ? renderGoal(kindGoal).includes('调研') : false);
+
+    // 标 done 前过独立复核：FAIL 退回 review，PASS 才落地
+    const reviewStore = new GoalStore(kindTmp, 'R1');
+    await reviewStore.create({ objective: '写一片', criteria: ['测试全绿'], slices: ['改代码'] }, { maxRounds: 3, maxWallMs: 60_000 });
+    const baseCtx = {
+      dataRoot: kindTmp,
+      log: quietLogger,
+      goals: reviewStore,
+      capabilities: OWNER_CAPS,
+      tier: 'owner' as const,
+    };
+    const failOut = await executeTool('goal_step', '{"slice":"s1","status":"done"}', {
+      ...baseCtx,
+      reviewSlice: async () => ({ pass: false, note: '缺测试输出' }),
+    });
+    check('复核不过退回 review', failOut.includes('复核没过') && (await reviewStore.read())?.slices[0]?.status === 'review');
+    check('退回时把理由写进切片', ((await reviewStore.read())?.slices[0]?.note ?? '').includes('缺测试输出'));
+    const passOut = await executeTool('goal_step', '{"slice":"s1","status":"done"}', {
+      ...baseCtx,
+      reviewSlice: async () => ({ pass: true, note: '证据齐全' }),
+    });
+    check('复核通过才标 done', (await reviewStore.read())?.slices[0]?.status === 'done', passOut.slice(0, 60));
+    check('复核结果落盘', existsSync(path.join(kindTmp, 'reviews', 'R1')));
+  } finally {
+    await rm(kindTmp, { recursive: true, force: true });
+  }
+
+  // 会话续航：到点交接换链，不是停工
+  check('30 轮触发交接', shouldRotateThread({ turns: 30, maxAgeMs: 0, maxTurns: 30 }).rotate);
+  check(
+    '3 小时触发交接',
+    shouldRotateThread({ bornAt: Date.now() - 3 * 3_600_000, turns: 1, maxAgeMs: 3 * 3_600_000, maxTurns: 30 }).rotate,
+  );
+  check(
+    '短会话不交接',
+    !shouldRotateThread({ bornAt: Date.now() - 60_000, turns: 2, maxAgeMs: 3 * 3_600_000, maxTurns: 30 }).rotate,
+  );
+  const handoffTmp = await mkdtemp(path.join(tmpdir(), 'handoff-'));
+  try {
+    const rel = await writeHandoff(
+      handoffTmp,
+      'G1',
+      renderHandoff({ reason: '会话已 30 轮', turns: 30, goalBrief: '目标：X', tail: '- user: hi' }),
+    );
+    check('交接单落盘', rel.startsWith(path.join('handoffs', 'G1')) && existsSync(path.join(handoffTmp, rel)));
+  } finally {
+    await rm(handoffTmp, { recursive: true, force: true });
+  }
+  check('会话寿命默认 3 小时 / 30 轮', (() => {
+    const cfg = readAgentConfig({} as NodeJS.ProcessEnv).thread;
+    return cfg.maxAgeMs === 3 * 3_600_000 && cfg.maxTurns === 30;
+  })());
 
   console.log(failures === 0 ? '\n全部通过\n' : `\n${failures} 项失败\n`);
   process.exit(failures === 0 ? 0 : 1);

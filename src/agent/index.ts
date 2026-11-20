@@ -29,10 +29,12 @@ import { GroupMemory } from './memory.js';
 import { CONTEXT_FOOTER, CONTEXT_HEADER, resolvePersona } from './persona.js';
 import { capabilitiesFor, describeTier, resolveTier, type PolicyConfig, type Tier } from './policy.js';
 import { RecordStore } from './records.js';
-import { GoalStore, canContinue, goalBrief, nextSlice, renderGoal } from './goals.js';
+import { GoalStore, canContinue, goalBrief, nextSlice, renderGoal, type Goal, type GoalSlice } from './goals.js';
 import { CnbClient, readCnbConfig } from './cnb.js';
 import { cleanQQText } from './text.js';
-import { parseBlacklist } from './exec.js';
+import { parseBlacklist, runCommand } from './exec.js';
+import { kindPack } from './kinds.js';
+import { renderHandoff, handoffPath, shouldRotateThread, writeHandoff } from './thread.js';
 import { executeTool, toolDefinitionsFor, type ToolContext } from './tools.js';
 
 import { Workspace } from './workspace.js';
@@ -122,6 +124,10 @@ export interface AgentConfig {
   thread: {
     /** 超过多少估算 token 就压缩一次。 */
     maxTokens: number;
+    /** 一段会话最多活多久：到点写交接单、换新链，不是停工。 */
+    maxAgeMs: number;
+    /** 一段会话最多几轮：到点同上。 */
+    maxTurns: number;
   };
   /**
    * 前几轮开思考，之后关掉。
@@ -212,6 +218,9 @@ export function readAgentConfig(env: NodeJS.ProcessEnv): AgentConfig {
     thinkingRounds: Number(env.AGENT_THINKING_ROUNDS ?? 2),
     thread: {
       maxTokens: Number(env.AGENT_THREAD_MAX_TOKENS ?? 60_000) || 60_000,
+      // 3 小时 / 30 轮：到点交接换会话，不降能力（Humanize 实测长会话 token 缩水 30%–45%）
+      maxAgeMs: Number(env.AGENT_THREAD_MAX_AGE_MS ?? 3 * 60 * 60 * 1000) || 0,
+      maxTurns: Number(env.AGENT_THREAD_MAX_TURNS ?? 30) || 0,
     },
     goals: {
       enabled: env.AGENT_GOAL_ENABLED !== 'false',
@@ -328,6 +337,8 @@ export interface ThreadState {
   /** 已经追进链里的最后一条群消息 id，下次只追加它之后的。 */
   lastMessageId?: string;
   turns: number;
+  /** 建链时间：到了 maxAgeMs 就交接换链。 */
+  bornAt: number;
 }
 
 /** 粗估 token：中文按 3 字/token 算，图按 2000 字等价。 */
@@ -793,7 +804,11 @@ export class ChatAgent {
     }
 
     const caps = capabilitiesFor(access.tier, this.config.policy);
-    const tools = toolDefinitionsFor(caps);
+    // 目标类型决定能力包：调研/运维/评审按需收窄工具面，code 拿全部
+    const goalForKind = chatId && this.config.goals.enabled
+      ? await this.goalStoreFor(chatId).read().catch(() => undefined)
+      : undefined;
+    const tools = toolDefinitionsFor(caps, goalForKind?.kind);
     const ctx: ToolContext = {
       dataRoot: this.config.dataRoot,
       // 私聊没有群 id，就搜全部历史，否则会一条都搜不到
@@ -809,6 +824,7 @@ export class ChatAgent {
       goals: this.config.goals.enabled ? this.goalStoreFor(chatId ?? 'direct') : undefined,
       cnb: caps.repoWrite ? this.cnb : undefined,
       speaker: access.speaker,
+      reviewSlice: (input) => this.reviewSlice(input),
     };
 
     const deadline = Date.now() + this.config.turnBudgetMs;
@@ -1291,6 +1307,82 @@ export class ChatAgent {
     }
   }
 
+  /**
+   * 独立复核：空上下文、温度 0，只给判据、切片说明、证据与仓库现状。
+   * 解析不出 PASS 一律按未过处理 —— 宁可退回 review 重做，不可假 done。
+   */
+  private async reviewSlice(input: {
+    goal: Goal;
+    slice: GoalSlice;
+    evidence?: string;
+  }): Promise<{ pass: boolean; note: string }> {
+    const { goal, slice } = input;
+    const snapshot = await this.repoSnapshot();
+    const payload = [
+      `目标：${goal.objective}`,
+      `类型：${kindPack(goal.kind).label}`,
+      `完成判据：\n${goal.criteria.map((item) => `- ${item}`).join('\n')}`,
+      `切片：${slice.id} ${slice.title}`,
+      slice.note ? `执行者说明：${slice.note}` : '',
+      slice.ref ? `出处：${slice.ref}` : '',
+      input.evidence ? `证据：\n${input.evidence.slice(0, 4000)}` : '证据：执行者没有提供',
+      snapshot ? `仓库现状：\n${snapshot}` : '',
+    ]
+      .filter(Boolean)
+      .join('\n\n');
+    const system =
+      '你是独立复核者：只按判据核对证据，不看执行者的自我评价。' +
+      '证据不足以证明判据满足时一律 FAIL。' +
+      '只输出两行：第一行 PASS 或 FAIL，第二行一句理由（指出缺哪条证据）。';
+    try {
+      const raw = await this.complete(
+        [
+          { role: 'system', content: system },
+          { role: 'user', content: payload },
+        ],
+        { ...this.config.llm, purpose: 'review', temperature: 0 },
+        1,
+      );
+      const lines = raw
+        .trim()
+        .split('\n')
+        .map((line) => line.trim())
+        .filter(Boolean);
+      const pass = /^PASS/i.test(lines[0] ?? '');
+      const note = (lines.slice(1).join(' ') || lines[0] || '无说明').slice(0, 300);
+      this.log.info('切片复核', { slice: slice.id, pass, note });
+      return { pass, note };
+    } catch (error) {
+      this.log.warn('切片复核失败，按未过处理', { slice: slice.id, error });
+      return { pass: false, note: '复核调用失败，按未过处理（重试或补证据）' };
+    }
+  }
+
+  /** 复核用的仓库现状：只看现状，不跑测试（测试结果由执行者当证据提供）。 */
+  private async repoSnapshot(): Promise<string> {
+    if (!this.workspace) {
+      return '';
+    }
+    try {
+      const result = await runCommand({
+        cmd: 'git status --short && git diff --stat && git log --oneline -3',
+        cwd: this.workspace.repoDir,
+        workspace: this.workspace.root,
+        tier: 'owner',
+        home: this.workspace.home,
+        limits: { timeoutMs: 15_000, maxBytes: 4_000 },
+      });
+      return [result.stdout, result.stderr]
+        .filter(Boolean)
+        .join('\n')
+        .trim()
+        .slice(0, 2000);
+    } catch (error) {
+      this.log.warn('取仓库现状失败', { error });
+      return '';
+    }
+  }
+
   /** 记下这次的开头词（前 1-3 个字）。 */
   private noteOpener(conversationId: string, text: string): void {
     const match = /^[\s「"'（(]*([^\s，。！？,.!?~～]{1,3})/.exec(text);
@@ -1661,9 +1753,12 @@ export class ChatAgent {
     if (this.config.goals.enabled) {
       const goal = await this.goalStoreFor(scope.isDirect ? 'direct' : scope.conversationId).read();
       if (goal && goal.status !== 'cancelled') {
+        const pack = kindPack(goal.kind);
         tailParts.push(
           `## 当前目标\n\n${goalBrief(goal)}\n\n` +
+            `这类活（${pack.label}）的干法与验收：\n${pack.prompt}\n\n` +
             '一轮只推一片：看清现状 → 做 → 自己验 → goal_step 标进度（done/review/blocked 都要一句结论与出处）。' +
+            '标 done 前会有一次独立复核，证据写进 evidence（测试输出、CI 结论、PR 链接），没证据会被退回。' +
             '所有切片都验过才 goal_finish；缺权限或等人拍板就 goal_block，别硬往下做。',
         );
       }
@@ -1732,7 +1827,54 @@ export class ChatAgent {
         messages: rest,
         lastMessageId,
         turns: (usable?.turns ?? 0) + 1,
+        bornAt: usable?.bornAt ?? Date.now(),
       };
+      // 会话寿命：到点不是停工，是写交接单后换一条新链（新链只带目标 + 最近几句）
+      const rotation = shouldRotateThread({
+        ...(usable ? { bornAt: usable.bornAt } : {}),
+        turns: next.turns,
+        maxAgeMs: this.config.thread.maxAgeMs,
+        maxTurns: this.config.thread.maxTurns,
+      });
+      if (rotation.rotate) {
+        const at = new Date();
+        const tail = rest
+          .slice(-6)
+          .map((item) => {
+            const body = typeof item.content === 'string' ? item.content : '[图片/多段内容]';
+            return `- ${item.role}: ${body.replace(/\s+/g, ' ').slice(0, 200)}`;
+          })
+          .join('\n');
+        const rel = handoffPath(threadKey, at);
+        const note =
+          `（上一段会话已交接：${rel}。${rotation.reason}，按交接单与记录本接着往下推，` +
+          '别重问我上面已经说过的事；缺信息就去看文件。）';
+        const store = this.config.goals.enabled ? this.goalStoreFor(threadKey) : undefined;
+        void (async () => {
+          const goal = await store?.read().catch(() => undefined);
+          const body = renderHandoff({
+            reason: rotation.reason ?? '到点交接',
+            turns: next.turns,
+            ...(goal ? { goalBrief: goalBrief(goal) } : {}),
+            tail,
+            at,
+          });
+          await writeHandoff(this.config.dataRoot, threadKey, body, at);
+        })().catch((error) => this.log.warn('交接单落盘失败', { conversationId: threadKey, error }));
+        this.log.info('会话交接', {
+          conversationId: threadKey,
+          reason: rotation.reason,
+          turns: next.turns,
+          handoff: rel,
+        });
+        next = {
+          system,
+          messages: [{ role: 'user', content: note }],
+          lastMessageId,
+          turns: 0,
+          bornAt: at.getTime(),
+        };
+      }
       const tokens = approxTokens(next.messages);
       if (tokens > this.config.thread.maxTokens) {
         const kept = next.messages.slice(-6);

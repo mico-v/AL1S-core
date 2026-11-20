@@ -14,7 +14,8 @@ import { renderHits as renderWebHits, searchWeb } from './web.js';
 import { renderRunResult, runCommand } from './exec.js';
 import type { Capabilities, Tier } from './policy.js';
 import { isKind, isStatus, type RecordStore } from './records.js';
-import { isSliceStatus, renderGoal, type GoalStore } from './goals.js';
+import { isSliceStatus, renderGoal, type Goal, type GoalSlice, type GoalStore } from './goals.js';
+import { filterToolsForKind, isGoalKind, type GoalKind } from './kinds.js';
 import { renderIssue, renderIssues, renderPulls, type CnbClient } from './cnb.js';
 import type { Workspace } from './workspace.js';
 
@@ -41,6 +42,15 @@ export interface ToolContext {
   cnb?: CnbClient;
   /** 说话人昵称，记条目时当 by。 */
   speaker?: string;
+  /**
+   * 独立复核：标 done 之前过一道。返回 pass=false 就把切片退回 review。
+   * 由 index.ts 接上（空上下文 + 只喂判据与证据）。
+   */
+  reviewSlice?: (input: {
+    goal: Goal;
+    slice: GoalSlice;
+    evidence?: string;
+  }) => Promise<{ pass: boolean; note: string }>;
 }
 
 /** 聊天类工具：任何身份都能用。 */
@@ -215,6 +225,11 @@ const GOAL_TOOLS: unknown[] = [
             items: { type: 'string' },
             description: '切片（一片一个 PR），按依赖顺序，最多 12 片',
           },
+          kind: {
+            type: 'string',
+            enum: ['code', 'research', 'ops', 'review'],
+            description: '活儿的类型：code 写代码 / research 调研 / ops 运维巡检 / review 评审（只读），默认 code',
+          },
         },
         required: ['objective', 'criteria', 'slices'],
       },
@@ -241,6 +256,10 @@ const GOAL_TOOLS: unknown[] = [
           status: { type: 'string', enum: ['todo', 'doing', 'review', 'done', 'blocked', 'dropped'] },
           note: { type: 'string', description: '一句话：改了什么、验了什么' },
           ref: { type: 'string', description: '出处：issue 号、PR 链接、commit' },
+          evidence: {
+            type: 'string',
+            description: '标 done 时的证据：测试输出、CI 结论、页面 hash、PR 链接（复核只认这个）',
+          },
         },
         required: ['status'],
       },
@@ -475,7 +494,7 @@ const REPO_WRITE_TOOLS: unknown[] = [
 ];
 
 /** 按能力集挑工具：模型看不到它用不了的工具，就不会去试。 */
-export function toolDefinitionsFor(caps: Capabilities): unknown[] {
+export function toolDefinitionsFor(caps: Capabilities, kind?: GoalKind): unknown[] {
   const tools: unknown[] = [...CHAT_TOOLS, ...RECORD_QUERY_TOOLS];
   if (caps.repoRead) {
     tools.push(...REPO_READ_TOOLS);
@@ -486,7 +505,8 @@ export function toolDefinitionsFor(caps: Capabilities): unknown[] {
   if (caps.repoWrite) {
     tools.push(...REPO_WRITE_TOOLS, ...CNB_TOOLS);
   }
-  return tools;
+  // 目标类型的能力包：code 不设白名单（全部给），调研/运维/评审按需收窄
+  return filterToolsForKind(tools, kind);
 }
 
 /** 兼容旧引用：没给能力集时就是聊天工具。 */
@@ -869,6 +889,7 @@ async function executeToolInner(name: string, rawArgs: string, ctx: ToolContext)
           objective: asString(args.objective),
           criteria: arrayOf(args.criteria) ?? [],
           slices: arrayOf(args.slices) ?? [],
+          ...(isGoalKind(args.kind) ? { kind: args.kind } : {}),
           ...(ctx.speaker ? { by: ctx.speaker } : {}),
         },
         { maxRounds: 12, maxWallMs: 4 * 60 * 60 * 1000 },
@@ -888,6 +909,26 @@ async function executeToolInner(name: string, rawArgs: string, ctx: ToolContext)
       const status = args.status;
       if (!isSliceStatus(status)) {
         return 'status 只能是 todo / doing / review / done / blocked / dropped。';
+      }
+      // 标 done 前先过独立复核：同一条会话里自评自判等于没审
+      if (status === 'done' && ctx.reviewSlice) {
+        const goal = await ctx.goals.read();
+        const slice = goal ? await ctx.goals.sliceByKey(asString(args.slice) || (goal.slices.find((s) => s.status === 'doing')?.id ?? '')) : undefined;
+        if (goal && slice) {
+          const review = await ctx.reviewSlice({
+            goal,
+            slice,
+            ...(asString(args.evidence) ? { evidence: asString(args.evidence) } : {}),
+          });
+          await ctx.goals.saveReview(slice.id, review);
+          if (!review.pass) {
+            const back = await ctx.goals.step(slice.id, 'review', {
+              note: `复核未过：${review.note}`.slice(0, 400),
+              ...(ctx.speaker ? { by: ctx.speaker } : {}),
+            });
+            return `复核没过：${review.note}\n已退回 review，改完把证据写进 evidence 再标 done。\n${back}`;
+          }
+        }
       }
       return await ctx.goals.step(asString(args.slice), status, {
         ...(asString(args.note) ? { note: asString(args.note) } : {}),

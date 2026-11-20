@@ -15,6 +15,7 @@
 import { existsSync } from 'node:fs';
 import { mkdir, readFile, rename, writeFile } from 'node:fs/promises';
 import path from 'node:path';
+import { isGoalKind, kindPack, type GoalKind } from './kinds.js';
 
 export const SLICE_STATUSES = ['todo', 'doing', 'review', 'done', 'blocked', 'dropped'] as const;
 export type SliceStatus = (typeof SLICE_STATUSES)[number];
@@ -60,6 +61,8 @@ export interface GoalBudget {
 export interface Goal {
   id: string;
   objective: string;
+  /** 活儿的类型：决定提示词与能力包（code / research / ops / review）。 */
+  kind?: GoalKind;
   criteria: string[];
   slices: GoalSlice[];
   status: GoalStatus;
@@ -179,6 +182,7 @@ export interface GoalCreateInput {
   objective: string;
   criteria: string[];
   slices: Array<string | { title: string; id?: string }>;
+  kind?: GoalKind;
   by?: string;
   maxRounds?: number;
   maxWallMs?: number;
@@ -186,9 +190,11 @@ export interface GoalCreateInput {
 
 export class GoalStore {
   readonly file: string;
+  readonly groupId: string;
 
   constructor(dataRoot: string, groupId: string) {
-    this.file = path.join(dataRoot, 'goals', `${safeGroup(groupId)}.json`);
+    this.groupId = safeGroup(groupId);
+    this.file = path.join(dataRoot, 'goals', `${this.groupId}.json`);
   }
 
   async read(): Promise<Goal | undefined> {
@@ -234,6 +240,7 @@ export class GoalStore {
     const goal: Goal = {
       id: newGoalId(at),
       objective,
+      ...(isGoalKind(input.kind) ? { kind: input.kind } : {}),
       criteria,
       slices,
       status: 'active',
@@ -250,6 +257,21 @@ export class GoalStore {
     };
     await this.save(goal);
     return renderGoal(goal);
+  }
+
+  /** 按 id / 序号 / 标题片段找切片；找不到返回 undefined。 */
+  sliceByKey(key: string): Promise<GoalSlice | undefined> {
+    return this.read().then((goal) => (goal ? this.resolveSlice(goal, key) : undefined));
+  }
+
+  /** 复核结果落盘：data/reviews/<群>/<切片>-<时间>.json，只追加不改历史。 */
+  async saveReview(sliceId: string, review: { pass: boolean; note: string; model?: string }): Promise<string> {
+    const dir = path.join(path.dirname(path.dirname(this.file)), 'reviews', safeGroup(this.groupId));
+    const at = nowIso();
+    const file = path.join(dir, `${sliceId}-${at.replace(/[:.]/g, '-')}.json`);
+    await mkdir(dir, { recursive: true });
+    await writeFile(file, `${JSON.stringify({ at, slice: sliceId, ...review }, null, 2)}\n`, 'utf8');
+    return file;
   }
 
   /** 按 id / 序号 / 标题片段找切片；找不到返回 undefined。 */
@@ -473,7 +495,7 @@ export function renderGoal(goal: Goal): string {
     })
     .join('\n');
   return [
-    `目标 ${goal.id} · 状态 ${goal.status} · 进度 ${goalProgress(goal)} · 自动续跑 ${
+    `目标 ${goal.id} · 类型 ${kindPack(goal.kind).label} · 状态 ${goal.status} · 进度 ${goalProgress(goal)} · 自动续跑 ${
       goal.budget.maxRounds > 0 ? `${goal.budget.rounds}/${goal.budget.maxRounds}` : `${goal.budget.rounds}（不限轮数）`
     }`,
     goal.objective,
@@ -487,7 +509,7 @@ export function renderGoal(goal: Goal): string {
 export function goalBrief(goal: Goal): string {
   const next = nextSlice(goal);
   const lines = [
-    `目标：${goal.objective.slice(0, 200)}`,
+    `目标（${kindPack(goal.kind).label}）：${goal.objective.slice(0, 200)}`,
     `状态 ${goal.status} · 进度 ${goalProgress(goal)} · 自动续跑 ${
       goal.budget.maxRounds > 0 ? `${goal.budget.rounds}/${goal.budget.maxRounds}` : `${goal.budget.rounds}（不限轮数）`
     }`,
