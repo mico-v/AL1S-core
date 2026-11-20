@@ -1080,63 +1080,69 @@ export class ChatAgent {
    * 目的不是让它自己无限干活，而是让长活跨过上下文窗口不断线 ——
    * 所以轮数与墙钟都由预算管，到点就停，等人接手。
    */
-  private scheduleGoalTick(scope: Scope, bot: Bot): void {
+  private async scheduleGoalTick(scope: Scope, bot: Bot): Promise<boolean> {
     if (!this.config.goals.enabled || !this.config.goals.auto || scope.isDirect) {
-      return;
+      return false;
     }
     const chatId = scope.conversationId;
     if (!this.config.policy.devGroups.includes(chatId)) {
-      return;
+      return false;
     }
     if (this.goalTimers.has(chatId) || this.goalRunning.has(chatId)) {
-      return;
+      return false;
     }
     const store = this.goalStoreFor(chatId);
-    void (async () => {
-      const goal = await store.read();
-      if (!goal) {
-        return;
+    const goal = await store.read();
+    if (!goal) {
+      return false;
+    }
+    const verdict = canContinue(goal, {
+      maxRounds: this.config.goals.maxRounds,
+      maxWallMs: this.config.goals.maxWallMs,
+    });
+    if (!verdict.ok) {
+      // 同一个理由不要每 2 分钟刷一遍（之前一天几百行「不续跑」就是这么来的）
+      if (this.goalStopReason.get(chatId) !== verdict.reason) {
+        this.log.info('不续跑', { conversationId: chatId, reason: verdict.reason });
+        this.goalStopReason.set(chatId, verdict.reason ?? '');
       }
-      const verdict = canContinue(goal, {
-        maxRounds: this.config.goals.maxRounds,
-        maxWallMs: this.config.goals.maxWallMs,
-      });
-      if (!verdict.ok) {
-        // 同一个理由不要每 2 分钟刷一遍（之前一天几百行「不续跑」就是这么来的）
-        if (this.goalStopReason.get(chatId) !== verdict.reason) {
-          this.log.info('不续跑', { conversationId: chatId, reason: verdict.reason });
-          this.goalStopReason.set(chatId, verdict.reason ?? '');
-        }
-        // 预算用满就停，但必须说一句 —— 不然群里看到的就是「干到一半人没了」
-        if (!this.goalNotices.has(goal.id) && /用满|墙钟/.test(verdict.reason ?? '')) {
-          this.goalNotices.add(goal.id);
-          void this
-            .deliver(
-              bot,
-              scope.replyTarget,
-              `⏸ ${verdict.reason}，目标「${goal.objective.slice(0, 40)}…」先停在这。回 /goal resume 我就续上（预算重置）。`,
-            )
-            .catch((error) => this.log.warn('停跑提示发送失败', { conversationId: chatId, error }));
-        }
-        return;
+      // 预算用满就转 paused：留在 active 会被巡检每 2 分钟捞起来空转，日志看着像在干活
+      const exhausted = /用满|墙钟/.test(verdict.reason ?? '');
+      if (exhausted) {
+        await store.pause(verdict.reason ?? '预算用满').catch((error) => {
+          this.log.warn('目标转 paused 失败', { conversationId: chatId, error });
+        });
       }
-      if (this.goalTimers.has(chatId) || this.goalRunning.has(chatId)) {
-        return;
+      // 必须说一句 —— 不然群里看到的就是「干到一半人没了」
+      if (exhausted && !this.goalNotices.has(goal.id)) {
+        this.goalNotices.add(goal.id);
+        void this
+          .deliver(
+            bot,
+            scope.replyTarget,
+            `⏸ ${verdict.reason}，目标「${goal.objective.slice(0, 40)}…」先停在这。回 /goal resume 我就续上（预算重置）。`,
+          )
+          .catch((error) => this.log.warn('停跑提示发送失败', { conversationId: chatId, error }));
       }
-      const timer = setTimeout(() => {
-        this.goalTimers.delete(chatId);
-        void this.goalWake(scope, bot).catch((error) =>
-          this.log.warn('自动续跑失败', { conversationId: chatId, error }),
-        );
-      }, this.config.goals.gapMs);
-      timer.unref();
-      this.goalTimers.set(chatId, timer);
-      this.log.info('安排自动续跑', {
-        conversationId: chatId,
-        gapMs: this.config.goals.gapMs,
-        slice: nextSlice(goal)?.id,
-      });
-    })();
+      return false;
+    }
+    if (this.goalTimers.has(chatId) || this.goalRunning.has(chatId)) {
+      return false;
+    }
+    const timer = setTimeout(() => {
+      this.goalTimers.delete(chatId);
+      void this.goalWake(scope, bot).catch((error) =>
+        this.log.warn('自动续跑失败', { conversationId: chatId, error }),
+      );
+    }, this.config.goals.gapMs);
+    timer.unref();
+    this.goalTimers.set(chatId, timer);
+    this.log.info('安排自动续跑', {
+      conversationId: chatId,
+      gapMs: this.config.goals.gapMs,
+      slice: nextSlice(goal)?.id,
+    });
+    return true;
   }
 
   /**
@@ -1168,12 +1174,12 @@ export class ChatAgent {
       probe = await this.cnb.probeIssue(awaiting.issue);
     } catch (error) {
       this.log.warn('CNB 探针失败，下一跳再试', { conversationId: chatId, issue: awaiting.issue, error });
-      this.scheduleGoalTick(scope, bot);
+      void this.scheduleGoalTick(scope, bot);
       return;
     }
     if (probe.sig === awaiting.sig) {
       this.log.info('NPC 还没动，继续等', { conversationId: chatId, issue: awaiting.issue });
-      this.scheduleGoalTick(scope, bot);
+      void this.scheduleGoalTick(scope, bot);
       return;
     }
     this.log.info('NPC 有动静，叫醒', { conversationId: chatId, issue: awaiting.issue });
@@ -1206,8 +1212,10 @@ export class ChatAgent {
         isDirect: false,
         replyTarget: { scope: 'group', targetId: chatId },
       };
-      this.scheduleGoalTick(scope, bot);
-      resumed += 1;
+      // 只有真排上定时器才算接上；预算已用满的群在这里返回 false，不再假报「已接上」
+      if (await this.scheduleGoalTick(scope, bot)) {
+        resumed += 1;
+      }
     }
     return resumed;
   }
@@ -1260,7 +1268,7 @@ export class ChatAgent {
     } finally {
       this.goalRunning.delete(chatId);
       if (keepGoing) {
-        this.scheduleGoalTick(scope, bot);
+        void this.scheduleGoalTick(scope, bot);
       }
     }
   }
@@ -1806,7 +1814,7 @@ export class ChatAgent {
       });
       await send(reply);
       // 回合结束：还有目标就安排下一轮自动续跑（人一插话就会被取消）
-      this.scheduleGoalTick(scope, bot);
+      void this.scheduleGoalTick(scope, bot);
     } catch (error) {
       // 自动续跑失败不发「我卡住了」：下一跳会自己重试，群里只看到一堆广播反而更吓人。
       const autoTick = (message.messageId ?? '').startsWith('goal-');

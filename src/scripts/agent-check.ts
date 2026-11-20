@@ -1103,6 +1103,22 @@ async function main(): Promise<void> {
     check('done 后不再续跑', (await store.tick({ maxRounds: 5, maxWallMs: 3_600_000 }))?.ok === false);
 
     const blockedStore = new GoalStore(goalTmp, 'G2');
+    // 预算用尽要转 paused：留在 active 会被巡检每 2 分钟捞起来空转，日志看着像在干活
+    const pauseStore = new GoalStore(goalTmp, 'G4');
+    await pauseStore.create({ objective: '预算用尽测试', criteria: ['跑完'], slices: ['一片'] }, { maxRounds: 1, maxWallMs: 3_600_000 });
+    await pauseStore.tick({ maxRounds: 1, maxWallMs: 3_600_000 });
+    const exhausted = await pauseStore.read();
+    check(
+      '用满后 canContinue 拒续跑',
+      exhausted ? !canContinue(exhausted, { maxRounds: 1, maxWallMs: 3_600_000 }).ok : false,
+    );
+    check(
+      '预算用尽转 paused',
+      (await pauseStore.pause('自动续跑轮数用满（1/1）')) === true &&
+        (await pauseStore.read())?.status === 'paused',
+    );
+    check('paused 不重复转', (await pauseStore.pause('再来一次')) === false);
+    check('paused 后不再续跑', (await pauseStore.tick({ maxRounds: 9, maxWallMs: 3_600_000 }))?.ok === false);
     await blockedStore.create({ objective: '等主人拍板', criteria: ['确认'], slices: ['问主人'] }, { maxRounds: 3, maxWallMs: 60_000 });
     check(
       '卡住后自动续跑停',

@@ -374,6 +374,20 @@ export class GoalStore {
     return '目标已取消，自动续跑停止。';
   }
 
+  /** 预算用尽：转 paused。只改状态，说不说由调用方决定；/goal resume 可续。 */
+  async pause(reason: string): Promise<boolean> {
+    const goal = await this.read();
+    if (!goal || goal.status !== 'active') {
+      return false;
+    }
+    goal.status = 'paused';
+    goal.updatedAt = nowIso();
+    goal.log.push({ at: goal.updatedAt, text: `自动续跑暂停：${clip(reason, 200)}` });
+    goal.log = goal.log.slice(-80);
+    await this.save(goal);
+    return true;
+  }
+
   async resume(): Promise<string> {
     const goal = await this.read();
     if (!goal) {
