@@ -1119,6 +1119,24 @@ async function main(): Promise<void> {
     );
     check('paused 不重复转', (await pauseStore.pause('再来一次')) === false);
     check('paused 后不再续跑', (await pauseStore.tick({ maxRounds: 9, maxWallMs: 3_600_000 }))?.ok === false);
+
+    // 有进展就续命：配额是异常保护，不是给 agent 上锁
+    const renewStore = new GoalStore(goalTmp, 'G5');
+    await renewStore.create({ objective: '续命测试', criteria: ['跑完'], slices: ['一片'] }, { maxRounds: 1, maxWallMs: 3_600_000 });
+    await renewStore.tick({ maxRounds: 1, maxWallMs: 3_600_000 });
+    check('没进展时计空转轮数', (await renewStore.read())?.budget.roundsSinceProgress === 1);
+    await renewStore.step('s1', 'doing', { note: '开工' });
+    check('切片一动手就算有进展', (await renewStore.read())?.budget.roundsSinceProgress === 0);
+    const renews = await renewStore.renew('轮数用满，但上一段有进展');
+    const renewed = await renewStore.read();
+    check(
+      '续命后预算重置',
+      renews === 1 && renewed?.budget.rounds === 0 && renewed?.budget.renews === 1,
+    );
+    check(
+      '续命后能继续跑',
+      renewed ? canContinue(renewed, { maxRounds: 1, maxWallMs: 3_600_000 }).ok : false,
+    );
     await blockedStore.create({ objective: '等主人拍板', criteria: ['确认'], slices: ['问主人'] }, { maxRounds: 3, maxWallMs: 60_000 });
     check(
       '卡住后自动续跑停',
@@ -1138,6 +1156,15 @@ async function main(): Promise<void> {
     check('简报提示在等 NPC', watched ? goalBrief(watched).includes('在等 #21') : false);
     await watchStore.clearWatch('指纹变了');
     check('叫醒后探针自动解除', (await watchStore.read())?.awaiting === undefined);
+
+    // 等 NPC 时切片全是 blocked，但探针还挂着：不能判「没活干」把线断掉
+    const probeStore = new GoalStore(goalTmp, 'G6');
+    await probeStore.create({ objective: '等 NPC 交货', criteria: ['PR 合入'], slices: ['派工', '复核'] }, { maxRounds: 0, maxWallMs: 3_600_000 });
+    await probeStore.step('s1', 'blocked');
+    await probeStore.step('s2', 'blocked');
+    check('切片全 blocked 就不续跑', (await probeStore.read()) ? !canContinue((await probeStore.read())!, {}).ok : false);
+    await probeStore.watch(20, 'sig-1', '等 PR');
+    check('挂探针后允许续跑（只探针不烧回合）', (await probeStore.read()) ? canContinue((await probeStore.read())!, {}).ok : false);
   } finally {
     await rm(goalTmp, { recursive: true, force: true });
   }

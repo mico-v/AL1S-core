@@ -1101,15 +1101,33 @@ export class ChatAgent {
       maxWallMs: this.config.goals.maxWallMs,
     });
     if (!verdict.ok) {
+      const exhausted = /用满|墙钟/.test(verdict.reason ?? '');
+      const stalled = goal.budget.roundsSinceProgress ?? 0;
+      // 预算到点但上一段确实有推进：续命接着干。配额是异常保护，不是给 agent 上锁。
+      if (exhausted && stalled === 0 && nextSlice(goal)) {
+        const renews = await store.renew(`${verdict.reason}，但上一段有进展`).catch(() => 0);
+        this.log.info('预算到点但有进展，续命继续', {
+          conversationId: chatId,
+          renews,
+          reason: verdict.reason,
+        });
+        void this
+          .deliver(
+            bot,
+            scope.replyTarget,
+            `🔁 ${verdict.reason}，但上一段有推进，续命接着干（第 ${renews} 次）。`,
+          )
+          .catch((error) => this.log.warn('续命提示发送失败', { conversationId: chatId, error }));
+        return this.scheduleGoalTick(scope, bot);
+      }
       // 同一个理由不要每 2 分钟刷一遍（之前一天几百行「不续跑」就是这么来的）
       if (this.goalStopReason.get(chatId) !== verdict.reason) {
-        this.log.info('不续跑', { conversationId: chatId, reason: verdict.reason });
+        this.log.info('不续跑', { conversationId: chatId, reason: verdict.reason, stalled });
         this.goalStopReason.set(chatId, verdict.reason ?? '');
       }
-      // 预算用满就转 paused：留在 active 会被巡检每 2 分钟捞起来空转，日志看着像在干活
-      const exhausted = /用满|墙钟/.test(verdict.reason ?? '');
+      // 没进展才停：留在 active 会被巡检每 2 分钟捞起来空转，日志看着像在干活
       if (exhausted) {
-        await store.pause(verdict.reason ?? '预算用满').catch((error) => {
+        await store.pause(`连续 ${stalled} 轮没有新进展（${verdict.reason}）`).catch((error) => {
           this.log.warn('目标转 paused 失败', { conversationId: chatId, error });
         });
       }
@@ -1120,7 +1138,7 @@ export class ChatAgent {
           .deliver(
             bot,
             scope.replyTarget,
-            `⏸ ${verdict.reason}，目标「${goal.objective.slice(0, 40)}…」先停在这。回 /goal resume 我就续上（预算重置）。`,
+            `⏸ 连续 ${stalled} 轮没有新进展（${verdict.reason}），先停在这。回 /goal resume 我就续上（预算重置）；要换方向就 goal_step 改切片。`,
           )
           .catch((error) => this.log.warn('停跑提示发送失败', { conversationId: chatId, error }));
       }

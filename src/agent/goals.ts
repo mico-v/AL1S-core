@@ -44,12 +44,17 @@ export interface GoalLogEntry {
 export interface GoalBudget {
   /** 已经自动续跑了几轮。 */
   rounds: number;
-  /** 上限：到点就停，等人接手。 */
+  /** 一段预算内的轮数上限：到点不是停，而是看有没有进展（见 renew）。 */
   maxRounds: number;
-  /** 第一次开始的时间，用来算墙钟预算。 */
+  /** 这一段预算的起始时间，用来算墙钟。 */
   startedAt: string;
   maxWallMs: number;
   lastTickAt?: string;
+  /** 距离上一次切片状态变化跑了几轮：0 = 刚有进展，>0 = 在空转。 */
+  roundsSinceProgress?: number;
+  /** 续命次数（预算到点但有进展时自动续），只用于观测。 */
+  renews?: number;
+  lastProgressAt?: string;
 }
 
 export interface Goal {
@@ -115,6 +120,10 @@ export function canContinue(
     return { ok: false, reason: `超出墙钟预算（${Math.round(maxWallMs / 60000)} 分钟）` };
   }
   if (!nextSlice(goal)) {
+    // 挂着探针 = 在等外部交货：探针只读两个接口，不烧回合，别把它当「没活干」停掉
+    if (goal.awaiting) {
+      return { ok: true };
+    }
     return { ok: false, reason: '没有待推进的切片' };
   }
   return { ok: true };
@@ -281,6 +290,11 @@ export class GoalStore {
       slice.ref = clip(options.ref, 300);
     }
     goal.updatedAt = nowIso();
+    // 切片真变了才算进展：续跑闸门看的是这个，不是轮数
+    if (goal.budget) {
+      goal.budget.roundsSinceProgress = 0;
+      goal.budget.lastProgressAt = goal.updatedAt;
+    }
     const line = `${slice.id} ${slice.title} → ${status}${options.ref ? `（${options.ref}）` : ''}`;
     goal.log.push({ at: goal.updatedAt, text: line, ...(options.by ? { by: options.by } : {}) });
     goal.log = goal.log.slice(-80);
@@ -374,6 +388,22 @@ export class GoalStore {
     return '目标已取消，自动续跑停止。';
   }
 
+  /** 预算到点但有进展：开新的一段，而不是停下等人。 */
+  async renew(reason: string): Promise<number> {
+    const goal = await this.read();
+    if (!goal) {
+      return 0;
+    }
+    goal.budget.rounds = 0;
+    goal.budget.startedAt = nowIso();
+    goal.budget.renews = (goal.budget.renews ?? 0) + 1;
+    goal.updatedAt = goal.budget.startedAt;
+    goal.log.push({ at: goal.updatedAt, text: `续命（第 ${goal.budget.renews} 次）：${clip(reason, 200)}` });
+    goal.log = goal.log.slice(-80);
+    await this.save(goal);
+    return goal.budget.renews;
+  }
+
   /** 预算用尽：转 paused。只改状态，说不说由调用方决定；/goal resume 可续。 */
   async pause(reason: string): Promise<boolean> {
     const goal = await this.read();
@@ -416,6 +446,7 @@ export class GoalStore {
       return { goal, ok: false, reason: verdict.reason };
     }
     goal.budget.rounds += 1;
+    goal.budget.roundsSinceProgress = (goal.budget.roundsSinceProgress ?? 0) + 1;
     goal.budget.lastTickAt = nowIso();
     goal.updatedAt = goal.budget.lastTickAt;
     goal.log.push({ at: goal.updatedAt, text: `自动续跑第 ${goal.budget.rounds} 轮` });
