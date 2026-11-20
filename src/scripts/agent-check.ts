@@ -1424,7 +1424,7 @@ async function main(): Promise<void> {
       createdAt: Date.now(),
       by: '謎矢',
     };
-    const keyboard = buildChoiceKeyboard(choice, { ownerOpenids: ['OWNER1'] }) as unknown as {
+    const keyboard = buildChoiceKeyboard(choice, { restrictTo: ['OWNER1'] }) as unknown as {
       content: { rows: Array<{ buttons: Array<Record<string, unknown>> }> };
     };
     check('一行一个按钮', keyboard.content.rows.length === 2);
@@ -1434,6 +1434,10 @@ async function main(): Promise<void> {
     check('同组按钮互斥变灰', first.group_id === `choice-${token}`);
     check('data 带序号', first.action.data === encodeChoiceData(token, 0));
     check('有过低版本兜底文案', typeof first.action.unsupport_tips === 'string');
+    const open = buildChoiceKeyboard(choice) as unknown as {
+      content: { rows: Array<{ buttons: Array<Record<string, any>> }> };
+    };
+    check('不知道限谁时就不限（服务端再拦）', open.content.rows[0]?.buttons[0]?.action.permission.type === 2);
     const card = renderChoiceMarkdown(choice);
     check('正文带问题', card.includes('先推哪块'));
     check('正文带编号选项与细节', card.includes('1. 先做 M2：室内与双模') && card.includes('2. 先补 UGC'));

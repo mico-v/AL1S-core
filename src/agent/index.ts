@@ -658,6 +658,13 @@ export class ChatAgent {
   private readonly goalStores = new Map<string, GoalStore>();
   /** 待选选项卡片（按钮），按会话分开。 */
   private readonly choiceStores = new Map<string, ChoiceStore>();
+  /**
+   * 每个群里「主人 / 开发成员」的 member_openid。
+   *
+   * 群里的 id 是 member_openid，和单聊的 user_openid 不是同一个值；
+   * 只能从「已经认出来的人说过话」里学，学不到就不限按钮、靠 tier 拦。
+   */
+  private readonly ownerIdsByChat = new Map<string, Set<string>>();
   /** 待执行的自动续跑定时器（每群最多一个）。 */
   private readonly goalTimers = new Map<string, NodeJS.Timeout>();
   /** 正在跑自动续跑的群，防止重入。 */
@@ -1151,9 +1158,13 @@ export class ChatAgent {
       ? { scope: 'group', targetId: groupOpenid }
       : { scope: 'c2c', targetId: userOpenid }) as unknown as Parameters<Bot['replyText']>[0];
 
-    // 按钮上已经限了指定用户，这里再挡一道：群里别人点了不算主人的决定
-    if (this.config.ownerOpenids.length > 0 && !this.config.ownerOpenids.includes(clicker)) {
-      this.log.info('选项卡片被非主人点击，忽略', {
+    // 谁能点：单聊就是卡片发过去的那个会话；群里按权限档（主人 / 开发成员）算，
+    // 群友点了不算数 —— 按钮上可能已经限了指定用户，这里再挡一道。
+    const authorized = groupOpenid
+      ? resolveTier(clicker, groupOpenid, this.config.policy) !== 'guest'
+      : `dm:${clicker}` === `dm:${userOpenid}`;
+    if (!authorized) {
+      this.log.info('选项卡片被无权限的人点击，忽略', {
         chatId,
         clicker: clicker.slice(0, 8),
       });
@@ -1869,6 +1880,18 @@ export class ChatAgent {
       scope.isDirect ? undefined : scope.conversationId,
       this.config.policy,
     );
+    // 顺手学一下「这个群里谁是自己人」：群里的 member_openid 和单聊 openid 不是一个值，
+    // 选项卡片的按钮要限人时只能靠这个表（学不到就不限，服务端 tier 再拦）
+    if (tier !== 'guest' && !scope.isDirect && message.senderId) {
+      let known = this.ownerIdsByChat.get(scope.conversationId);
+      if (!known) {
+        known = new Set<string>();
+        this.ownerIdsByChat.set(scope.conversationId, known);
+      }
+      if (known.size < 8) {
+        known.add(message.senderId);
+      }
+    }
     parts.push(`## 你的身份与边界\n\n${describeTier(tier)}`);
     if (tier !== 'guest' && this.workspace) {
       parts.push(
@@ -2146,11 +2169,16 @@ export class ChatAgent {
       const store = this.choiceStoreFor(scope.conversationId);
       await store.add(choice);
       const card = renderChoiceMarkdown(choice);
+      // 群里的按钮只能限「已知的这个人在这群的 member_openid」；还不知道就不限，
+      // 靠 handleChoice 里的 tier 再拦一道（宁可多一步校验，不要错认别人的选择）
+      const restrictTo = scope.isDirect
+        ? []
+        : [...(this.ownerIdsByChat.get(scope.conversationId) ?? [])];
       try {
         await bot.pushMarkdown(
           scope.replyTarget,
           card,
-          buildChoiceKeyboard(choice, { ownerOpenids: this.config.ownerOpenids }),
+          buildChoiceKeyboard(choice, { restrictTo }),
         );
       } catch (error) {
         await store.take(token).catch(() => undefined);

@@ -78,15 +78,22 @@ export function clipLabel(label: string, max = MAX_LABEL_CHARS): string {
 }
 
 /**
- * 造键盘：每个选项一行，权限只给主人。
+ * 造键盘：每个选项一行。
  *
- * `permission.type=0` + `specify_user_ids`：群里其他人点了只会弹「没有权限」，
- * 不会把别人的选择当成主人的决定。
+ * `restrictTo` 给了就限指定用户点（群里只能给到「主人在这群的 member_openid」）；
+ * 没给就所有人可点 —— 单聊里就对方一个人，无所谓；群里则靠服务端 tier 再拦一道。
+ *
+ * `group_id` 让同一组按钮点一个其余变灰（仅 `action.type=1` 有效）。
  */
 export function buildChoiceKeyboard(
   choice: PendingChoice,
-  opts: { ownerOpenids: string[] },
+  opts: { restrictTo?: string[] } = {},
 ): InlineKeyboard {
+  const restrictTo = (opts.restrictTo ?? []).filter(Boolean);
+  const permission =
+    restrictTo.length > 0
+      ? { type: 0, specify_user_ids: restrictTo }
+      : { type: 2 };
   const buttons = choice.options.slice(0, MAX_CHOICE_OPTIONS).map((option, index) => {
     const label = clipLabel(option.label);
     const button: Record<string, unknown> = {
@@ -99,10 +106,7 @@ export function buildChoiceKeyboard(
       },
       action: {
         type: 1,
-        permission: {
-          type: 0,
-          specify_user_ids: opts.ownerOpenids,
-        },
+        permission,
         data: encodeChoiceData(choice.token, index),
         unsupport_tips: '当前版本不支持按钮，直接回我一句选哪个',
       },
