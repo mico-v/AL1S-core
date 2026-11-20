@@ -7,6 +7,7 @@
  *   - / 开头的消息是别的机器人的命令，直接忽略。
  */
 
+import { createHash } from 'node:crypto';
 import type { QQBotInboundMessage } from '@tencent-connect/qqbot-nodejs';
 import type { Bot } from '../bot.js';
 import type { AppLogger } from '../logger.js';
@@ -339,6 +340,13 @@ export interface ThreadState {
   turns: number;
   /** 建链时间：到了 maxAgeMs 就交接换链。 */
   bornAt: number;
+  /** 上一轮尾部简报的指纹：没变就不重念（重念=每轮多烧一份未命中的新 token）。 */
+  tailSig?: string;
+}
+
+/** 尾部简报的指纹：只用来判断「跟上轮一模一样吗」，不参与语义。 */
+export function digestOf(text: string): string {
+  return createHash('sha1').update(text).digest('hex').slice(0, 16);
 }
 
 /** 粗估 token：中文按 3 字/token 算，图按 2000 字等价。 */
@@ -1119,6 +1127,28 @@ export class ChatAgent {
     if (!verdict.ok) {
       const exhausted = /用满|墙钟/.test(verdict.reason ?? '');
       const stalled = goal.budget.roundsSinceProgress ?? 0;
+      // 探针挂在非 active 目标上 = 永远不会被叫醒（2026-11-20 实测停摆一小时）。
+      // 自动续跑只认 active，所以这里必须出声，不能只写日志。
+      if (goal.awaiting && goal.status !== 'active') {
+        const key = `orphan:${goal.id}:${goal.awaiting.issue}`;
+        if (!this.goalNotices.has(key)) {
+          this.goalNotices.add(key);
+          this.log.warn('探针挂在非 active 目标上，不会被叫醒', {
+            conversationId: chatId,
+            status: goal.status,
+            issue: goal.awaiting.issue,
+          });
+          void this
+            .deliver(
+              bot,
+              scope.replyTarget,
+              `⚠ 我把 #${goal.awaiting.issue} 的探针挂在了${goal.status}的目标 ${goal.id} 上 —— ` +
+                '自动续跑只跑 active 目标，所以它不会叫醒我。要接着干就 /goal resume，' +
+                '或者让我 goal_create 立个新目标。',
+            )
+            .catch((error) => this.log.warn('探针告警发送失败', { conversationId: chatId, error }));
+        }
+      }
       // 预算到点但上一段确实有推进：续命接着干。配额是异常保护，不是给 agent 上锁。
       if (exhausted && stalled === 0 && nextSlice(goal)) {
         const renews = await store.renew(`${verdict.reason}，但上一段有进展`).catch(() => 0);
@@ -1750,10 +1780,16 @@ export class ChatAgent {
     }
 
     // 当前目标：长活的切片账本。每轮只推一片，不然会一口气做完就断在半路。
+    // 只念 active / paused 的：done 的目标再念一遍只会把「在等 #N」这种陈旧探针带进上下文。
+    let goalLine = '';
     if (this.config.goals.enabled) {
       const goal = await this.goalStoreFor(scope.isDirect ? 'direct' : scope.conversationId).read();
-      if (goal && goal.status !== 'cancelled') {
+      if (goal && (goal.status === 'active' || goal.status === 'paused')) {
         const pack = kindPack(goal.kind);
+        const next = nextSlice(goal);
+        goalLine = next
+          ? `目标 ${goal.id}（${goal.status}）下一片 ${next.id} ${next.title}`
+          : `目标 ${goal.id}（${goal.status}）没有待推进的切片`;
         tailParts.push(
           `## 当前目标\n\n${goalBrief(goal)}\n\n` +
             `这类活（${pack.label}）的干法与验收：\n${pack.prompt}\n\n` +
@@ -1778,7 +1814,6 @@ export class ChatAgent {
     const system = [resolvePersona(scope.isDirect ? undefined : scope.conversationId, this.config.dataRoot), ...parts].join(
       '\n\n---\n\n',
     );
-    const tailBlock = tailParts.length > 0 ? `${tailParts.join('\n\n')}\n\n` : '';
 
     // 跨回合会话链：同一会话不再每轮从头重建，而是追加推进 ——
     // 前缀一字不差才能命中 provider 的 KV 缓存（Codex 的 history 也是 append-only）。
@@ -1791,6 +1826,17 @@ export class ChatAgent {
     const prior = usable ? usable.messages : [];
     const deltaLines = delta ?? pending;
     const history = renderBuffer(deltaLines);
+
+    // 记录本 / 目标 / 成员档案每轮都贴一遍，等于每轮白烧 1.5~2k 未命中的 token，
+    // 首调命中就是这么被拖到 80% 的。只在内容变了才重念，没变就一句「见上文」。
+    const tailSig = digestOf([...tailParts, remembered ?? ''].join('\u0000'));
+    const hasTail = tailParts.length > 0 || Boolean(remembered);
+    const repeat = hasTail && usable !== undefined && usable.tailSig === tailSig;
+    const tailBlock = !hasTail
+      ? ''
+      : repeat
+        ? `## 记录本 / 目标 / 记忆\n\n（自上一轮没变化${goalLine ? `：${goalLine}` : ''}。记录本摘要、${speaker} 的档案与目标清单都在上文，按那个继续；要看最新状态用 goal_status / memory_search。）\n\n`
+        : `${tailParts.join('\n\n')}\n\n`;
     const now = new Date();
     const stamp = `${String(now.getHours()).padStart(2, '0')}:${String(now.getMinutes()).padStart(2, '0')}`;
     const quoted = scope.isDirect ? undefined : await this.resolveQuote(scope.conversationId, message);
@@ -1800,7 +1846,7 @@ export class ChatAgent {
         ? this.unresolvedQuoteHint(scope.conversationId)
         : '';
     const current = `[${stamp}] ${speaker}${scope.isDirect ? '' : ' → Kei'}：${quotedPrefix}${text}`;
-    const memoryBlock = remembered ? `## 你记得的 ${speaker}\n\n${remembered}\n\n` : '';
+    const memoryBlock = !repeat && remembered ? `## 你记得的 ${speaker}\n\n${remembered}\n\n` : '';
     const userText = history
       ? `${CONTEXT_HEADER}\n${history}\n${CONTEXT_FOOTER}\n\n${tailBlock}${memoryBlock}${current}`
       : `${tailBlock}${memoryBlock}${current}`;
@@ -1828,6 +1874,7 @@ export class ChatAgent {
         lastMessageId,
         turns: (usable?.turns ?? 0) + 1,
         bornAt: usable?.bornAt ?? Date.now(),
+        tailSig,
       };
       // 会话寿命：到点不是停工，是写交接单后换一条新链（新链只带目标 + 最近几句）
       const rotation = shouldRotateThread({

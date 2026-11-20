@@ -10,7 +10,7 @@ import { existsSync } from 'node:fs';
 import { mkdir, mkdtemp, rm, utimes, appendFile, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
-import { ChatAgent, approxTokens, clipToolOutput, describeProgress, isBotMentioned, MAX_REPLY_CHARS, MAX_REPLY_CHUNKS, pruneToolResults, readAgentConfig, repeatedOpener, splitReply } from '../agent/index.js';
+import { ChatAgent, approxTokens, clipToolOutput, describeProgress, digestOf, isBotMentioned, MAX_REPLY_CHARS, MAX_REPLY_CHUNKS, pruneToolResults, readAgentConfig, repeatedOpener, splitReply } from '../agent/index.js';
 import { pruneMediaCache } from '../chat-log.js';
 import type { ChatMessage } from '../agent/llm.js';
 import { GroupBuffer, renderBuffer } from '../agent/context.js';
@@ -1029,6 +1029,50 @@ async function main(): Promise<void> {
   check('前文只追加不改写（前缀可命中缓存）', prefixSame);
   await rm(threadTmp, { recursive: true, force: true });
 
+  // 简报（记录本 / 目标 / 成员档案）没变就不重念：每轮重念一遍 = 每轮多一份未命中的新 token，
+  // 首调命中率就是这么被拖下去的（2026-11-20 实测 2.2k 字符/轮）。
+  check('指纹稳定', digestOf('abc') === digestOf('abc') && digestOf('abc') !== digestOf('abd'));
+  const briefTmp = await mkdtemp(path.join(tmpdir(), 'al1s-brief-'));
+  try {
+    await new RecordStore(briefTmp, GROUP).append({
+      kind: 'task',
+      title: '把 M2 室内数据规范写完',
+      status: 'doing',
+      by: '謎矢',
+    });
+    const briefSeen: ChatMessage[][] = [];
+    const briefAgent = new ChatAgent(
+      { ...config, dataRoot: briefTmp, toolsEnabled: false },
+      quietLogger,
+      async (msgs: ChatMessage[]) => {
+        briefSeen.push(msgs.map((m) => ({ ...m })));
+        return '嗯';
+      },
+    );
+    const sayBrief = async (body: string): Promise<void> => {
+      await briefAgent.handle(
+        makeMessage({ content: body, mentions: [{ member_openid: BOT_OPENID, bot: true }] }),
+        { replyText: async () => undefined } as unknown as Bot,
+      );
+    };
+    await sayBrief('第一句');
+    await sayBrief('第二句');
+    const firstBody = String(briefSeen[0]?.at(-1)?.content ?? '');
+    const secondBody = String(briefSeen[1]?.at(-1)?.content ?? '');
+    check('首轮把记录本念全', firstBody.includes('把 M2 室内数据规范写完'), firstBody.slice(0, 40));
+    check('简报没变就不重念', secondBody.includes('自上一轮没变化') && !secondBody.includes('把 M2 室内数据规范写完'));
+    check(
+      '重念时不再贴整份简报',
+      firstBody.includes('## 记录本摘要') && !secondBody.includes('## 记录本摘要'),
+    );
+    await new RecordStore(briefTmp, GROUP).append({ kind: 'task', title: '接着做楼层渲染', status: 'todo', by: '謎矢' });
+    await sayBrief('第三句');
+    const thirdBody = String(briefSeen[2]?.at(-1)?.content ?? '');
+    check('记录本一变就重念', thirdBody.includes('接着做楼层渲染') && !thirdBody.includes('自上一轮没变化'));
+  } finally {
+    await rm(briefTmp, { recursive: true, force: true });
+  }
+
   // 上游漏解析时，把 DeepSeek 原生标记归一成标准 tool_calls
   const dsmlText =
     '<｜DSML｜tool_calls>\n<｜DSML｜invoke name="run_command">\n' +
@@ -1167,6 +1211,19 @@ async function main(): Promise<void> {
     check('切片全 blocked 就不续跑', (await probeStore.read()) ? !canContinue((await probeStore.read())!, {}).ok : false);
     await probeStore.watch(20, 'sig-1', '等 PR');
     check('挂探针后允许续跑（只探针不烧回合）', (await probeStore.read()) ? canContinue((await probeStore.read())!, {}).ok : false);
+
+    // 探针挂在 done 目标上 = 静默停摆（2026-11-20 实测：收尾后又挂 #25，一小时没人叫醒）
+    const orphanStore = new GoalStore(goalTmp, 'G7');
+    await orphanStore.create(
+      { objective: '收尾后再挂探针', criteria: ['能跑'], slices: ['一片'] },
+      { maxRounds: 5, maxWallMs: 3_600_000 },
+    );
+    await orphanStore.watch(25, 'sig-9', '等 NPC 交货');
+    const closed = await orphanStore.finish('收尾');
+    check('收尾顺手拆探针', closed.includes('拆了 #25') && (await orphanStore.read())?.awaiting === undefined);
+    const refusedWatch = await orphanStore.watch(26, 'sig-10', '再挂一个');
+    check('done 目标挂探针被拒', refusedWatch.includes('不会叫醒'), refusedWatch.slice(0, 40));
+    check('被拒时账本不落探针', (await orphanStore.read())?.awaiting === undefined);
   } finally {
     await rm(goalTmp, { recursive: true, force: true });
   }

@@ -330,6 +330,15 @@ export class GoalStore {
     if (!goal) {
       return '这个群还没有目标。';
     }
+    if (goal.status !== 'active') {
+      // 探针只叫醒 active 目标。挂在 done / paused 上 = 静默停摆（2026-11-20 踩过：
+      // 目标已经 goal_finish，又挂了 #25 的探针，之后再没人叫醒它）
+      return (
+        `目标 ${goal.id} 状态是 ${goal.status}，挂探针不会叫醒你 —— 自动续跑只跑 active 目标。` +
+        '要跟进的是新活，就先 goal_create 立新目标（判据 + 3~5 片）再挂探针；' +
+        '要继续这一条就 /goal resume。'
+      );
+    }
     goal.awaiting = { issue, sig, since: nowIso(), ...(note ? { note: clip(note, 300) } : {}) };
     goal.updatedAt = nowIso();
     goal.log.push({ at: goal.updatedAt, text: `等 #${issue} 的 NPC 交货${note ? `：${clip(note, 160)}` : ''}` });
@@ -375,6 +384,9 @@ export class GoalStore {
     const remaining = goal.slices.filter((slice) => slice.status !== 'done' && slice.status !== 'dropped');
     goal.status = 'done';
     goal.recap = clip(recap, 800);
+    // 收尾就把探针拆了：done 的目标不会再被续跑叫醒，留着只会变成「静默停摆」
+    const watched = goal.awaiting?.issue;
+    delete goal.awaiting;
     goal.updatedAt = nowIso();
     goal.log.push({ at: goal.updatedAt, text: `收尾：${goal.recap}`, ...(by ? { by } : {}) });
     await this.save(goal);
@@ -382,7 +394,8 @@ export class GoalStore {
       remaining.length > 0
         ? `\n注意：还有 ${remaining.length} 片没标完成（${remaining.map((s) => s.id).join('/')}）—— 别把没验过的当完成了。`
         : '';
-    return `目标已收尾。${goal.recap}${warn}`;
+    const dropped = watched ? `\n顺手拆了 #${watched} 的探针（目标已收尾，不会再叫醒）。` : '';
+    return `目标已收尾。${goal.recap}${warn}${dropped}`;
   }
 
   async block(reason: string, by?: string): Promise<string> {
