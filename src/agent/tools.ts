@@ -17,6 +17,7 @@ import { isKind, isStatus, type RecordStore } from './records.js';
 import { isSliceStatus, renderGoal, type Goal, type GoalSlice, type GoalStore } from './goals.js';
 import { filterToolsForKind, isGoalKind, type GoalKind } from './kinds.js';
 import { renderIssue, renderIssues, renderPulls, type CnbClient } from './cnb.js';
+import { checkCnbArgs, listCnbGuide, readCnbGuide, renderCnbRun, searchCnbGuide, type CnbCli } from './cnbcli.js';
 import type { Workspace } from './workspace.js';
 
 export interface ToolContext {
@@ -40,6 +41,8 @@ export interface ToolContext {
   goals?: GoalStore;
   /** CNB 接口：issue 协作通道。 */
   cnb?: CnbClient;
+  /** CNB 官方 CLI：全模块命令 + 官方 skill 文档。 */
+  cnbCli?: CnbCli;
   /** 说话人昵称，记条目时当 by。 */
   speaker?: string;
   /**
@@ -392,6 +395,54 @@ const CNB_TOOLS: unknown[] = [
   },
 ];
 
+/** CNB 官方 skill 文档：只读，任何能读仓库的身份都能查。 */
+const CNB_GUIDE_TOOLS: unknown[] = [
+  {
+    type: 'function',
+    function: {
+      name: 'cnb_guide',
+      description:
+        '查 CNB 官方 skill 文档（cnb-api / cnb-pipeline / cnb-code-review / cnb-upload-attachment / cnb-docs / cnb-repo-knowledge-base / cnb-tapd-resource-fetcher / cnb-version 等）。命令名、参数、流水线字段、评审口径都先查这里，别靠猜。不带参数列技能；给 name 读正文；name + path 读参考文件；query 关键词全库检索。',
+      parameters: {
+        type: 'object',
+        properties: {
+          name: { type: 'string', description: '技能名，例如 cnb-api、cnb-pipeline' },
+          path: { type: 'string', description: '技能目录下的参考文件，例如 references/syntax-reference.md' },
+          query: { type: 'string', description: '关键词，全库检索用' },
+        },
+      },
+    },
+  },
+];
+
+/** CNB 官方 CLI：全模块命令（写仓库的身份才给）。 */
+const CNB_CLI_TOOLS: unknown[] = [
+  {
+    type: 'function',
+    function: {
+      name: 'cnb',
+      description: [
+        '跑 CNB 官方 CLI（`cnb <module> <tool>`，argv 数组、不经 shell）。仓库固定为当前项目，不用传 --repo。',
+        '常用：["issues","list-issues","--state","open"]、["issues","get","--number","24"]、["issues","comment","--number","24","--body","…"]、["pulls","get","--number","37"]、["pulls","list-files","--number","37"]、["pulls","check-status","--number","37"]、["pulls","get-ci-logs","--number","37"]、["pulls","submit-review","--number","37","--event","approve","--body","…"]、["build","…"]、["assets","…"]、["knowledge-base","…"]。',
+        '不确定命令或参数就先 cnb_guide（name=cnb-api / cnb-pipeline / cnb-code-review）查官方口径。',
+        '注意：CLI 对 HTTP 404 也退出 0，结论看输出里的 status / errcode。',
+      ].join(''),
+      parameters: {
+        type: 'object',
+        properties: {
+          args: {
+            type: 'array',
+            items: { type: 'string' },
+            description: 'argv 数组，例如 ["issues","get","--number","24"]',
+          },
+          timeout_ms: { type: 'number', description: '超时，默认 60000，上限 180000' },
+        },
+        required: ['args'],
+      },
+    },
+  },
+];
+
 /** 读仓库：开发成员与主人。 */
 const REPO_READ_TOOLS: unknown[] = [
   {
@@ -497,13 +548,13 @@ const REPO_WRITE_TOOLS: unknown[] = [
 export function toolDefinitionsFor(caps: Capabilities, kind?: GoalKind): unknown[] {
   const tools: unknown[] = [...CHAT_TOOLS, ...RECORD_QUERY_TOOLS];
   if (caps.repoRead) {
-    tools.push(...REPO_READ_TOOLS);
+    tools.push(...REPO_READ_TOOLS, ...CNB_GUIDE_TOOLS);
   }
   if (caps.memoryWrite) {
     tools.push(...RECORD_WRITE_TOOLS, ...GOAL_TOOLS);
   }
   if (caps.repoWrite) {
-    tools.push(...REPO_WRITE_TOOLS, ...CNB_TOOLS);
+    tools.push(...REPO_WRITE_TOOLS, ...CNB_TOOLS, ...CNB_CLI_TOOLS);
   }
   // 目标类型的能力包：code 不设白名单（全部给），调研/运维/评审按需收窄
   return filterToolsForKind(tools, kind);
@@ -1019,6 +1070,35 @@ async function executeToolInner(name: string, rawArgs: string, ctx: ToolContext)
       await ctx.cnb.closeIssue(number, asString(args.comment) || undefined);
       ctx.log.info('关了 CNB issue', { repo: ctx.cnb.repo, number });
       return `已关闭 #${number}。`;
+    }
+    if (name === 'cnb_guide') {
+      if (!ctx.cnbCli) {
+        return '这台机器没装 CNB 官方 skill 文档。';
+      }
+      const dir = ctx.cnbCli.config.guideDir;
+      const query = asString(args.query).trim();
+      const skillName = asString(args.name).trim();
+      if (query) {
+        return await searchCnbGuide(dir, query);
+      }
+      if (skillName) {
+        return await readCnbGuide(dir, skillName, asString(args.path) || undefined);
+      }
+      return await listCnbGuide(dir);
+    }
+    if (name === 'cnb') {
+      if (!ctx.cnbCli || !ctx.capabilities?.repoWrite) {
+        return '当前身份不能跑 CNB 命令。';
+      }
+      const checked = checkCnbArgs(args.args);
+      if (!checked.ok) {
+        return checked.reason;
+      }
+      const result = await ctx.cnbCli.run(checked.args, {
+        ...(asNumber(args.timeout_ms) ? { timeoutMs: asNumber(args.timeout_ms) } : {}),
+      });
+      ctx.log.info('跑了 cnb 命令', { args: checked.args.join(' ').slice(0, 160), code: result.code });
+      return renderCnbRun(result, checked.args);
     }
     if (name === 'repo_status') {
       if (!ctx.workspace || !ctx.capabilities?.repoRead) {

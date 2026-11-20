@@ -26,6 +26,7 @@ import { checkCommand, parseBlacklist } from '../agent/exec.js';
 import { RecordStore } from '../agent/records.js';
 import { GoalStore, canContinue, goalBrief, nextSlice, renderGoal } from '../agent/goals.js';
 import { readCnbConfig, buildProbeSignature, renderIssues, renderPulls } from '../agent/cnb.js';
+import { checkCnbArgs, listCnbGuide, readCnbCliConfig, readCnbGuide, renderCnbRun, searchCnbGuide } from '../agent/cnbcli.js';
 import { renderHandoff, shouldRotateThread, writeHandoff } from '../agent/thread.js';
 import { kindPack } from '../agent/kinds.js';
 import { matchGoalCommand } from '../agent/commands.js';
@@ -1341,6 +1342,55 @@ async function main(): Promise<void> {
     const cfg = readAgentConfig({} as NodeJS.ProcessEnv).thread;
     return cfg.maxAgeMs === 3 * 3_600_000 && cfg.maxTurns === 30;
   })());
+
+  console.log('\n[24] CNB 官方 CLI 与官方 skill 文档');
+  const cliCfg = readCnbCliConfig({
+    KEI_CNB_TOKEN: 't0k',
+    AGENT_CNB_REPO: 'mico-v/demo',
+    AGENT_CNB_TOKEN_FILE: '/nonexistent/cnb-token',
+    HOME: '/srv/kei',
+  } as NodeJS.ProcessEnv);
+  check('CLI 复用 issue 通道的令牌与仓库', cliCfg?.token === 't0k' && cliCfg?.repo === 'mico-v/demo');
+  check('默认 bin 指向全局安装的 cnb', cliCfg?.bin === '/usr/local/bin/cnb', String(cliCfg?.bin));
+  check('官方文档默认落在 HOME/cnb-skills', cliCfg?.guideDir === '/srv/kei/cnb-skills', String(cliCfg?.guideDir));
+  check('没令牌就不挂 CLI', readCnbCliConfig({ AGENT_CNB_TOKEN_FILE: '/nonexistent/cnb-token' } as NodeJS.ProcessEnv) === undefined);
+  check('正常命令放行', checkCnbArgs(['issues', 'get', '--number', '24']).ok);
+  check('--help 放行（模型可以自己探索）', checkCnbArgs(['--help']).ok);
+  check('交互式登录拦住', !checkCnbArgs(['login']).ok);
+  check('git-credential 拦住', !checkCnbArgs(['git-credential', 'get']).ok);
+  const unknownModule = checkCnbArgs(['foo']);
+  check('不认识的模块回清单', !unknownModule.ok && unknownModule.reason.includes('issues'));
+  check('不许参数里覆盖凭据', !checkCnbArgs(['issues', 'get', '--token', 'x']).ok);
+  check('删仓库拦住', !checkCnbArgs(['repositories', 'delete-repo', '--repo', 'x/y']).ok);
+  check('空 args 拒绝', !checkCnbArgs([]).ok);
+  check('非字符串参数拒绝', !checkCnbArgs(['issues', 1]).ok);
+  check('结果视图带状态与耗时', renderCnbRun({ code: 0, out: 'status: 200', err: '', ms: 1200 }, ['issues', 'get']).includes('→ ok（1.2s）'));
+  check('超时单独标出', renderCnbRun({ code: -2, out: '', err: '', ms: 60_000 }, ['build', 'x']).includes('超时被杀'));
+
+  const guideTmp = await mkdtemp(path.join(tmpdir(), 'cnbguide-'));
+  try {
+    await mkdir(path.join(guideTmp, 'cnb-api'), { recursive: true });
+    await mkdir(path.join(guideTmp, 'cnb-pipeline', 'references'), { recursive: true });
+    await writeFile(
+      path.join(guideTmp, 'cnb-api', 'SKILL.md'),
+      '---\nname: cnb-api\ndescription: CNB 平台交互命令\n---\n\n# cnb-api\n\ncnb issues get\n',
+    );
+    await writeFile(path.join(guideTmp, 'cnb-pipeline', 'SKILL.md'), '---\nname: cnb-pipeline\ndescription: 流水线\n---\n\n# cnb-pipeline\n');
+    await writeFile(path.join(guideTmp, 'cnb-pipeline', 'references', 'syntax-reference.md'), 'branch: main\n');
+    const listed = await listCnbGuide(guideTmp);
+    check('列表带技能名与说明', listed.includes('cnb-api：CNB 平台交互命令'), listed.slice(0, 60));
+    check('列表标出参考文件', listed.includes('references/syntax-reference.md'));
+    check('能读正文', (await readCnbGuide(guideTmp, 'cnb-api')).includes('cnb issues get'));
+    check('能读参考文件', (await readCnbGuide(guideTmp, 'cnb-pipeline', 'references/syntax-reference.md')).includes('branch: main'));
+    check('检索命中带行号', (await searchCnbGuide(guideTmp, 'branch')).includes('syntax-reference.md:1:'));
+    check('检索无果给下一步', (await searchCnbGuide(guideTmp, 'zzz')).includes('换个词'));
+    check('技能名不许带路径', (await readCnbGuide(guideTmp, '../etc')).includes('不合法'));
+  } finally {
+    await rm(guideTmp, { recursive: true, force: true });
+  }
+  check('owner 有 cnb 与 cnb_guide', ownerTools.includes('"cnb"') && ownerTools.includes('cnb_guide'));
+  check('guest 看不到 cnb', !guestTools.includes('"cnb"'));
+  check('调研包只给 guide 不给写命令', toolNames(OWNER_CAPS, 'research').includes('cnb_guide') && !toolNames(OWNER_CAPS, 'research').includes('cnb'));
 
   console.log(failures === 0 ? '\n全部通过\n' : `\n${failures} 项失败\n`);
   process.exit(failures === 0 ? 0 : 1);

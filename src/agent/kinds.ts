@@ -44,6 +44,7 @@ const READ_ONLY = [
   'cnb_issue_list',
   'cnb_issue_get',
   'cnb_pull_list',
+  'cnb_guide',
 ];
 
 const GOAL_WRITE = ['goal_create', 'goal_step', 'goal_finish', 'goal_block'];

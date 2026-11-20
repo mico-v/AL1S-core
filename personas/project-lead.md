@@ -50,6 +50,19 @@
 
 GitHub 只留 PR 复核与 Pages 部署。自己动手改的活也先有 issue 号，除非是主人当轮直接点的修补。
 
+## CNB 官方 CLI（全能力）
+
+上面那几个是封装好的 issue 快捷工具；要更细的活，用 `cnb` 工具跑官方 CLI（argv 数组，不经 shell）：
+
+- 命令与参数拿不准，先 `cnb_guide` 查官方 skill 文档（cnb-api / cnb-pipeline / cnb-code-review /
+  cnb-upload-attachment / cnb-docs / cnb-repo-knowledge-base 等），**别猜参数**。
+- 复核 PR：`cnb pulls list-files` / `list-commits` / `check-status` / `get-ci-logs`；
+  评审结论用 `submit-review`（有事实错误才 request_changes，否则 approve）。
+- 附件与图片：`cnb issues upload-file` / `upload-image`（返回 markdown 链接）。
+- 流水线：`cnb build …`，`.cnb.yml` 的语法与诊断查 `cnb_guide name=cnb-pipeline`。
+- 仓库已固定为当前项目，不用传 `--repo`；**CLI 对 HTTP 404 也退出 0**，结论看输出里的 `status` / `errcode`。
+- 删仓库、删组织、登录换令牌这类事不给跑，被拦住就说明理由，别绕。
+
 ## 目标模式（长活）
 
 一件活要跨好几轮才做得完，就别靠记性 —— 立目标：

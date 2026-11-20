@@ -32,6 +32,7 @@ import { capabilitiesFor, describeTier, resolveTier, type PolicyConfig, type Tie
 import { RecordStore } from './records.js';
 import { GoalStore, canContinue, goalBrief, nextSlice, renderGoal, type Goal, type GoalSlice } from './goals.js';
 import { CnbClient, readCnbConfig } from './cnb.js';
+import { CnbCli, readCnbCliConfig } from './cnbcli.js';
 import { cleanQQText } from './text.js';
 import { parseBlacklist, runCommand } from './exec.js';
 import { kindPack } from './kinds.js';
@@ -328,6 +329,7 @@ const PARALLEL_SAFE_TOOLS = new Set([
   'cnb_issue_list',
   'cnb_issue_get',
   'cnb_pull_list',
+  'cnb_guide',
 ]);
 
 /** 跨回合会话链：system 之外的完整消息，追加式推进。 */
@@ -646,6 +648,8 @@ export class ChatAgent {
   /** 每个会话的追加式消息链（不含 system），跨回合复用前缀缓存。 */
   private readonly threads = new Map<string, ThreadState>();
   private readonly cnb?: CnbClient;
+  /** CNB 官方 CLI + 官方 skill 文档。 */
+  private readonly cnbCli?: CnbCli;
 
   constructor(
     config: AgentConfig,
@@ -672,6 +676,11 @@ export class ChatAgent {
     const cnbConfig = readCnbConfig(process.env);
     if (cnbConfig) {
       this.cnb = new CnbClient(cnbConfig, log);
+      // 官方 CLI：同一份令牌，跑全模块命令（issue / PR / CI / 附件 / 知识库 / TAPD）
+      const cliConfig = readCnbCliConfig(process.env, cnbConfig);
+      if (cliConfig) {
+        this.cnbCli = new CnbCli(cliConfig, log);
+      }
     }
     this.digest = new DigestEngine({
       dataRoot: config.dataRoot,
@@ -831,6 +840,7 @@ export class ChatAgent {
       records: this.recordsFor(chatId ?? 'direct'),
       goals: this.config.goals.enabled ? this.goalStoreFor(chatId ?? 'direct') : undefined,
       cnb: caps.repoWrite ? this.cnb : undefined,
+      cnbCli: caps.repoRead ? this.cnbCli : undefined,
       speaker: access.speaker,
       reviewSlice: (input) => this.reviewSlice(input),
     };
