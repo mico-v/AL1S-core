@@ -19,6 +19,7 @@ import { filterToolsForKind, isGoalKind, type GoalKind } from './kinds.js';
 import { renderIssue, renderIssues, renderPulls, type CnbClient } from './cnb.js';
 import { checkCnbArgs, listCnbGuide, readCnbGuide, renderCnbRun, searchCnbGuide, type CnbCli } from './cnbcli.js';
 import type { Workspace } from './workspace.js';
+import { MAX_CHOICE_OPTIONS, MAX_LABEL_CHARS, type ChoiceOption } from './choices.js';
 
 export interface ToolContext {
   dataRoot: string;
@@ -54,6 +55,11 @@ export interface ToolContext {
     slice: GoalSlice;
     evidence?: string;
   }) => Promise<{ pass: boolean; note: string }>;
+  /**
+   * 发一张选项卡片（按钮）。只在主人那一档注入；没有它就等于没这个工具。
+   * 返回给模型看的回执（已发出 / 为什么没发）。
+   */
+  askChoice?: (input: { question: string; options: ChoiceOption[] }) => Promise<string>;
 }
 
 /** 聊天类工具：任何身份都能用。 */
@@ -544,9 +550,47 @@ const REPO_WRITE_TOOLS: unknown[] = [
   },
 ];
 
+/** 选项卡片：只给主人档（要不要让人拍板，本来也只有主人这一层有意义）。 */
+const CHOICE_TOOLS: unknown[] = [
+  {
+    type: 'function',
+    function: {
+      name: 'ask_choice',
+      description:
+        '要主人拍板时发一张选项卡片（按钮），2~5 个选项。用在「方案 A 还是 B」「先做哪一块」这类必须有人定的事；能自己判断的别问。发完本轮只回一句很短的话，不要重复选项内容。',
+      parameters: {
+        type: 'object',
+        properties: {
+          question: { type: 'string', description: '一句话问题，不超过 40 字' },
+          options: {
+            type: 'array',
+            description: `2~${MAX_CHOICE_OPTIONS} 个选项`,
+            items: {
+              type: 'object',
+              properties: {
+                label: { type: 'string', description: `按钮上的字，不超过 ${MAX_LABEL_CHARS} 字` },
+                detail: { type: 'string', description: '补充说明，写进正文，选填' },
+              },
+              required: ['label'],
+            },
+          },
+        },
+        required: ['question', 'options'],
+      },
+    },
+  },
+];
+
 /** 按能力集挑工具：模型看不到它用不了的工具，就不会去试。 */
-export function toolDefinitionsFor(caps: Capabilities, kind?: GoalKind): unknown[] {
+export function toolDefinitionsFor(
+  caps: Capabilities,
+  kind?: GoalKind,
+  extra: { canAskChoice?: boolean } = {},
+): unknown[] {
   const tools: unknown[] = [...CHAT_TOOLS, ...RECORD_QUERY_TOOLS];
+  if (extra.canAskChoice) {
+    tools.push(...CHOICE_TOOLS);
+  }
   if (caps.repoRead) {
     tools.push(...REPO_READ_TOOLS, ...CNB_GUIDE_TOOLS);
   }
@@ -596,6 +640,37 @@ function safeParse(raw: string): Record<string, unknown> {
   } catch {
     return {};
   }
+}
+
+/**
+ * 选项宽容解析：模型有时给字符串数组，有时给 {label, detail}。
+ * 缺 label 的直接丢，超过上限的截断 —— 按钮上写不下第 6 个。
+ */
+function parseChoiceOptions(raw: unknown): ChoiceOption[] {
+  if (!Array.isArray(raw)) {
+    return [];
+  }
+  const out: ChoiceOption[] = [];
+  for (const item of raw) {
+    if (typeof item === 'string') {
+      const label = item.trim();
+      if (label) {
+        out.push({ label });
+      }
+      continue;
+    }
+    if (!item || typeof item !== 'object') {
+      continue;
+    }
+    const rec = item as Record<string, unknown>;
+    const label = asString(rec.label ?? rec.text ?? rec.title).trim();
+    if (!label) {
+      continue;
+    }
+    const detail = asString(rec.detail ?? rec.description ?? rec.note).trim();
+    out.push(detail ? { label, detail } : { label });
+  }
+  return out.slice(0, MAX_CHOICE_OPTIONS);
 }
 
 /** 字符串数组参数：模型偶尔会塞一个字符串进来，统一成数组。 */
@@ -835,6 +910,20 @@ export async function executeTool(name: string, rawArgs: string, ctx: ToolContex
 async function executeToolInner(name: string, rawArgs: string, ctx: ToolContext): Promise<string> {
   const args = safeParse(rawArgs);
   try {
+    if (name === 'ask_choice') {
+      if (!ctx.askChoice) {
+        return '当前身份发不了选项卡片：直接问一句就行。';
+      }
+      const question = asString(args.question).trim();
+      if (!question) {
+        return '需要 question（一句话问题）。';
+      }
+      const options = parseChoiceOptions(args.options);
+      if (options.length < 2) {
+        return '至少给两个选项；只有一个的话直接说结论，不用出卡片。';
+      }
+      return await ctx.askChoice({ question, options });
+    }
     if (name === 'search_messages') {
       const query = asString(args.query).trim();
       if (!query) {

@@ -266,3 +266,26 @@
 - 事件详情：INTERACTION_CREATE
 
 - 回应接口：PUT /interactions/{interaction_id}
+
+##  开放状态（本地注记，2026-11-21 核对）
+
+官方 FAQ 已明确：**单聊场景、群聊场景的自定义 Markdown 消息与消息按钮，已开放给所有机器人，无需单独申请模版**；频道场景仍需要内邀。
+
+所以群里不必等按钮模板审批，直接用长形式：
+
+```
+{
+  "msg_type": 2,
+  "markdown": { "content": "**先推哪块？**\n\n1. 先做 M2\n2. 先补 UGC" },
+  "keyboard": { "content": { "rows": [ { "buttons": [ { ... } ] } ] } }
+}
+```
+
+群聊/单聊按钮字段以 `发送群聊消息` 的 `Keyboard` / `Button` schema 为准，比频道多出几个字段：
+
+- `group_id`：同一分组内点一个，其它按钮自动变灰（仅 `action.type=1` 有效）。
+- `modal`：二次确认弹窗（`content` ≤ 40 字、不能带 URL）。
+- `render_data.style`：0 灰框、1 蓝框、3 白底红字、4 蓝底白字。
+- `permission.type`：0 指定用户、1 管理员、2 所有人（群聊没有身份组）。
+
+来源：`/develop/api-v2/autogen/api/v2_groups_group_openid_messages.post.html`、`/bot_FAQ/`。

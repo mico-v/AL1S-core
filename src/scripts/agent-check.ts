@@ -27,6 +27,17 @@ import { RecordStore } from '../agent/records.js';
 import { GoalStore, canContinue, goalBrief, nextSlice, renderGoal } from '../agent/goals.js';
 import { readCnbConfig, buildProbeSignature, renderIssues, renderPulls } from '../agent/cnb.js';
 import { checkCnbArgs, listCnbGuide, readCnbCliConfig, readCnbGuide, renderCnbRun, searchCnbGuide } from '../agent/cnbcli.js';
+import {
+  CHOICE_TTL_MS,
+  ChoiceStore,
+  MAX_LABEL_CHARS,
+  buildChoiceKeyboard,
+  clipLabel,
+  encodeChoiceData,
+  parseChoiceData,
+  renderChoiceMarkdown,
+  type PendingChoice,
+} from '../agent/choices.js';
 import { renderHandoff, shouldRotateThread, writeHandoff } from '../agent/thread.js';
 import { kindPack } from '../agent/kinds.js';
 import { matchGoalCommand } from '../agent/commands.js';
@@ -1391,6 +1402,82 @@ async function main(): Promise<void> {
   check('owner 有 cnb 与 cnb_guide', ownerTools.includes('"cnb"') && ownerTools.includes('cnb_guide'));
   check('guest 看不到 cnb', !guestTools.includes('"cnb"'));
   check('调研包只给 guide 不给写命令', toolNames(OWNER_CAPS, 'research').includes('cnb_guide') && !toolNames(OWNER_CAPS, 'research').includes('cnb'));
+
+  console.log('\n[25] 选项卡片（按钮）');
+  {
+    const token = 'abc123';
+    const parsed = parseChoiceData(encodeChoiceData(token, 2));
+    check('按钮 data 能来回解', parsed?.token === token && parsed.index === 2, JSON.stringify(parsed));
+    check('别的互动事件不误认', parseChoiceData('other:1:2') === undefined);
+    check('坏 data 不报错', parseChoiceData('choice:x') === undefined && parseChoiceData(undefined) === undefined);
+    check('按钮文字按上限截', clipLabel('一二三四五六七八九十十一').length <= MAX_LABEL_CHARS);
+    check('短文字不截', clipLabel('先做 M2') === '先做 M2');
+
+    const choice: PendingChoice = {
+      token,
+      chatId: 'G1',
+      question: '先推哪块？',
+      options: [
+        { label: '先做 M2', detail: '室内与双模' },
+        { label: '先补 UGC' },
+      ],
+      createdAt: Date.now(),
+      by: '謎矢',
+    };
+    const keyboard = buildChoiceKeyboard(choice, { ownerOpenids: ['OWNER1'] }) as unknown as {
+      content: { rows: Array<{ buttons: Array<Record<string, unknown>> }> };
+    };
+    check('一行一个按钮', keyboard.content.rows.length === 2);
+    const first = keyboard.content.rows[0]?.buttons[0] as Record<string, any>;
+    check('按钮是回调类型', first.action.type === 1);
+    check('只给主人点', JSON.stringify(first.action.permission.specify_user_ids) === '["OWNER1"]');
+    check('同组按钮互斥变灰', first.group_id === `choice-${token}`);
+    check('data 带序号', first.action.data === encodeChoiceData(token, 0));
+    check('有过低版本兜底文案', typeof first.action.unsupport_tips === 'string');
+    const card = renderChoiceMarkdown(choice);
+    check('正文带问题', card.includes('先推哪块'));
+    check('正文带编号选项与细节', card.includes('1. 先做 M2：室内与双模') && card.includes('2. 先补 UGC'));
+
+    const choiceTmp = await mkdtemp(path.join(tmpdir(), 'choice-'));
+    try {
+      const store = new ChoiceStore(choiceTmp, 'G1');
+      check('空仓取不到', (await store.take(token)) === undefined);
+      await store.add(choice);
+      check('落盘后能读到', (await store.read()).length === 1);
+      const taken = await store.take(token);
+      check('取回原选项', taken?.question === '先推哪块？');
+      check('一次性：再取就没了', (await store.take(token)) === undefined);
+      await store.add({ ...choice, createdAt: Date.now() - CHOICE_TTL_MS - 1 });
+      check('过期卡片自动作废', (await store.read()).length === 0);
+      await store.add({ ...choice, token: 'dm1' });
+      const dm = new ChoiceStore(choiceTmp, 'dm:OWNER1');
+      await dm.add({ ...choice, token: 'dm1', chatId: 'dm:OWNER1' });
+      check('会话之间不串', (await dm.read()).length === 1 && (await store.read()).length === 1);
+    } finally {
+      await rm(choiceTmp, { recursive: true, force: true });
+    }
+
+    const withChoice = JSON.stringify(toolDefinitionsFor(OWNER_CAPS, undefined, { canAskChoice: true }));
+    const withoutChoice = JSON.stringify(toolDefinitionsFor(OWNER_CAPS));
+    check('主人档看得到 ask_choice', withChoice.includes('ask_choice'));
+    check('没注入就不露这个工具', !withoutChoice.includes('ask_choice'));
+    const ctxBase = { dataRoot: '/tmp', log: quietLogger } as unknown as Parameters<typeof executeTool>[2];
+    check('没能力时拒绝出卡片', (await executeTool('ask_choice', '{"question":"q","options":["a","b"]}', ctxBase)).includes('发不了'));
+    let asked: { question: string; options: unknown[] } | undefined;
+    const ctxWith = {
+      ...ctxBase,
+      askChoice: async (input: { question: string; options: unknown[] }) => {
+        asked = input;
+        return '已发出';
+      },
+    } as unknown as Parameters<typeof executeTool>[2];
+    check('字符串选项也能收', (await executeTool('ask_choice', '{"question":"q","options":["a","b"]}', ctxWith)) === '已发出');
+    check('选项转成对象', Array.isArray(asked?.options) && (asked?.options[0] as { label?: string })?.label === 'a');
+    check('只有一个选项时拒绝', (await executeTool('ask_choice', '{"question":"q","options":["a"]}', ctxWith)).includes('两个选项'));
+    check('缺问题拒绝', (await executeTool('ask_choice', '{"options":["a","b"]}', ctxWith)).includes('question'));
+    check('人格里写了按钮口径', PERSONA.includes('ask_choice') && PERSONA.includes('≤10 字'));
+    check('人格里写了 markdown 链接写法', PERSONA.includes('[看这里](https://'));
+  }
 
   console.log(failures === 0 ? '\n全部通过\n' : `\n${failures} 项失败\n`);
   process.exit(failures === 0 ? 0 : 1);

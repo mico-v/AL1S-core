@@ -8,7 +8,7 @@
  */
 
 import { createHash } from 'node:crypto';
-import type { QQBotInboundMessage } from '@tencent-connect/qqbot-nodejs';
+import type { InteractionEvent, QQBotInboundMessage } from '@tencent-connect/qqbot-nodejs';
 import type { Bot } from '../bot.js';
 import type { AppLogger } from '../logger.js';
 import { matchCommand, matchGoalCommand, renderStatus } from './commands.js';
@@ -38,6 +38,15 @@ import { parseBlacklist, runCommand } from './exec.js';
 import { kindPack } from './kinds.js';
 import { renderHandoff, handoffPath, shouldRotateThread, writeHandoff } from './thread.js';
 import { executeTool, toolDefinitionsFor, type ToolContext } from './tools.js';
+import {
+  ChoiceStore,
+  MAX_CHOICE_OPTIONS,
+  buildChoiceKeyboard,
+  parseChoiceData,
+  renderChoiceMarkdown,
+  type ChoiceOption,
+  type PendingChoice,
+} from './choices.js';
 
 import { Workspace } from './workspace.js';
 import { appendFile, mkdir } from 'node:fs/promises';
@@ -444,6 +453,16 @@ export function isAtEvent(message: QQBotInboundMessage): boolean {
   return (message as unknown as { rawEventType?: string }).rawEventType === 'GROUP_AT_MESSAGE_CREATE';
 }
 
+/**
+ * 这条消息是「主人点了选项按钮」合成出来的。
+ *
+ * 它没有 @ 也没有 mention，但必须进模型：点按钮就是回答，
+ * 当成普通群消息丢进缓冲等于没听见。
+ */
+export function isChoiceMessage(message: QQBotInboundMessage): boolean {
+  return (message as unknown as { rawEventType?: string }).rawEventType === 'CHOICE_INTERACTION';
+}
+
 /** 这条消息是不是 @ 了机器人本人。只看 openid / bot+username，不看空的 bot 标志。 */
 export function isBotMentioned(message: QQBotInboundMessage, config: AgentConfig): boolean {
   const mentions = (message as unknown as { mentions?: unknown }).mentions;
@@ -637,6 +656,8 @@ export class ChatAgent {
   /** 每个群一个记录本（直接对话也一个）。 */
   private readonly recordStores = new Map<string, RecordStore>();
   private readonly goalStores = new Map<string, GoalStore>();
+  /** 待选选项卡片（按钮），按会话分开。 */
+  private readonly choiceStores = new Map<string, ChoiceStore>();
   /** 待执行的自动续跑定时器（每群最多一个）。 */
   private readonly goalTimers = new Map<string, NodeJS.Timeout>();
   /** 正在跑自动续跑的群，防止重入。 */
@@ -805,6 +826,8 @@ export class ChatAgent {
       onProgress?: (line: string) => void | Promise<void>;
       /** 回合结束后把完整对话交回去，供跨回合续用（前缀缓存靠它）。 */
       onConvo?: (convo: ChatMessage[], text: string) => void;
+      /** 发选项卡片（主人档才有）；不传就是没这个能力。 */
+      askChoice?: (input: { question: string; options: ChoiceOption[] }) => Promise<string>;
     } = {
       tier: 'guest',
       speaker: '',
@@ -825,7 +848,9 @@ export class ChatAgent {
     const goalForKind = chatId && this.config.goals.enabled
       ? await this.goalStoreFor(chatId).read().catch(() => undefined)
       : undefined;
-    const tools = toolDefinitionsFor(caps, goalForKind?.kind);
+    const tools = toolDefinitionsFor(caps, goalForKind?.kind, {
+      canAskChoice: access.tier === 'owner' && access.askChoice !== undefined,
+    });
     const ctx: ToolContext = {
       dataRoot: this.config.dataRoot,
       // 私聊没有群 id，就搜全部历史，否则会一条都搜不到
@@ -843,6 +868,7 @@ export class ChatAgent {
       cnbCli: caps.repoRead ? this.cnbCli : undefined,
       speaker: access.speaker,
       reviewSlice: (input) => this.reviewSlice(input),
+      ...(access.askChoice ? { askChoice: access.askChoice } : {}),
     };
 
     const deadline = Date.now() + this.config.turnBudgetMs;
@@ -1095,6 +1121,76 @@ export class ChatAgent {
       this.goalStores.set(key, store);
     }
     return store;
+  }
+
+  /** 待选卡片按会话分开存：一张卡片可能挂一整天，重启后还得能点。 */
+  private choiceStoreFor(key: string): ChoiceStore {
+    let store = this.choiceStores.get(key);
+    if (!store) {
+      store = new ChoiceStore(this.config.dataRoot, key);
+      this.choiceStores.set(key, store);
+    }
+    return store;
+  }
+
+  /**
+   * 按钮点回来了：把「主人选了 X」合成一条用户消息，照常走 handle。
+   *
+   * 只做转译，不另开一条路径 —— 上下文、权限档、目标续跑、落盘都复用现有的。
+   */
+  async handleChoice(event: InteractionEvent, bot: Bot): Promise<void> {
+    const parsed = parseChoiceData(event.data.resolved.button_data);
+    if (!parsed) {
+      return;
+    }
+    const groupOpenid = event.group_openid;
+    const userOpenid = event.user_openid ?? event.group_member_openid ?? '';
+    const clicker = event.group_member_openid ?? userOpenid;
+    const chatId = groupOpenid ?? `dm:${userOpenid}`;
+    const target = (groupOpenid
+      ? { scope: 'group', targetId: groupOpenid }
+      : { scope: 'c2c', targetId: userOpenid }) as unknown as Parameters<Bot['replyText']>[0];
+
+    // 按钮上已经限了指定用户，这里再挡一道：群里别人点了不算主人的决定
+    if (this.config.ownerOpenids.length > 0 && !this.config.ownerOpenids.includes(clicker)) {
+      this.log.info('选项卡片被非主人点击，忽略', {
+        chatId,
+        clicker: clicker.slice(0, 8),
+      });
+      return;
+    }
+
+    const pending = await this.choiceStoreFor(chatId).take(parsed.token);
+    if (!pending) {
+      await this.deliver(bot, target, '这张卡片过期了（或者已经点过），要的话我重发一张。').catch(
+        () => undefined,
+      );
+      return;
+    }
+    const option = pending.options[parsed.index];
+    if (!option) {
+      await this.deliver(bot, target, '按钮对不上（选项序号越界），我重发一张吧。').catch(() => undefined);
+      return;
+    }
+
+    const text = `（点了按钮）${option.label}${option.detail ? `：${option.detail}` : ''}\n\n原先要定的是：${pending.question}`;
+    const synthetic = {
+      rawEventType: 'CHOICE_INTERACTION',
+      kind: groupOpenid ? 'group' : 'c2c',
+      senderId: clicker,
+      senderName: '主人',
+      content: text,
+      messageId: `choice-${pending.token}-${parsed.index}`,
+      timestamp: new Date().toISOString(),
+      ...(groupOpenid ? { groupOpenid } : {}),
+      replyTarget: target,
+    } as unknown as QQBotInboundMessage;
+    this.log.info('按钮选择', {
+      conversationId: chatId,
+      token: pending.token,
+      option: option.label,
+    });
+    await this.handle(synthetic, bot);
   }
 
   /** 取消排队中的自动续跑（有人说话、或目标已收尾时）。 */
@@ -1615,7 +1711,8 @@ export class ChatAgent {
       this.digest.observe(scope.conversationId, text, Date.now());
     }
 
-    const called = scope.isDirect || isAtEvent(message) || isBotMentioned(message, this.config);
+    const called =
+      scope.isDirect || isAtEvent(message) || isBotMentioned(message, this.config) || isChoiceMessage(message);
     if (!called) {
       const imageUrls = attachments
         .filter((item) => (item.content_type ?? '').startsWith('image/') || item.url?.includes('multimedia'))
@@ -2022,12 +2119,67 @@ export class ChatAgent {
     };
     const chatId = scope.isDirect ? undefined : scope.conversationId;
 
+    // 要主人拍板时出按钮：点回来会当成一条新消息再走一遍 handle
+    const askChoice = async (input: { question: string; options: ChoiceOption[] }): Promise<string> => {
+      if (tier !== 'owner') {
+        return '当前身份发不了选项卡片：直接问一句就行。';
+      }
+      if (this.config.ownerOpenids.length === 0) {
+        return '没配 AGENT_OWNER_OPENIDS，发不了卡片。';
+      }
+      const options = input.options.slice(0, MAX_CHOICE_OPTIONS);
+      if (options.length < 2) {
+        return '至少两个选项才值得出卡片：直接说结论。';
+      }
+      const token = createHash('sha256')
+        .update(`${scope.conversationId}:${Date.now()}:${Math.random()}`)
+        .digest('hex')
+        .slice(0, 10);
+      const choice: PendingChoice = {
+        token,
+        chatId: scope.conversationId,
+        question: input.question.slice(0, 120),
+        options,
+        createdAt: Date.now(),
+        by: speaker,
+      };
+      const store = this.choiceStoreFor(scope.conversationId);
+      await store.add(choice);
+      const card = renderChoiceMarkdown(choice);
+      try {
+        await bot.pushMarkdown(
+          scope.replyTarget,
+          card,
+          buildChoiceKeyboard(choice, { ownerOpenids: this.config.ownerOpenids }),
+        );
+      } catch (error) {
+        await store.take(token).catch(() => undefined);
+        this.log.warn('选项卡片发送失败', { conversationId: scope.conversationId, error });
+        return '卡片没发出去（接口报错）：改成一句话问。';
+      }
+      if (!scope.isDirect) {
+        this.buffer.push(scope.conversationId, {
+          senderName: this.config.botUsernames[0] ?? 'Kei',
+          text: card,
+          timestamp: Date.now(),
+          isSelf: true,
+        });
+      }
+      this.log.info('发出选项卡片', {
+        conversationId: scope.conversationId,
+        token,
+        options: options.length,
+      });
+      return `已发出选项卡片（${options.length} 个按钮，token ${token}）。主人点按钮后会以新消息进来；本轮只回一句很短的话，不要重复选项内容。`;
+    };
+
     try {
       const reply = await this.converse(buildMessages(userText, true), opts, chatId, this.config.toolRounds, {
         tier,
         speaker,
         onProgress,
         onConvo: remember,
+        askChoice,
       });
       await send(reply);
       // 回合结束：还有目标就安排下一轮自动续跑（人一插话就会被取消）
@@ -2056,6 +2208,7 @@ export class ChatAgent {
           speaker,
           onProgress,
           onConvo: remember,
+          askChoice,
         });
         await send(reply);
       } catch (retryError) {

@@ -227,6 +227,27 @@ export class Bot {
     return this.client.sendMarkdown(target, content, opts);
   }
 
+  /**
+   * 主动推一条 Markdown（可带按钮），丢掉 msgId。
+   *
+   * 选项卡片要挂一整天，被动回复窗口（群聊 60 分钟、条数上限 5）撑不住；
+   * 而且卡片本身不需要引用某条消息。
+   */
+  pushMarkdown(
+    target: ReplyTarget,
+    content: string,
+    keyboard?: InlineKeyboard,
+  ): Promise<MessageResponse> {
+    const copy = { ...(target as unknown as Record<string, unknown>) };
+    delete copy.msgId;
+    return this.client.send({
+      target: copy as unknown as ReplyTarget,
+      msgType: MsgType.MARKDOWN,
+      markdown: { content },
+      ...(keyboard === undefined ? {} : { keyboard }),
+    });
+  }
+
   /** 通用发送，支持全部 msg_type。 */
   send(opts: SendMessageOptions): Promise<MessageResponse> {
     return this.client.send(opts);

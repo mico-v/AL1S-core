@@ -233,8 +233,16 @@ try {
       buttonId: event.data.resolved.button_id,
       buttonData: event.data.resolved.button_data,
     });
-    // 点击按钮必须回应，否则客户端一直 loading。
+    // 点击按钮必须回应，否则客户端一直 loading。先回再干活：回应只有 3 秒窗口。
     await b.acknowledgeInteraction(event.id, 0);
+    // 选项卡片（action.type=1 回调按钮）：把选择当成一条消息继续跑
+    if (event.type === 11) {
+      try {
+        await agent.handleChoice(event, b);
+      } catch (error) {
+        log.error('按钮选择处理失败', { error });
+      }
+    }
   });
 
   bot.onRawEvent((ctx) => {
