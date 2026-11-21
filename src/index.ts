@@ -241,6 +241,15 @@ try {
         await agent.handleChoice(event, b);
       } catch (error) {
         log.error('按钮选择处理失败', { error });
+        // 点了没反应最难受：失败也要说一句，别只写日志
+        const target = event.group_openid
+          ? { scope: 'group' as const, targetId: event.group_openid }
+          : { scope: 'c2c' as const, targetId: event.user_openid ?? '' };
+        if (target.targetId) {
+          await b
+            .pushText(target as unknown as Parameters<typeof b.pushText>[0], '按钮没处理成功（已写进日志），再点一次或者直接回我一句。')
+            .catch(() => undefined);
+        }
       }
     }
   });
