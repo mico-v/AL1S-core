@@ -83,13 +83,16 @@ export function clipLabel(label: string, max = MAX_LABEL_CHARS): string {
  * `restrictTo` 给了就限指定用户点（群里只能给到「主人在这群的 member_openid」）；
  * 没给就所有人可点 —— 单聊里就对方一个人，无所谓；群里则靠服务端 tier 再拦一道。
  *
- * `group_id` 让同一组按钮点一个其余变灰（仅 `action.type=1` 有效）。
+ * `group_id` 让同一组按钮点一个其余变灰（仅 `action.type=1` 有效）；
+ * **群聊接口不认这个字段**（2026-11-21 实测 400「请求参数 rows.buttons.group_id 无效」），
+ * 所以发群时用 `withGroupId: false` 摘掉，单聊保留。
  */
 export function buildChoiceKeyboard(
   choice: PendingChoice,
-  opts: { restrictTo?: string[] } = {},
+  opts: { restrictTo?: string[]; withGroupId?: boolean } = {},
 ): InlineKeyboard {
   const restrictTo = (opts.restrictTo ?? []).filter(Boolean);
+  const withGroupId = opts.withGroupId !== false;
   const permission =
     restrictTo.length > 0
       ? { type: 0, specify_user_ids: restrictTo }
@@ -110,8 +113,8 @@ export function buildChoiceKeyboard(
         data: encodeChoiceData(choice.token, index),
         unsupport_tips: '当前版本不支持按钮，直接回我一句选哪个',
       },
-      // 点一个，同组其它按钮自动变灰
-      group_id: `choice-${choice.token}`,
+      // 点一个，同组其它按钮自动变灰（群聊接口不认这个字段，发群时要摘掉）
+      ...(withGroupId ? { group_id: `choice-${choice.token}` } : {}),
     };
     return button;
   });

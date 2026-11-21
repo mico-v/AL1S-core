@@ -1446,6 +1446,19 @@ async function main(): Promise<void> {
     check('按钮是回调类型', first.action.type === 1);
     check('只给主人点', JSON.stringify(first.action.permission.specify_user_ids) === '["OWNER1"]');
     check('同组按钮互斥变灰', first.group_id === `choice-${token}`);
+    const groupKeyboard = buildChoiceKeyboard(choice, { restrictTo: ['MEMBER1'], withGroupId: false }) as unknown as {
+      content: { rows: Array<{ buttons: Array<Record<string, any>> }> };
+    };
+    check(
+      '发群时摘掉 group_id（群聊接口不认，会 400）',
+      groupKeyboard.content.rows[0]?.buttons[0]?.group_id === undefined,
+    );
+    check(
+      '发群时仍带 data 与限制人',
+      groupKeyboard.content.rows[0]?.buttons[0]?.action.data === encodeChoiceData(token, 0) &&
+        JSON.stringify(groupKeyboard.content.rows[0]?.buttons[0]?.action.permission.specify_user_ids) ===
+          '["MEMBER1"]',
+    );
     check('data 带序号', first.action.data === encodeChoiceData(token, 0));
     check('有过低版本兜底文案', typeof first.action.unsupport_tips === 'string');
     const open = buildChoiceKeyboard(choice) as unknown as {

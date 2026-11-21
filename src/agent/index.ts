@@ -2229,7 +2229,7 @@ export class ChatAgent {
         await bot.pushMarkdown(
           scope.replyTarget,
           card,
-          buildChoiceKeyboard(choice, { restrictTo }),
+          buildChoiceKeyboard(choice, { restrictTo, withGroupId: scope.isDirect }),
         );
       } catch (error) {
         await store.take(token).catch(() => undefined);
