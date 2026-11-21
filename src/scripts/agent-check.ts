@@ -1809,6 +1809,22 @@ async function main(): Promise<void> {
     check('自查单点名 work_mode 与 issue 号', notice.includes('work_mode') && notice.includes('#30'));
     check('自查单要求并行派工', notice.includes('并行'));
     check('工具描述里写了 work_mode 口径', JSON.stringify(toolDefinitionsFor(OWNER_CAPS)).includes('work_mode'));
+
+    const waitingGoal = {
+      id: 'g1',
+      objective: 'o',
+      criteria: ['c'],
+      slices: [{ id: 's1', title: 't', status: 'blocked' as const }],
+      status: 'active' as const,
+      createdAt: new Date().toISOString(),
+      updatedAt: new Date().toISOString(),
+      awaiting: { issue: 30, sig: 's', since: new Date(Date.now() - 26 * 60_000).toISOString() },
+      budget: { rounds: 1, maxRounds: 12, startedAt: new Date().toISOString(), maxWallMs: 1 },
+      log: [],
+    };
+    check('目标视图会写「在等 #N」', renderGoal(waitingGoal).includes('在等 #30'));
+    check('目标视图带已等时长', renderGoal(waitingGoal).includes('已等 26 分钟'));
+    check('简报也带已等时长', goalBrief(waitingGoal).includes('已等 26 分钟'));
   }
 
   console.log(failures === 0 ? '\n全部通过\n' : `\n${failures} 项失败\n`);

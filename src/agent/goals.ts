@@ -518,9 +518,20 @@ export class GoalStore {
   }
 }
 
+/** 在等 NPC 的一句话：带已等时长，超过阈值就明说会自查。 */
+export function describeAwaiting(goal: Goal, now = Date.now()): string | undefined {
+  if (!goal.awaiting) {
+    return undefined;
+  }
+  const minutes = Math.floor(watchIdleMs(goal.awaiting, now) / 60000);
+  const waited = minutes >= 1 ? `已等 ${minutes} 分钟` : '刚挂上';
+  return `在等 #${goal.awaiting.issue}（${waited}）：NPC 那边一动就叫醒，别自己轮询。`;
+}
+
 /** 给工具返回的完整视图。 */
 export function renderGoal(goal: Goal): string {
   const next = nextSlice(goal);
+  const waiting = describeAwaiting(goal);
   const slices = goal.slices
     .map((slice) => {
       const flags = [
@@ -541,6 +552,7 @@ export function renderGoal(goal: Goal): string {
     goal.objective,
     `完成判据：\n${goal.criteria.map((item) => `- ${item}`).join('\n')}`,
     `切片：\n${slices}`,
+    ...(waiting ? [waiting] : []),
     next ? `下一片：${next.id} ${next.title}` : '没有待推进的切片 —— 要么收尾（goal_finish），要么说清卡在哪（goal_block）。',
   ].join('\n');
 }
@@ -560,7 +572,7 @@ export function goalBrief(goal: Goal): string {
     lines.push('切片都处理完了：该 goal_finish 收尾，或 goal_block 说明卡点。');
   }
   if (goal.awaiting) {
-    lines.push(`在等 #${goal.awaiting.issue}：NPC 那边一动就叫醒你，别自己轮询。`);
+    lines.push(describeAwaiting(goal) ?? `在等 #${goal.awaiting.issue}`);
   }
   const recent = goal.log.slice(-3).map((entry) => `- ${entry.at.slice(5, 16).replace('T', ' ')} ${entry.text}`);
   if (recent.length > 0) {
