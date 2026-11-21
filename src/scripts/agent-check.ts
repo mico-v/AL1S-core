@@ -10,7 +10,7 @@ import { existsSync } from 'node:fs';
 import { mkdir, mkdtemp, rm, utimes, appendFile, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
-import { ChatAgent, approxTokens, clipToolOutput, describeProgress, digestOf, isBotMentioned, MAX_REPLY_CHARS, MAX_REPLY_CHUNKS, pruneToolResults, readAgentConfig, repeatedOpener, splitReply } from '../agent/index.js';
+import { ChatAgent, approxTokens, clipToolOutput, describeProgress, digestOf, isBotMentioned, MAX_REPLY_CHARS, MAX_REPLY_CHUNKS, pruneToolResults, readAgentConfig, repeatedOpener, selfCheckNotice, splitReply } from '../agent/index.js';
 import { pruneMediaCache } from '../chat-log.js';
 import type { ChatMessage } from '../agent/llm.js';
 import { GroupBuffer, renderBuffer } from '../agent/context.js';
@@ -24,9 +24,9 @@ import { PERSONA, resolvePersona } from '../agent/persona.js';
 import { capabilitiesFor, resolveTier, GUEST_CAPS, OWNER_CAPS } from '../agent/policy.js';
 import { checkCommand, parseBlacklist } from '../agent/exec.js';
 import { RecordStore } from '../agent/records.js';
-import { GoalStore, canContinue, goalBrief, nextSlice, renderGoal } from '../agent/goals.js';
+import { GoalStore, canContinue, goalBrief, nextSlice, renderGoal, shouldSelfCheck } from '../agent/goals.js';
 import { readCnbConfig, buildProbeSignature, renderIssues, renderPulls } from '../agent/cnb.js';
-import { checkCnbArgs, listCnbGuide, readCnbCliConfig, readCnbGuide, renderCnbRun, searchCnbGuide } from '../agent/cnbcli.js';
+import { checkCnbArgs, ensureBuddyMention, listCnbGuide, readCnbCliConfig, readCnbGuide, renderCnbRun, routeIssueComment, searchCnbGuide } from '../agent/cnbcli.js';
 import {
   CHOICE_TTL_MS,
   ChoiceStore,
@@ -1746,6 +1746,69 @@ async function main(): Promise<void> {
     );
     check('非法链接时没调发送层', sent === undefined);
     check('人格里写了卡片口径', PERSONA.includes('send_card') && PERSONA.includes('≤200 字'));
+  }
+
+  console.log('\n[28] 派发闭环（裸评论升级成派工 + 探针等太久自查）');
+  {
+    const dispatch = routeIssueComment(['issues', 'comment', '--number', '30', '--body', '复核不通过，请只补校验']);
+    check('CLI 发评论默认按派工算', dispatch.kind === 'dispatch' && dispatch.number === 30);
+    check('派工正文自动补 @CodeBuddy', ensureBuddyMention('复核不通过') === '@CodeBuddy\n\n复核不通过');
+    check('已经 @ 过就不重复补', ensureBuddyMention('@CodeBuddy\n\n复核不通过') === '@CodeBuddy\n\n复核不通过');
+    const plain = routeIssueComment(['issues', 'comment', '-n', '33', '-b', 'note: 只留记录']);
+    check('note: 前缀走普通评论', plain.kind === 'plain' && plain.number === 33 && plain.body === '只留记录');
+    check('别的子命令不接管', routeIssueComment(['issues', 'list-issues']).kind === 'none');
+    check('缺 body 不接管', routeIssueComment(['issues', 'comment', '--number', '30']).kind === 'none');
+
+    let ranCli = false;
+    const posted: Array<{ number: number; body: string; workMode: boolean }> = [];
+    const ctxDispatch = {
+      dataRoot: '/tmp',
+      log: quietLogger,
+      capabilities: OWNER_CAPS,
+      cnb: {
+        repo: 'mico-v/campus-nav-3d',
+        commentIssue: async (number: number, body: string, workMode = false) => {
+          posted.push({ number, body, workMode });
+        },
+      },
+      cnbCli: {
+        run: async () => {
+          ranCli = true;
+          return { code: 0, stdout: '', stderr: '' };
+        },
+      },
+    } as unknown as Parameters<typeof executeTool>[2];
+    const out = await executeTool(
+      'cnb',
+      JSON.stringify({ args: ['issues', 'comment', '--number', '30', '--body', '请只补连接表校验'] }),
+      ctxDispatch,
+    );
+    check(
+      '工具层把裸评论升级成派工',
+      posted.length === 1 && posted[0]?.workMode === true && posted[0]?.number === 30,
+    );
+    check('升级后正文带 @CodeBuddy', (posted[0]?.body ?? '').includes('@CodeBuddy'));
+    check('不再落到 CLI', !ranCli);
+    check('返回值点名下一步', out.includes('goal_watch'));
+
+    const waited = { issue: 30, sig: 's', since: new Date(Date.now() - 31 * 60_000).toISOString() };
+    check('等 31 分钟触发自查', shouldSelfCheck(waited, 30 * 60_000));
+    check(
+      '等 5 分钟不打扰',
+      !shouldSelfCheck({ ...waited, since: new Date(Date.now() - 5 * 60_000).toISOString() }, 30 * 60_000),
+    );
+    check('没挂探针不自查', !shouldSelfCheck(undefined, 30 * 60_000));
+    check('0 关掉自查', !shouldSelfCheck(waited, 0));
+    check('probeIdleMs 默认 30 分钟', readAgentConfig({}).goals.probeIdleMs === 30 * 60_000);
+    check(
+      'probeIdleMs 可用环境变量调',
+      readAgentConfig({ AGENT_GOAL_PROBE_IDLE_MS: '600000' }).goals.probeIdleMs === 600_000,
+    );
+    check('0 可关掉自查', readAgentConfig({ AGENT_GOAL_PROBE_IDLE_MS: '0' }).goals.probeIdleMs === 0);
+    const notice = selfCheckNotice(30, 31);
+    check('自查单点名 work_mode 与 issue 号', notice.includes('work_mode') && notice.includes('#30'));
+    check('自查单要求并行派工', notice.includes('并行'));
+    check('工具描述里写了 work_mode 口径', JSON.stringify(toolDefinitionsFor(OWNER_CAPS)).includes('work_mode'));
   }
 
   console.log(failures === 0 ? '\n全部通过\n' : `\n${failures} 项失败\n`);

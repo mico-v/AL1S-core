@@ -17,7 +17,16 @@ import { isKind, isStatus, type RecordStore } from './records.js';
 import { isSliceStatus, renderGoal, type Goal, type GoalSlice, type GoalStore } from './goals.js';
 import { filterToolsForKind, isGoalKind, type GoalKind } from './kinds.js';
 import { renderIssue, renderIssues, renderPulls, type CnbClient } from './cnb.js';
-import { checkCnbArgs, listCnbGuide, readCnbGuide, renderCnbRun, searchCnbGuide, type CnbCli } from './cnbcli.js';
+import {
+  checkCnbArgs,
+  ensureBuddyMention,
+  listCnbGuide,
+  readCnbGuide,
+  renderCnbRun,
+  routeIssueComment,
+  searchCnbGuide,
+  type CnbCli,
+} from './cnbcli.js';
 import type { Workspace } from './workspace.js';
 import { MAX_CHOICE_OPTIONS, MAX_LABEL_CHARS, type ChoiceOption } from './choices.js';
 import { MAX_CARD_DESC_CHARS, MAX_CARD_TITLE_CHARS, buildCard, type CardInput } from './cards.js';
@@ -233,12 +242,13 @@ const GOAL_TOOLS: unknown[] = [
           criteria: {
             type: 'array',
             items: { type: 'string' },
-            description: '完成判据，要能验证：`npx vitest run` 全绿 / PR 合并 / 页面能打开',
+            description:
+              '完成判据，要能验证：`npx vitest run` 全绿 / PR 合并 / 页面能打开。每片自己能被验：别写「所有 PR 都合了」这种把切片锁死的条件，否则单片的复核永远过不了。',
           },
           slices: {
             type: 'array',
             items: { type: 'string' },
-            description: '切片（一片一个 PR），按依赖顺序，最多 12 片',
+            description: '切片（一片一个 PR），按依赖顺序，最多 12 片；互不碰目录的片标成可并行，立完一次派 2~3 个',
           },
           kind: {
             type: 'string',
@@ -285,7 +295,7 @@ const GOAL_TOOLS: unknown[] = [
     function: {
       name: 'goal_watch',
       description:
-        '派工之后挂探针：盯这个 issue，NPC 有新评论 / 开了 PR / 关了 issue 就叫醒你继续；没变化就不开口，也不烧回合。盯到一个变化就自动解除，要接着等就再挂一次。',
+        '派工之后挂探针：盯这个 issue，NPC 有新评论 / 开了 PR / 关了 issue 就叫醒你继续；没变化就不开口，也不烧回合。盯到一个变化就自动解除，要接着等就再挂一次。等够 30 分钟（AGENT_GOAL_PROBE_IDLE_MS）还没动静会自动叫醒自查：核实派工有没有真叫醒 NPC，顺便看别的片能不能先起。',
       parameters: {
         type: 'object',
         properties: {
@@ -368,7 +378,7 @@ const CNB_TOOLS: unknown[] = [
     function: {
       name: 'cnb_issue_dispatch',
       description:
-        '在 issue 里发派工评论并带 work_mode，让 NPC/CodeBuddy 下场写代码、推分支、开 PR。评论要写清分支名、可改目录、自测命令、PR 标题前缀。',
+        '在 issue 里发派工评论并带 work_mode + @CodeBuddy，让 NPC/CodeBuddy 下场写代码、推分支、开 PR。评论要写清分支名、可改目录、自测命令、PR 标题前缀。复核不通过要它重交，也走这个工具（别用 cnb 裸发评论）。能并行的片一次派 2~3 个，别串着等。',
       parameters: {
         type: 'object',
         properties: {
@@ -435,7 +445,8 @@ const CNB_CLI_TOOLS: unknown[] = [
       name: 'cnb',
       description: [
         '跑 CNB 官方 CLI（`cnb <module> <tool>`，argv 数组、不经 shell）。仓库固定为当前项目，不用传 --repo。',
-        '常用：["issues","list-issues","--state","open"]、["issues","get","--number","24"]、["issues","comment","--number","24","--body","…"]、["pulls","get","--number","37"]、["pulls","list-files","--number","37"]、["pulls","check-status","--number","37"]、["pulls","get-ci-logs","--number","37"]、["pulls","submit-review","--number","37","--event","approve","--body","…"]、["build","…"]、["assets","…"]、["knowledge-base","…"]。',
+        '常用：["issues","list-issues","--state","open"]、["issues","get","--number","24"]、["pulls","get","--number","37"]、["pulls","list-files","--number","37"]、["pulls","check-status","--number","37"]、["pulls","get-ci-logs","--number","37"]、["pulls","submit-review","--number","37","--event","approve","--body","…"]、["build","…"]、["assets","…"]、["knowledge-base","…"]。',
+        '发评论注意：["issues","comment"] 会按派工口径自动补 @CodeBuddy + work_mode（裸评论叫不醒 NPC）；只要普通记录就在 body 前写 note: 前缀。',
         '不确定命令或参数就先 cnb_guide（name=cnb-api / cnb-pipeline / cnb-code-review）查官方口径。',
         '注意：CLI 对 HTTP 404 也退出 0，结论看输出里的 status / errcode。',
       ].join(''),
@@ -1195,9 +1206,13 @@ async function executeToolInner(name: string, rawArgs: string, ctx: ToolContext)
       if (!number || !comment) {
         return '派工需要 issue 号和说明。';
       }
-      await ctx.cnb.commentIssue(number, `@CodeBuddy\n\n${comment}`, true);
+      await ctx.cnb.commentIssue(number, ensureBuddyMention(comment), true);
       ctx.log.info('CNB 派工', { repo: ctx.cnb.repo, number });
-      return `已派工 #${number}（work_mode）。等它推分支开 PR，回来用 cnb_pull_list 看。`;
+      return (
+        `已派工 #${number}（@CodeBuddy + work_mode）。等它推分支开 PR，回来用 cnb_pull_list 看。\n` +
+        `接着 goal_step 把切片标 doing，再 goal_watch(#${number}) 挂探针；` +
+        '等了 30 分钟还没动静我会自己醒一次，核实派工有没有生效。'
+      );
     }
     if (name === 'cnb_issue_close') {
       if (!ctx.cnb || !ctx.capabilities?.repoWrite) {
@@ -1233,6 +1248,24 @@ async function executeToolInner(name: string, rawArgs: string, ctx: ToolContext)
       const checked = checkCnbArgs(args.args);
       if (!checked.ok) {
         return checked.reason;
+      }
+      // 走 CLI 发评论默认按派工算：裸评论叫不醒 NPC（2026-11-21 干等 2.5 小时的坑）
+      const route = routeIssueComment(checked.args);
+      if (route.kind !== 'none') {
+        if (!ctx.cnb) {
+          return '没配 CNB 令牌，发不了评论；要用派工通道得先有 AGENT_CNB_TOKEN_FILE。';
+        }
+        if (route.kind === 'plain') {
+          await ctx.cnb.commentIssue(route.number, route.body);
+          ctx.log.info('CNB 普通评论', { repo: ctx.cnb.repo, number: route.number });
+          return `已在 #${route.number} 留了一条普通评论（note: 前缀 = 不带 work_mode，不会叫醒 NPC）。`;
+        }
+        await ctx.cnb.commentIssue(route.number, ensureBuddyMention(route.body), true);
+        ctx.log.info('CNB 重派工（CLI 评论自动升级）', { repo: ctx.cnb.repo, number: route.number });
+        return (
+          `已按派工口径发到 #${route.number}（自动补 @CodeBuddy + work_mode）—— 裸评论叫不醒 NPC，这条带上了。\n` +
+          `接着 goal_step 把切片标 doing，再 goal_watch(#${route.number}) 挂探针；只想要一条普通记录就写 note: 前缀。`
+        );
       }
       const result = await ctx.cnbCli.run(checked.args, {
         ...(asNumber(args.timeout_ms) ? { timeoutMs: asNumber(args.timeout_ms) } : {}),

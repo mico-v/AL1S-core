@@ -88,6 +88,33 @@ export function isGoalStatus(value: unknown): value is GoalStatus {
   return typeof value === 'string' && (GOAL_STATUSES as readonly string[]).includes(value);
 }
 
+/** 探针已经挂了多久（毫秒）：没在等就是 0。 */
+export function watchIdleMs(awaiting: Goal['awaiting'], now = Date.now()): number {
+  if (!awaiting) {
+    return 0;
+  }
+  const since = Date.parse(awaiting.since);
+  return Number.isFinite(since) ? Math.max(0, now - since) : 0;
+}
+
+/**
+ * 等太久该自查了吗。
+ *
+ * 2026-11-21 实测：它用裸 `cnb issues comment` 发了「复核不通过，请在这分支补…」，
+ * 没带 @CodeBuddy + work_mode，NPC 压根不会下场；探针只看指纹，于是两条 issue 干等 2 小时半。
+ * 所以等够 idleMs 必须自己醒一次，去核实「对方到底有没有被叫醒」。
+ */
+export function shouldSelfCheck(
+  awaiting: Goal['awaiting'],
+  idleMs: number,
+  now = Date.now(),
+): boolean {
+  if (!awaiting || idleMs <= 0) {
+    return false;
+  }
+  return watchIdleMs(awaiting, now) >= idleMs;
+}
+
 /** 下一片该做的：先 todo，再看 doing / review（有活干就别开新的）。 */
 export function nextSlice(goal: Goal): GoalSlice | undefined {
   return (

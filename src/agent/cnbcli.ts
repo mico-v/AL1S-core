@@ -153,6 +153,54 @@ export function checkCnbArgs(raw: unknown): CnbArgCheck {
   return { ok: true, args };
 }
 
+export type IssueCommentRoute =
+  | { kind: 'dispatch'; number: number; body: string }
+  | { kind: 'plain'; number: number; body: string }
+  | { kind: 'none' };
+
+/**
+ * `cnb issues comment` 的落点判断：默认按派工发（带 work_mode + @CodeBuddy）。
+ *
+ * 2026-11-21 实测踩坑：它用裸 CLI 发了「复核不通过，请在这个分支补…」，没带 work_mode，
+ * NPC 根本不会下场，评论看着像派了活，实际干等 2 小时半。
+ * 所以走 CLI 发评论一律升级成派工；只想留一句记录就写 `note:` 前缀（会去掉前缀再发）。
+ */
+export function routeIssueComment(args: string[]): IssueCommentRoute {
+  if (args[0] !== 'issues' || args[1] !== 'comment') {
+    return { kind: 'none' };
+  }
+  const value = (names: string[]): string | undefined => {
+    for (let i = 0; i < args.length; i += 1) {
+      const flag = args[i];
+      if (!flag || !names.includes(flag)) {
+        continue;
+      }
+      const next = args[i + 1];
+      if (next !== undefined && !next.startsWith('--')) {
+        return next;
+      }
+    }
+    return undefined;
+  };
+  const number = Number(value(['--number', '-n', '--issue', '-i']));
+  const body = value(['--body', '-b']);
+  if (!Number.isFinite(number) || number <= 0 || !body || !body.trim()) {
+    return { kind: 'none' };
+  }
+  const trimmed = body.trim();
+  if (/^note[:：]/i.test(trimmed)) {
+    return { kind: 'plain', number, body: trimmed.replace(/^note[:：]\s*/i, '') };
+  }
+  return { kind: 'dispatch', number, body: trimmed };
+}
+
+/** 派工正文一定要有 @：模型漏了就补上，不靠它记。 */
+export function ensureBuddyMention(body: string): string {
+  const trimmed = body.trim();
+  return /@CodeBuddy\b/i.test(trimmed) ? trimmed : `@CodeBuddy\n\n${trimmed}`;
+}
+
+
 export interface CnbRunResult {
   /** 进程退出码；-1 = 起不来，-2 = 超时被杀。 */
   code: number;

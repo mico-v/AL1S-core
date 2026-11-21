@@ -30,7 +30,17 @@ import { GroupMemory } from './memory.js';
 import { CONTEXT_FOOTER, CONTEXT_HEADER, resolvePersona } from './persona.js';
 import { capabilitiesFor, describeTier, resolveTier, type PolicyConfig, type Tier } from './policy.js';
 import { RecordStore } from './records.js';
-import { GoalStore, canContinue, goalBrief, nextSlice, renderGoal, type Goal, type GoalSlice } from './goals.js';
+import {
+  GoalStore,
+  canContinue,
+  goalBrief,
+  nextSlice,
+  renderGoal,
+  shouldSelfCheck,
+  watchIdleMs,
+  type Goal,
+  type GoalSlice,
+} from './goals.js';
 import { CnbClient, readCnbConfig } from './cnb.js';
 import { CnbCli, readCnbCliConfig } from './cnbcli.js';
 import { cleanQQText } from './text.js';
@@ -158,6 +168,8 @@ export interface AgentConfig {
     gapMs: number;
     maxRounds: number;
     maxWallMs: number;
+    /** 探针等这么久（毫秒）还没动静就叫醒自查；0 = 不自查。 */
+    probeIdleMs: number;
   };
 }
 
@@ -241,6 +253,8 @@ export function readAgentConfig(env: NodeJS.ProcessEnv): AgentConfig {
       // 0 = 不按轮数限，只剩墙钟闸门（长任务跟进需要它一直跑）
       maxRounds: Number(env.AGENT_GOAL_MAX_ROUNDS ?? 0) || 0,
       maxWallMs: Number(env.AGENT_GOAL_MAX_WALL_MS ?? 12 * 60 * 60 * 1000) || 12 * 60 * 60 * 1000,
+      // 30 分钟没动静就自查：NPC 可能压根没被叫醒（派工评论漏了 @ / work_mode）
+      probeIdleMs: Number(env.AGENT_GOAL_PROBE_IDLE_MS ?? 30 * 60 * 1000) || 0,
     },
   };
 }
@@ -417,6 +431,22 @@ function progressArg(raw: string): string {
   } catch {
     return '';
   }
+}
+
+/**
+ * 探针等太久的自查单。
+ *
+ * 最常见的情况不是 NPC 慢，而是它压根没被叫醒：派工评论走了裸 `cnb issues comment`，
+ * 没带 @CodeBuddy + work_mode。所以先查这个，再谈等。
+ */
+export function selfCheckNotice(issue: number, minutes: number): string {
+  return [
+    `#${issue} 已经等了 ${minutes} 分钟，一点变化都没有 —— 先自查，别接着空等：`,
+    `1) cnb_issue_get #${issue} 看最近那条派工评论：有没有 @CodeBuddy、发的时候带没带 work_mode。` +
+      '没带就用 cnb_issue_dispatch 重派一次（裸评论 NPC 不会下场）。',
+    '2) 看对应 PR 是不是还挂在旧 base 上：是就直接推 fix/ 分支并在 issue 里重派，别等 NPC 自己发现。',
+    '3) 顺手看别的 todo 切片能不能先起：能并行就一次派 2~3 片，别串着等。',
+  ].join('\n');
 }
 
 /** 一行进度：「⏳ 第 8 步 · 跑命令：npm test」。 */
@@ -1364,6 +1394,19 @@ export class ChatAgent {
       return;
     }
     if (probe.sig === awaiting.sig) {
+      // 指纹不变不等于「对方在干活」：派工评论漏了 @CodeBuddy / work_mode，NPC 根本不会下场，
+      // 这时候死等就是白等（2026-11-21 实测干等 2 小时半）。等够 probeIdleMs 就叫醒自查。
+      if (shouldSelfCheck(awaiting, this.config.goals.probeIdleMs)) {
+        const minutes = Math.max(1, Math.round(watchIdleMs(awaiting) / 60000));
+        this.log.info('探针等太久，叫醒自查', {
+          conversationId: chatId,
+          issue: awaiting.issue,
+          minutes,
+        });
+        await store.clearWatch(`等了 ${minutes} 分钟没动静，自查派工是否生效`);
+        await this.runGoalTick(scope, bot, selfCheckNotice(awaiting.issue, minutes));
+        return;
+      }
       this.log.info('NPC 还没动，继续等', { conversationId: chatId, issue: awaiting.issue });
       void this.scheduleGoalTick(scope, bot);
       return;
@@ -1434,7 +1477,8 @@ export class ChatAgent {
         `（自动续跑 ${goal.budget.rounds}/${goal.budget.maxRounds}）接着推目标：${goal.objective.slice(0, 120)}`,
         `这一轮只做一片 —— ${slice ? `${slice.id} ${slice.title}` : '没有待办切片'}。` +
           '做完就 goal_step 标进度，做完所有切片再 goal_finish，卡住就 goal_block；' +
-          '要等 NPC 交货就 goal_watch 挂探针，别自己一轮轮去轮询。',
+          '要 NPC 干活一律走 cnb_issue_dispatch（自动 @CodeBuddy + work_mode），裸 cnb issues comment 不算派工；' +
+          '互不碰目录的片一次派 2~3 个并行跑，派完 goal_watch 挂探针，别自己一轮轮轮询。',
       ]
         .filter(Boolean)
         .join('\n');
@@ -1484,7 +1528,9 @@ export class ChatAgent {
       .join('\n\n');
     const system =
       '你是独立复核者：只按判据核对证据，不看执行者的自我评价。' +
-      '证据不足以证明判据满足时一律 FAIL。' +
+      '只看「这一片该交的东西」：目标级判据里涉及其他切片的交付物（别的 PR、别的模块）不算本片的判据，' +
+      '不要因为它还没完成就判 FAIL。' +
+      '证据不足以证明本片判据满足时一律 FAIL。' +
       '只输出两行：第一行 PASS 或 FAIL，第二行一句理由（指出缺哪条证据）。';
     try {
       const raw = await this.complete(

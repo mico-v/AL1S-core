@@ -65,6 +65,21 @@
 代价：最坏情况晚一个 `AGENT_GOAL_GAP_MS`（默认 90s）才发现。要更快就把 gap 调小，
 探针本身只多两个只读请求。
 
+### 探针等太久要自查（2026-11-21 补）
+
+指纹不变**不等于**对方在干活。11-21 实测：复核不通过后用裸 `cnb issues comment` 发
+「请在这个分支上只补…」，没带 `@CodeBuddy` + `work_mode`，NPC 压根不会下场，
+探针看着「没变化」就继续睡，两条 issue 干等 2 小时半。
+
+所以 `awaiting.since` 超过 `AGENT_GOAL_PROBE_IDLE_MS`（默认 30 分钟）还没动静，
+调度器会主动 `clearWatch()` 并开一轮自查：
+
+1. 看最近那条派工评论有没有 `@CodeBuddy`、发的时候带没带 `work_mode`，没带就 `cnb_issue_dispatch` 重派；
+2. 看对应 PR 是不是还挂在旧 base 上，是就直接推 `fix/` 分支并重派；
+3. 顺手看别的 todo 切片能不能先起，能并行就一次派 2~3 片。
+
+这条不是心跳播报：只在「等超时」这个状态变化时出声，且醒来即解除。
+
 ## 自动续跑的四道闸门
 
 `index.ts` 的 `scheduleGoalTick`：
@@ -95,9 +110,13 @@ Accept 必须 `application/vnd.cnb.api+json`。
 
 - `cnb_issue_list` / `cnb_issue_get` —— 看已有切片，别重复开
 - `cnb_issue_create` —— 四段模板开 issue
-- `cnb_issue_dispatch` —— 评论带 `work_mode: true` + @CodeBuddy，派工给 NPC
+- `cnb_issue_dispatch` —— 评论带 `work_mode: true` + @CodeBuddy，派工给 NPC；**重派也走它**
 - `cnb_issue_close` —— 复核通过、PR 合并后关
 - `cnb_pull_list` —— 等 PR、看合没合
+
+走 `cnb` 官方 CLI 发 `issues comment` 时，工具层会**自动升级成派工**（补 `@CodeBuddy` + `work_mode`），
+不会落到 CLI；只想留一句记录就写 `note:` 前缀（去掉前缀后按普通评论发）。
+这条是为了堵「评论看着像派了活、实际没叫醒 NPC」的坑。
 
 工具对 `repoWrite` 开放。没配令牌就整个通道不挂（模型看不到工具，不会瞎试）。
 
@@ -109,6 +128,7 @@ AGENT_GOAL_AUTO=true
 AGENT_GOAL_GAP_MS=90000
 AGENT_GOAL_MAX_ROUNDS=12
 AGENT_GOAL_MAX_WALL_MS=14400000
+AGENT_GOAL_PROBE_IDLE_MS=1800000   # 探针等 30 分钟没动静就自查；0 = 关
 AGENT_CNB_REPO=mico-v/campus-nav-3d
 AGENT_CNB_TOKEN_FILE=/srv/kei/.config/cnb/token
 AGENT_CNB_API_BASE=https://api.cnb.cool
@@ -116,5 +136,6 @@ AGENT_CNB_API_BASE=https://api.cnb.cool
 
 ## 自检
 
-`pnpm agent:check` 的 `[21] 持续目标` 与 `[22] CNB issue 协作通道` 两段覆盖：
-判据缺失、并发目标、切片状态流转、轮数/墙钟闸门、收尾警告、令牌缺失、渲染与工具可见性。
+`pnpm agent:check` 的 `[21] 持续目标`、`[22] CNB issue 协作通道` 与 `[28] 派发闭环` 三段覆盖：
+判据缺失、并发目标、切片状态流转、轮数/墙钟闸门、收尾警告、令牌缺失、渲染与工具可见性、
+裸评论升级成派工（不落 CLI）、`note:` 前缀走普通评论、探针等太久触发自查。
