@@ -32,13 +32,15 @@ export type GoalCommand = 'status' | 'stop' | 'resume';
 /** 目标指令：不走模型，立刻回，不花钱。 */
 export function matchGoalCommand(text: string): GoalCommand | undefined {
   const normalized = text.trim().toLowerCase().replace(/\s+/g, ' ');
-  if (normalized === '/goal' || normalized === 'goal' || normalized === '/goal status' || normalized === '/目标') {
+  // 面板 / 指令菜单里的 name 会被 QQ 规范成不带斜杠的形式，两种写法都得认
+  const bare = normalized.replace(/^\/+/, '');
+  if (bare === 'goal' || bare === 'goal status' || bare === '目标') {
     return 'status';
   }
-  if (normalized === '/goal stop' || normalized === '/goal 停' || normalized === '/目标 停') {
+  if (bare === 'goal stop' || bare === '目标 停') {
     return 'stop';
   }
-  if (normalized === '/goal resume' || normalized === '/goal 继续' || normalized === '/目标 继续') {
+  if (bare === 'goal resume' || bare === '目标 继续') {
     return 'resume';
   }
   return undefined;

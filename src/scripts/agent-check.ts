@@ -38,6 +38,14 @@ import {
   renderChoiceMarkdown,
   type PendingChoice,
 } from '../agent/choices.js';
+import {
+  PANEL_REMARK,
+  buildPanel,
+  ensurePanel,
+  validatePanel,
+  type PanelApi,
+  type PanelRecord,
+} from '../agent/panels.js';
 import { renderHandoff, shouldRotateThread, writeHandoff } from '../agent/thread.js';
 import { kindPack } from '../agent/kinds.js';
 import { matchGoalCommand } from '../agent/commands.js';
@@ -1481,6 +1489,171 @@ async function main(): Promise<void> {
     check('缺问题拒绝', (await executeTool('ask_choice', '{"options":["a","b"]}', ctxWith)).includes('question'));
     check('人格里写了按钮口径', PERSONA.includes('ask_choice') && PERSONA.includes('≤10 字'));
     check('人格里写了 markdown 链接写法', PERSONA.includes('[看这里](https://'));
+  }
+
+  console.log('\n[26] 指令面板（/v2/panels）');
+  {
+    const groupSpec = buildPanel('group');
+    const directSpec = buildPanel('c2c');
+    const groupProblems = validatePanel(groupSpec);
+    check('群聊面板合规', groupProblems.length === 0, groupProblems.join('；'));
+    check('单聊面板合规', validatePanel(directSpec).length === 0);
+    check('群聊面板带 goal 与续跑', groupSpec.items.some((item) => item.name === 'goal resume'));
+    check(
+      '单聊面板不放 goal（单聊没有目标指令）',
+      !directSpec.items.some((item) => item.name.startsWith('goal')),
+    );
+    check(
+      '指令名不带斜杠（平台会规范掉）',
+      groupSpec.items
+        .filter((item) => item.type === 'command')
+        .every((item) => !item.name.startsWith('/')),
+    );
+    check('面板元素不超过 20 个', groupSpec.items.length <= 20);
+    check(
+      '面板里的指令都被解析器认',
+      groupSpec.items
+        .filter((item) => item.type === 'command')
+        .every((item) => matchCommand(item.name) !== undefined || matchGoalCommand(item.name) !== undefined),
+    );
+    check(
+      '去掉斜杠也认（面板 name 会被 QQ 规范化）',
+      matchGoalCommand('goal resume') === 'resume' && matchGoalCommand('/goal resume') === 'resume',
+    );
+    check(
+      '超长名字被拦下',
+      validatePanel({ ...groupSpec, items: [{ type: 'command', name: '/status-and-more' }] }).some((item) =>
+        item.includes('名字超过'),
+      ),
+    );
+    check(
+      '非 https 链接被拦下',
+      validatePanel({
+        scope: 'group',
+        remark: 'x',
+        items: [{ type: 'link', name: '控制台', link: 'http://kei.st.mioc.cc' }],
+      }).some((item) => item.includes('https://')),
+    );
+    check(
+      '没实现的指令被拦下',
+      validatePanel({ scope: 'group', remark: 'x', items: [{ type: 'command', name: '/deploy' }] }).some((item) =>
+        item.includes('不是已实现的指令'),
+      ),
+    );
+    check(
+      '单聊里 /goal 不算已实现',
+      validatePanel({ scope: 'c2c', remark: 'x', items: [{ type: 'command', name: '/goal' }] }).length > 0,
+    );
+    check('空面板被拦下', validatePanel({ scope: 'c2c', remark: 'x', items: [] }).length > 0);
+
+    const fakePanelApi = (
+      records: PanelRecord[] = [],
+    ): { api: PanelApi; calls: string[] } => {
+      const calls: string[] = [];
+      let seq = 0;
+      return {
+        calls,
+        api: {
+          get: async <T,>(path: string) => {
+            calls.push(`GET ${path}`);
+            return { records } as unknown as T;
+          },
+          post: async <T,>(path: string, body?: unknown) => {
+            calls.push(`POST ${path} ${JSON.stringify(body)}`);
+            seq += 1;
+            return { panel_id: `p_new${seq}` } as unknown as T;
+          },
+          put: async <T,>(path: string, body?: unknown) => {
+            calls.push(`PUT ${path} ${JSON.stringify(body)}`);
+            return {} as unknown as T;
+          },
+          delete: async <T,>(path: string) => {
+            calls.push(`DELETE ${path}`);
+            return {} as unknown as T;
+          },
+        },
+      };
+    };
+
+    const fresh = fakePanelApi();
+    const created = await ensurePanel(fresh.api, groupSpec, { targetType: 'specific', openids: ['G1'] });
+    check('首次对账新建', created.action === 'created' && created.panelId === 'p_new1');
+    check(
+      '群聊按 group_openids 生效',
+      fresh.calls.some((call) => call.startsWith('POST /v2/panels') && call.includes('"group_openids":["G1"]')),
+    );
+
+    const same = fakePanelApi([
+      { panel_id: 'p_1', scope: 'group', target_type: 'specific', panel: { items: groupSpec.items, remark: PANEL_REMARK } },
+    ]);
+    const unchanged = await ensurePanel(same.api, groupSpec, { targetType: 'specific', openids: ['G1'] });
+    check(
+      '内容一致就不动接口',
+      unchanged.action === 'unchanged' && !same.calls.some((call) => call.startsWith('PUT') || call.startsWith('POST')),
+    );
+
+    const slashed = await ensurePanel(
+      fakePanelApi([
+        {
+          panel_id: 'p_1',
+          scope: 'group',
+          target_type: 'specific',
+          panel: {
+            items: groupSpec.items.map((item) =>
+              item.type === 'command' ? { ...item, name: `/${item.name}` } : item,
+            ),
+            remark: PANEL_REMARK,
+          },
+        },
+      ]).api,
+      groupSpec,
+      { targetType: 'specific', openids: ['G1'] },
+    );
+    check('线上带斜杠也算一致（不会每次都对账成更新）', slashed.action === 'unchanged');
+
+    const changed = fakePanelApi([
+      {
+        panel_id: 'p_1',
+        scope: 'group',
+        target_type: 'specific',
+        panel: { items: [{ type: 'command', name: '/status' }], remark: PANEL_REMARK },
+      },
+    ]);
+    const updated = await ensurePanel(changed.api, groupSpec, { targetType: 'specific', openids: ['G1'] });
+    check(
+      '内容变了就地更新',
+      updated.action === 'updated' && changed.calls.some((call) => call.startsWith('PUT /v2/panels/p_1')),
+    );
+
+    const scopeChanged = fakePanelApi([
+      { panel_id: 'p_1', scope: 'group', target_type: 'all', panel: { items: groupSpec.items, remark: PANEL_REMARK } },
+    ]);
+    const recreated = await ensurePanel(scopeChanged.api, groupSpec, { targetType: 'specific', openids: ['G1'] });
+    check(
+      '范围变了删掉重建',
+      recreated.action === 'recreated' &&
+        recreated.replaced === 'p_1' &&
+        scopeChanged.calls.some((call) => call.startsWith('DELETE /v2/panels/p_1')),
+    );
+
+    const foreign = fakePanelApi([
+      { panel_id: 'p_9', scope: 'group', target_type: 'specific', panel: { items: [], remark: 'someone-else' } },
+    ]);
+    const kept = await ensurePanel(foreign.api, groupSpec, { targetType: 'specific', openids: ['G1'] });
+    check(
+      '别人的面板不碰',
+      kept.action === 'created' && !foreign.calls.some((call) => call.includes('p_9')),
+    );
+
+    const direct = fakePanelApi();
+    await ensurePanel(direct.api, directSpec, { targetType: 'specific', openids: ['OWNER1'] });
+    check('单聊按 user_openids 生效', direct.calls.some((call) => call.includes('"user_openids":["OWNER1"]')));
+
+    const noTarget = await ensurePanel(fakePanelApi().api, groupSpec, { targetType: 'specific' }).then(
+      () => false,
+      () => true,
+    );
+    check('specific 却没给对象直接报错', noTarget);
   }
 
   console.log(failures === 0 ? '\n全部通过\n' : `\n${failures} 项失败\n`);

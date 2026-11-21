@@ -1,25 +1,25 @@
 /**
- * 注册群聊指令面板。
+ * 注册 / 对账指令面板（官方 `/v2/panels`）。
  *
- *   pnpm qq:panel            # 注册/更新，作用于 AGENT_GROUPS 里的群
- *   pnpm qq:panel --all      # 作用于所有群
- *   pnpm qq:panel --list     # 只看现有面板
+ *   pnpm qq:panel                 # 单聊按主人、群聊按 AGENT_GROUPS，各自对账一次
+ *   pnpm qq:panel --scope c2c     # 只弄单聊
+ *   pnpm qq:panel --scope group   # 只弄群聊
+ *   pnpm qq:panel --all           # 改成对该场景所有人可见（target_type=all）
+ *   pnpm qq:panel --list          # 只看线上现有面板，不动
+ *   pnpm qq:panel --dry-run       # 只校验内容，不碰接口
  *
- * 走官方 /v2/panels（scope=group）。点击面板里的「/status」会把该文本
- * 填进输入框，用户发送后由 ChatAgent 的指令分支直接应答，不经过模型。
+ * 幂等：内容没变就什么都不做；内容变了就地更新；作用范围变了删掉重建
+ * （更新接口不改范围）。面板内容与约束都声明在 src/agent/panels.ts，
+ * 这个脚本只负责取 token 与打日志。
+ *
+ * 点击面板里的指令会把文字填进输入框，用户发送后由 ChatAgent 的指令分支
+ * 直接应答，不经过模型。
  */
+
+import { PANEL_REMARK, buildPanel, ensurePanel, validatePanel, type PanelApi, type PanelScope } from '../agent/panels.js';
 
 const TOKEN_URL = 'https://bots.qq.com/app/getAppAccessToken';
 const API_BASE = 'https://api.sgroup.qq.com';
-const REMARK = 'kei-commands';
-
-interface PanelItem {
-  type: 'command' | 'link';
-  name: string;
-  desc?: string;
-  only_admin?: boolean;
-  link?: string;
-}
 
 function env(name: string): string {
   const value = process.env[name]?.trim();
@@ -28,6 +28,13 @@ function env(name: string): string {
     process.exit(1);
   }
   return value;
+}
+
+function splitList(value: string | undefined): string[] {
+  return (value ?? '')
+    .split(',')
+    .map((item) => item.trim())
+    .filter(Boolean);
 }
 
 async function getToken(appId: string, secret: string): Promise<string> {
@@ -43,95 +50,122 @@ async function getToken(appId: string, secret: string): Promise<string> {
   return data.access_token;
 }
 
-async function api<T>(token: string, method: string, path: string, body?: unknown): Promise<T> {
-  const res = await fetch(`${API_BASE}${path}`, {
-    method,
-    headers: {
-      authorization: `QQBot ${token}`,
-      'content-type': 'application/json',
+function makeApi(token: string): PanelApi {
+  const call = async <T>(method: string, path: string, body?: unknown): Promise<T> => {
+    const res = await fetch(`${API_BASE}${path}`, {
+      method,
+      headers: { authorization: `QQBot ${token}`, 'content-type': 'application/json' },
+      ...(body === undefined ? {} : { body: JSON.stringify(body) }),
+    });
+    const text = await res.text();
+    if (!res.ok) {
+      throw new Error(`${method} ${path} → ${res.status} ${text.slice(0, 300)}`);
+    }
+    return (text ? JSON.parse(text) : {}) as T;
+  };
+  return {
+    get: <T>(path: string, query?: Record<string, string | number | boolean>) => {
+      const qs = query
+        ? `?${Object.entries(query)
+            .map(([key, value]) => `${encodeURIComponent(key)}=${encodeURIComponent(String(value))}`)
+            .join('&')}`
+        : '';
+      return call<T>('GET', `${path}${qs}`);
     },
-    ...(body ? { body: JSON.stringify(body) } : {}),
-  });
-  const text = await res.text();
-  if (!res.ok) {
-    throw new Error(`${method} ${path} → ${res.status} ${text.slice(0, 300)}`);
-  }
-  return (text ? JSON.parse(text) : {}) as T;
+    post: <T>(path: string, body?: unknown) => call<T>('POST', path, body),
+    put: <T>(path: string, body?: unknown) => call<T>('PUT', path, body),
+    delete: <T>(path: string) => call<T>('DELETE', path),
+  };
 }
 
 interface PanelRecord {
   panel_id: string;
   scope: string;
   target_type: string;
-  panel: { items?: PanelItem[]; remark?: string; version?: number };
+  panel: { items?: { type?: string; name?: string; desc?: string; link?: string }[]; remark?: string; version?: number };
+}
+
+async function listPanels(api: PanelApi, scope: PanelScope): Promise<void> {
+  const list = await api.get<{ records?: PanelRecord[] }>('/v2/panels', { scope, limit: 50 });
+  const records = list.records ?? [];
+  console.log(`${scope} 场景现有面板 ${records.length} 个：`);
+  for (const record of records) {
+    const mine = record.panel?.remark === PANEL_REMARK ? ' ← 我的' : '';
+    console.log(`  ${record.panel_id} · ${record.target_type} · remark=${record.panel?.remark ?? '-'}${mine}`);
+    for (const item of record.panel?.items ?? []) {
+      console.log(`    - [${item.type}] ${item.name}${item.desc ? ` · ${item.desc}` : ''}${item.link ? ` → ${item.link}` : ''}`);
+    }
+  }
 }
 
 async function main(): Promise<void> {
-  const appId = env('QQBOT_APP_ID');
-  const secret = env('QQBOT_APP_SECRET');
   const argv = process.argv.slice(2);
   const listOnly = argv.includes('--list');
-  const allGroups = argv.includes('--all');
+  const dryRun = argv.includes('--dry-run');
+  const allScopes = argv.includes('--all');
+  const scopeArg = argv[argv.indexOf('--scope') + 1];
+  const scopes: PanelScope[] =
+    argv.includes('--scope') && (scopeArg === 'c2c' || scopeArg === 'group')
+      ? [scopeArg]
+      : ['c2c', 'group'];
 
-  const token = await getToken(appId, secret);
+  const targets: Record<PanelScope, string[]> = {
+    c2c: splitList(process.env.AGENT_OWNER_OPENIDS),
+    group: splitList(process.env.AGENT_GROUPS),
+  };
 
-  const existing = await api<{ records?: PanelRecord[] }>(token, 'GET', '/v2/panels?scope=group&limit=50');
-  const ours = (existing.records ?? []).find((record) => record.panel?.remark === REMARK);
-
-  if (listOnly) {
-    console.log(`现有群聊面板 ${existing.records?.length ?? 0} 个：`);
-    for (const record of existing.records ?? []) {
-      console.log(`  ${record.panel_id} · ${record.target_type} · remark=${record.panel?.remark ?? '-'}`);
-      for (const item of record.panel?.items ?? []) {
-        console.log(`    - [${item.type}] ${item.name}${item.desc ? ` · ${item.desc}` : ''}`);
+  if (!dryRun) {
+    // 先把内容校验跑一遍，不合规就别浪费一次接口调用
+    for (const scope of scopes) {
+      const problems = validatePanel(buildPanel(scope));
+      if (problems.length > 0) {
+        console.error(`${scope} 面板不合规：${problems.join('；')}`);
+        process.exit(1);
       }
     }
-    return;
   }
 
-  const items: PanelItem[] = [
-    { type: 'command', name: '/status', desc: '看 Kei 当前的对话状态' },
-    { type: 'link', name: '控制台', desc: '消息与用量（仅主人）', link: 'https://kei.st.mioc.cc', only_admin: true },
-  ];
-  const panel = { items, remark: REMARK };
-
-  const desiredType = allGroups ? 'all' : 'specific';
-
-  // 更新接口只改内容，不改作用范围。范围要变（例如新加了群、想改成全群生效），
-  // 必须删掉重建 —— 否则面板永远绑在最初那几个群上，新群看不到。
-  if (ours && ours.target_type !== desiredType) {
-    try {
-      await api(token, 'DELETE', `/v2/panels/${ours.panel_id}`);
-      console.log(`已删除旧面板 ${ours.panel_id}（${ours.target_type} → ${desiredType}）`);
-    } catch (error) {
-      console.warn(`删除旧面板失败，将直接新建：${error instanceof Error ? error.message : String(error)}`);
+  if (dryRun) {
+    for (const scope of scopes) {
+      const spec = buildPanel(scope);
+      console.log(`${scope} 面板（${spec.items.length} 个元素，remark=${spec.remark}）：`);
+      for (const item of spec.items) {
+        console.log(`  - [${item.type}] ${item.name}${item.desc ? ` · ${item.desc}` : ''}${item.link ? ` → ${item.link}` : ''}`);
+      }
     }
-  } else if (ours) {
-    const result = await api<{ version?: number }>(token, 'PUT', `/v2/panels/${ours.panel_id}`, { panel });
-    console.log(`已更新面板 ${ours.panel_id} → version ${result.version ?? '?'}`);
+    console.log('（dry-run：没动接口）');
     return;
   }
 
-  const groups = allGroups
-    ? []
-    : (process.env.AGENT_GROUPS ?? '')
-        .split(',')
-        .map((g) => g.trim())
-        .filter(Boolean);
+  const api = makeApi(await getToken(env('QQBOT_APP_ID'), env('QQBOT_APP_SECRET')));
 
-  if (!allGroups && groups.length === 0) {
-    console.error('没有指定群：设置 AGENT_GROUPS，或加 --all');
-    process.exit(1);
-  }
-
-  const created = await api<{ panel_id?: string; version?: number }>(token, 'POST', '/v2/panels', {
-    scope: 'group',
-    ...(allGroups ? { target_type: 'all' } : { target_type: 'specific', group_openids: groups }),
-    panel,
-  });
-  console.log(`已创建面板 ${created.panel_id ?? '?'} → version ${created.version ?? '?'}`);
-  if (!allGroups) {
-    console.log(`作用群：${groups.join(', ')}`);
+  for (const scope of scopes) {
+    if (listOnly) {
+      await listPanels(api, scope);
+      continue;
+    }
+    const openids = targets[scope];
+    if (!allScopes && openids.length === 0) {
+      console.log(
+        `${scope}：没有生效对象（${scope === 'c2c' ? 'AGENT_OWNER_OPENIDS' : 'AGENT_GROUPS'} 为空），跳过；要全局生效加 --all`,
+      );
+      continue;
+    }
+    const result = await ensurePanel(api, buildPanel(scope), {
+      targetType: allScopes ? 'all' : 'specific',
+      openids,
+    });
+    const actionText: Record<typeof result.action, string> = {
+      created: '已创建',
+      updated: '已更新',
+      recreated: '范围变了，已重建',
+      unchanged: '内容没变，跳过',
+    };
+    console.log(
+      `${scope}：${actionText[result.action]} ${result.panelId ?? ''}${
+        result.replaced ? `（原 ${result.replaced}）` : ''
+      }${!allScopes && openids.length > 0 ? ` · 生效对象 ${openids.length} 个` : ' · 全局'}`,
+    );
   }
 }
 
