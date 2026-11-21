@@ -22,7 +22,7 @@ import { buildRequestBody, quotaPauseFrom } from '../agent/llm.js';
 import { parseNativeToolCalls } from '../agent/dsml.js';
 import { PERSONA, resolvePersona } from '../agent/persona.js';
 import { capabilitiesFor, resolveTier, GUEST_CAPS, OWNER_CAPS } from '../agent/policy.js';
-import { checkCommand, parseBlacklist } from '../agent/exec.js';
+import { checkCommand, heavyLocalHint, parseBlacklist, parseHeavyMode } from '../agent/exec.js';
 import { RecordStore } from '../agent/records.js';
 import { GoalStore, canContinue, goalBrief, nextSlice, renderGoal, shouldSelfCheck } from '../agent/goals.js';
 import { readCnbConfig, buildProbeSignature, renderIssues, renderPulls } from '../agent/cnb.js';
@@ -909,6 +909,7 @@ async function main(): Promise<void> {
     repo: 'campus-nav-3d',
     repoSlug: 'mico-v/campus-nav-3d',
     cmdBlacklist: [] as string[],
+    localHeavy: 'block' as const,
   };
   check('主人 → owner', resolveTier('OWNER', 'G1', policy) === 'owner');
   check('工程群里的开发成员 → dev', resolveTier('DEV', 'G1', policy) === 'dev');
@@ -1838,6 +1839,53 @@ async function main(): Promise<void> {
     check('目标视图会写「在等 #N」', renderGoal(waitingGoal).includes('在等 #30'));
     check('目标视图带已等时长', renderGoal(waitingGoal).includes('已等 26 分钟'));
     check('简报也带已等时长', goalBrief(waitingGoal).includes('已等 26 分钟'));
+  }
+
+  console.log('\n[29] 轻本地：全量测试/构建交给 CI');
+  {
+    check('全量单测认得出', heavyLocalHint('npx vitest run') === '全量单测');
+    check('带管道也认得出', heavyLocalHint('cd x && npx vitest run 2>&1 | tail -20') === '全量单测');
+    check('定向用例放行', heavyLocalHint('npx vitest run tests/landing.test.ts') === undefined);
+    check('-t 过滤放行', heavyLocalHint('npx vitest run -t landing') === undefined);
+    check('全量构建认得出', heavyLocalHint('npm run build') === '全量构建/测试');
+    check('类型检查认得出', heavyLocalHint('npx tsc --noEmit') === '全量构建/类型检查');
+    check('普通命令不误伤', heavyLocalHint('git status --short') === undefined);
+    check('搜 vitest 不误伤', heavyLocalHint('grep -rn vitest tests/ | head') === undefined);
+    check('读文件不误伤', heavyLocalHint('sed -n 1,80p src/main.ts') === undefined);
+
+    check('模式默认 block', parseHeavyMode(undefined) === 'block');
+    check('模式认 warn', parseHeavyMode('warn') === 'warn');
+    check('模式认 allow', parseHeavyMode('allow') === 'allow');
+    check('写错当默认', parseHeavyMode('yes') === 'block');
+    check('配置默认 block', readAgentConfig({}).policy.localHeavy === 'block');
+    check('配置可改 allow', readAgentConfig({ AGENT_LOCAL_HEAVY: 'allow' }).policy.localHeavy === 'allow');
+
+    let ran = false;
+    const ctxHeavy = {
+      dataRoot: '/tmp',
+      log: quietLogger,
+      capabilities: OWNER_CAPS,
+      localHeavy: 'block' as const,
+      workspace: { root: '/tmp', repoDir: '/tmp', home: '/tmp' },
+      runCommand: async () => {
+        ran = true;
+        return { ok: true, code: 0, stdout: '', stderr: '', timedOut: false, truncated: false };
+      },
+    } as unknown as Parameters<typeof executeTool>[2];
+    const blocked = await executeTool('run_command', JSON.stringify({ cmd: 'npx vitest run' }), ctxHeavy);
+    check('本地全量单测被拦下', blocked.includes('不在本地跑'));
+    check('拦下时指向 CI', blocked.includes('ci_status'));
+    check('拦下时给出定向用例写法', blocked.includes('tests/xxx.test.ts'));
+    check('拦下时提示 force 逃生口', blocked.includes('force'));
+    check('拦下时没真去跑', !ran);
+    check('run_command 暴露 force', JSON.stringify(toolDefinitionsFor(OWNER_CAPS)).includes('"force"'));
+    check('工具描述写了不在本地跑全量', JSON.stringify(toolDefinitionsFor(OWNER_CAPS)).includes('CI 和 NPC 的活'));
+    const allowed = await executeTool(
+      'run_command',
+      JSON.stringify({ cmd: 'npx vitest run tests/landing.test.ts' }),
+      ctxHeavy,
+    );
+    check('定向用例不被拦', !allowed.includes('不在本地跑'));
   }
 
   console.log(failures === 0 ? '\n全部通过\n' : `\n${failures} 项失败\n`);

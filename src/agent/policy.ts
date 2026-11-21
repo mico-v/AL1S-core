@@ -19,6 +19,8 @@
 
 export type Tier = 'owner' | 'dev' | 'guest';
 
+import type { HeavyMode } from './exec.js';
+
 export interface PolicyConfig {
   /** 主人 openid：任何场景都是 owner。 */
   ownerOpenids: string[];
@@ -39,6 +41,11 @@ export interface PolicyConfig {
    * 要拦什么只改 `.env` 的 `AGENT_CMD_BLACKLIST`，不用改代码。
    */
   cmdBlacklist: string[];
+  /**
+   * 全量测试 / 构建这类重活本地还跑不跑：`block`（默认，拦下并引导去 CI）/ `warn`（跑但告警）/ `allow`。
+   * 2026-11-21 口径：Kei 是指挥，不是施工队 —— 全量验证是 CI 和 NPC 的活。
+   */
+  localHeavy: HeavyMode;
 }
 
 export interface Capabilities {

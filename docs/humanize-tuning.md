@@ -116,6 +116,21 @@ Kei 现在的短板不是「跑得太久会烧钱」，而是**能力边界**：
 - 能力含义：从「发了评论就算派了活」变成「评论发出去、NPC 真的动了、没动就自己查」。
 - 验收：`agent:check` 新增 `[28] 派发闭环`，断言裸评论升级、`note:` 前缀、探针超时阈值与自查单。
 
+### C7 轻本地：全量验证是 CI 的活（已落地）
+
+- **问题（2026-11-21 实测）**：一次 `npx vitest run` 在本机 167 秒，输出还要吃几千 token；
+  一晚上它在本地跑了十几轮全量测试与构建。机器只有 1.6G 内存，这活本来就是 NPC 与 CI 的。
+- `exec.ts` 的 `heavyLocalHint()` 认三类重活：全量单测（`vitest`/`jest` 不带文件或用例过滤）、
+  全量构建/测试（`npm|pnpm|yarn run build|test`）、全量构建/类型检查（`vite|tsc|astro|rollup` 的
+  `build` 或 `--noEmit`）。
+- `run_command` 在 `AGENT_LOCAL_HEAVY=block`（默认）下直接拦，并给替代路径：看 PR 里 NPC 贴的输出 +
+  `ci_status` / `cnb pulls check-status`；要复现只跑定向用例（`npx vitest run tests/xxx.test.ts`）。
+  确实必须本地跑就带 `force`；要全局放开改 `AGENT_LOCAL_HEAVY=warn|allow`。
+- 人格与续跑提示同步改口径：**Kei 是指挥，不是施工队** —— 拆片、派工、验收、记结论归它；
+  写代码、跑全量测试与构建归 NPC 和 CI。能并行的片一次派 2~3 个。
+- 验收：`agent:check` 新增 `[29] 轻本地`，断言三类重活识别、定向用例放行、拦截时给替代路径、
+  `force` 逃生口、配置开关。
+
 ## 五、保留的三道安全阀（唯一允许的限制）
 
 这些是防跑飞，不是给能力上锁，任何一条触发都要在群里出声：
@@ -137,6 +152,7 @@ Kei 现在的短板不是「跑得太久会烧钱」，而是**能力边界**：
 - **C2（暂缓）**：单模型阶段先不做多模型接力；复核已按「同模型 + 空上下文」退化并标注。
 - **C6（已落地）**：`routeIssueComment` / `ensureBuddyMention` / `shouldSelfCheck`，
   `[28]` 自检守着；`AGENT_GOAL_PROBE_IDLE_MS` 默认 1800000。
+- **C7（已落地）**：`heavyLocalHint` / `parseHeavyMode`，`[29]` 自检守着；`AGENT_LOCAL_HEAVY` 默认 `block`。
 - 回滚：C1 / C3 / C4 各自一个提交，出问题 revert 后 `pnpm build` + 重启即可。
 
 ## 七、明确不做

@@ -44,7 +44,7 @@ import {
 import { CnbClient, readCnbConfig } from './cnb.js';
 import { CnbCli, readCnbCliConfig } from './cnbcli.js';
 import { cleanQQText } from './text.js';
-import { parseBlacklist, runCommand } from './exec.js';
+import { parseBlacklist, parseHeavyMode, runCommand } from './exec.js';
 import { kindPack } from './kinds.js';
 import { renderHandoff, handoffPath, shouldRotateThread, writeHandoff } from './thread.js';
 import { executeTool, toolDefinitionsFor, type ToolContext } from './tools.js';
@@ -224,6 +224,8 @@ export function readAgentConfig(env: NodeJS.ProcessEnv): AgentConfig {
       repoSlug: env.AGENT_REPO_SLUG ?? 'mico-v/campus-nav-3d',
       // 黑名单模式：默认空 = 全部放行；收紧时只改 .env，不改代码
       cmdBlacklist: parseBlacklist(env.AGENT_CMD_BLACKLIST),
+      // 全量测试/构建是 CI 的活：默认拦，别让它在 1.6G 机器上跑 167 秒的单测
+      localHeavy: parseHeavyMode(env.AGENT_LOCAL_HEAVY),
     },
     toolRounds: Number(env.AGENT_TOOL_ROUNDS ?? 40) || 40,
     // 5 分钟一刀切会把活切成两半（2026-11-19 日志：14~19 轮必然撞墙），
@@ -902,6 +904,7 @@ export class ChatAgent {
       tier: access.tier,
       capabilities: caps,
       cmdBlacklist: this.config.policy.cmdBlacklist,
+      localHeavy: this.config.policy.localHeavy,
       workspace: caps.repoRead ? this.workspace : undefined,
       records: this.recordsFor(chatId ?? 'direct'),
       goals: this.config.goals.enabled ? this.goalStoreFor(chatId ?? 'direct') : undefined,
@@ -1476,9 +1479,10 @@ export class ChatAgent {
         notice ?? '',
         `（自动续跑 ${goal.budget.rounds}/${goal.budget.maxRounds}）接着推目标：${goal.objective.slice(0, 120)}`,
         `这一轮只做一片 —— ${slice ? `${slice.id} ${slice.title}` : '没有待办切片'}。` +
-          '做完就 goal_step 标进度，做完所有切片再 goal_finish，卡住就 goal_block；' +
-          '要 NPC 干活一律走 cnb_issue_dispatch（自动 @CodeBuddy + work_mode），裸 cnb issues comment 不算派工；' +
-          '互不碰目录的片一次派 2~3 个并行跑，派完 goal_watch 挂探针，别自己一轮轮轮询。',
+          '你的活是**指挥与验收**，不是搬砖：需求拆成切片派给 NPC（cnb_issue_dispatch），' +
+          '验收看 PR 里 NPC 贴的输出 + ci_status / cnb pulls check-status，**别在本地跑全量测试与构建**' +
+          '（要复现只跑定向用例，几秒的那种）。互不碰目录的片一次派 2~3 个并行跑，派完 goal_watch 挂探针。' +
+          '做完就 goal_step 标进度，全部验过再 goal_finish，卡住就 goal_block。',
       ]
         .filter(Boolean)
         .join('\n');

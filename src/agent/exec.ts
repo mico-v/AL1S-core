@@ -49,6 +49,40 @@ function collapsed(cmd: string): string {
   return cmd.replace(/\s+/g, ' ').trim();
 }
 
+export type HeavyMode = 'block' | 'warn' | 'allow';
+
+/** 解析 `AGENT_LOCAL_HEAVY`；不认识的写法当默认（block）。 */
+export function parseHeavyMode(raw: string | undefined): HeavyMode {
+  const value = (raw ?? '').trim().toLowerCase();
+  return value === 'allow' || value === 'warn' ? value : 'block';
+}
+
+/**
+ * 这条命令是不是「CI 的活」：全量单测 / 全量构建 / 全量类型检查。
+ *
+ * 2026-11-21 口径：Kei 是指挥，不是施工队。一次 `npx vitest run` 在本机要 167 秒，
+ * 输出还得吃几千 token；这活本来就该 NPC 在 PR 里跑、CI 在云端跑。
+ * 带文件或用例过滤的定向测试不算重活（几秒），留给自己复现用。
+ */
+export function heavyLocalHint(cmd: string): string | undefined {
+  const text = collapsed(cmd);
+  if (!text) {
+    return undefined;
+  }
+  const targetedTest =
+    /(vitest|jest)\s+(run\s+)?[^|;&]*\btests?\/[\w./-]*/.test(text) || /--testNamePattern|\s-t\s/.test(text);
+  if (/\b(vitest|jest)\b/.test(text) && !targetedTest) {
+    return '全量单测';
+  }
+  if (/\b(npm|pnpm|yarn)\s+(run\s+)?(build|test)\b/.test(text)) {
+    return '全量构建/测试';
+  }
+  if (/\b(vite|tsc|astro|rollup)\b[^|;&]*(?:\bbuild\b|--noEmit)/.test(text)) {
+    return '全量构建/类型检查';
+  }
+  return undefined;
+}
+
 export interface CheckResult {
   allowed: boolean;
   why?: string;

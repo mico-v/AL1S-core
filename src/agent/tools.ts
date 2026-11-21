@@ -11,7 +11,7 @@ import type { AppLogger } from '../logger.js';
 import type { ChatMessage, LlmOptions } from './llm.js';
 import { MessageIndex, renderHits } from './search.js';
 import { renderHits as renderWebHits, searchWeb } from './web.js';
-import { renderRunResult, runCommand } from './exec.js';
+import { heavyLocalHint, renderRunResult, runCommand, type HeavyMode } from './exec.js';
 import type { Capabilities, Tier } from './policy.js';
 import { isKind, isStatus, type RecordStore } from './records.js';
 import { isSliceStatus, renderGoal, type Goal, type GoalSlice, type GoalStore } from './goals.js';
@@ -44,6 +44,8 @@ export interface ToolContext {
   capabilities?: Capabilities;
   /** 命令黑名单（正则源）；空 = 全放行。 */
   cmdBlacklist?: string[];
+  /** 全量测试/构建本地还跑不跑：block（默认）/ warn / allow。 */
+  localHeavy?: HeavyMode;
   /** 代码工作区；没配就没有代码类工具。 */
   workspace?: Workspace;
   /** 这个群的记录本。 */
@@ -534,13 +536,19 @@ const REPO_READ_TOOLS: unknown[] = [
     function: {
       name: 'run_command',
       description:
-        '在工作区里跑一条命令。当前是黑名单模式且黑名单为空：npm / git / gh / node 等常规开发命令都放行（能提交、推分支、开 PR、看 CI），cwd 锁在工作区内，超时默认 120 秒。要写整份文件用 write_file，要改一行用 sed/python 也行。',
+        '在工作区里跑一条命令。黑名单模式：npm / git / gh / node 等常规开发命令都放行，cwd 锁在工作区内，超时默认 120 秒。' +
+        '**全量测试与构建（npx vitest run、npm run build、tsc --noEmit）默认被拦**：那是 CI 和 NPC 的活，本机跑一次几分钟、输出还吃 token。' +
+        '验收看 PR 里 NPC 贴的输出 + ci_status / cnb pulls check-status；要复现只跑定向用例（npx vitest run tests/xxx.test.ts）。确实必须本地跑就带 force。',
       parameters: {
         type: 'object',
         properties: {
           cmd: { type: 'string', description: '命令，一句一条，可以带管道' },
           cwd: { type: 'string', description: '相对工作区的目录，默认主仓库' },
           timeout_ms: { type: 'number', description: '超时，默认 120000，最大 300000' },
+          force: {
+            type: 'boolean',
+            description: '确认要在本地跑全量测试/构建（比如 CI 挂了要复现），默认 false',
+          },
         },
         required: ['cmd'],
       },
@@ -1329,6 +1337,18 @@ async function executeToolInner(name: string, rawArgs: string, ctx: ToolContext)
       const cmd = asString(args.cmd).trim();
       if (!cmd) {
         return '需要提供 cmd。';
+      }
+      // 全量测试/构建是 CI 和 NPC 的活：本地跑一次几分钟，输出还吃几千 token
+      const heavy = heavyLocalHint(cmd);
+      const heavyMode = ctx.localHeavy ?? 'block';
+      if (heavy && heavyMode !== 'allow') {
+        const tip =
+          `「${heavy}」不在本地跑：验收看 PR 里 NPC 贴的输出 + ci_status / cnb pulls check-status；` +
+          '要复现只跑定向用例（`npx vitest run tests/xxx.test.ts`，几秒）。';
+        if (heavyMode === 'block' && args.force !== true) {
+          return `${tip}\n确实必须本地跑（比如 CI 挂了要复现），把 force 设成 true。`;
+        }
+        ctx.log.warn('本地跑了重活', { cmd: cmd.slice(0, 100), mode: heavyMode });
       }
       const timeout = Math.min(Math.max(asNumber(args.timeout_ms) ?? 120_000, 5_000), 300_000);
       const result = await runCommand({

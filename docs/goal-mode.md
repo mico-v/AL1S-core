@@ -129,6 +129,7 @@ AGENT_GOAL_GAP_MS=90000
 AGENT_GOAL_MAX_ROUNDS=12
 AGENT_GOAL_MAX_WALL_MS=14400000
 AGENT_GOAL_PROBE_IDLE_MS=1800000   # 探针等 30 分钟没动静就自查；0 = 关
+AGENT_LOCAL_HEAVY=block            # 全量测试/构建本地默认拦，交给 CI 与 NPC；warn / allow 可放
 AGENT_CNB_REPO=mico-v/campus-nav-3d
 AGENT_CNB_TOKEN_FILE=/srv/kei/.config/cnb/token
 AGENT_CNB_API_BASE=https://api.cnb.cool
