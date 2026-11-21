@@ -20,6 +20,7 @@ import { renderIssue, renderIssues, renderPulls, type CnbClient } from './cnb.js
 import { checkCnbArgs, listCnbGuide, readCnbGuide, renderCnbRun, searchCnbGuide, type CnbCli } from './cnbcli.js';
 import type { Workspace } from './workspace.js';
 import { MAX_CHOICE_OPTIONS, MAX_LABEL_CHARS, type ChoiceOption } from './choices.js';
+import { MAX_CARD_DESC_CHARS, MAX_CARD_TITLE_CHARS, buildCard, type CardInput } from './cards.js';
 
 export interface ToolContext {
   dataRoot: string;
@@ -60,6 +61,11 @@ export interface ToolContext {
    * 返回给模型看的回执（已发出 / 为什么没发）。
    */
   askChoice?: (input: { question: string; options: ChoiceOption[] }) => Promise<string>;
+  /**
+   * 发一张图文卡片（标题 + 说明 + 链接 + 配图）。只在开发档以上注入；
+   * 没有它就等于没这个工具。返回给模型看的回执。
+   */
+  sendCard?: (input: CardInput) => Promise<string>;
 }
 
 /** 聊天类工具：任何身份都能用。 */
@@ -581,15 +587,40 @@ const CHOICE_TOOLS: unknown[] = [
   },
 ];
 
+/** 图文卡片：开发档以上才注入（内容类输出，guest 用不上）。 */
+const CARD_TOOLS: unknown[] = [
+  {
+    type: 'function',
+    function: {
+      name: 'send_card',
+      description:
+        '把一件成组的信息发成图文卡片（标题 + 一句说明 + 链接 + 配图）：PR / issue 交付、构建结果、方案对比这类内容，卡片比一长串文字好读。配图必须是平台能转存的 https 图片：国内可达的 CDN（如 q1.qlogo.cn）行，GitHub 头像 / raw 链接会报「图片转存失败」。发完本轮补一句结论就行，不要把卡片内容再贴一遍。',
+      parameters: {
+        type: 'object',
+        properties: {
+          title: { type: 'string', description: `标题，1~${MAX_CARD_TITLE_CHARS} 字` },
+          description: { type: 'string', description: `一句说明，1~${MAX_CARD_DESC_CHARS} 字` },
+          url: { type: 'string', description: '点击跳转的 https 链接（PR / issue / 文档）' },
+          pic_url: { type: 'string', description: '配图的 https 链接' },
+        },
+        required: ['title', 'description', 'url', 'pic_url'],
+      },
+    },
+  },
+];
+
 /** 按能力集挑工具：模型看不到它用不了的工具，就不会去试。 */
 export function toolDefinitionsFor(
   caps: Capabilities,
   kind?: GoalKind,
-  extra: { canAskChoice?: boolean } = {},
+  extra: { canAskChoice?: boolean; canSendCard?: boolean } = {},
 ): unknown[] {
   const tools: unknown[] = [...CHAT_TOOLS, ...RECORD_QUERY_TOOLS];
   if (extra.canAskChoice) {
     tools.push(...CHOICE_TOOLS);
+  }
+  if (extra.canSendCard) {
+    tools.push(...CARD_TOOLS);
   }
   if (caps.repoRead) {
     tools.push(...REPO_READ_TOOLS, ...CNB_GUIDE_TOOLS);
@@ -923,6 +954,26 @@ async function executeToolInner(name: string, rawArgs: string, ctx: ToolContext)
         return '至少给两个选项；只有一个的话直接说结论，不用出卡片。';
       }
       return await ctx.askChoice({ question, options });
+    }
+    if (name === 'send_card') {
+      if (!ctx.sendCard) {
+        return '当前身份发不了图文卡片：把结论写成文字就行。';
+      }
+      const built = buildCard({
+        title: asString(args.title),
+        description: asString(args.description),
+        url: asString(args.url),
+        picUrl: asString(args.pic_url ?? args.picUrl),
+      });
+      if ('error' in built) {
+        return built.error;
+      }
+      return await ctx.sendCard({
+        title: built.card.content.title,
+        description: built.card.content.description,
+        url: built.card.content.url,
+        picUrl: built.card.content.pic_url,
+      });
     }
     if (name === 'search_messages') {
       const query = asString(args.query).trim();

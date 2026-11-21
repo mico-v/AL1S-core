@@ -46,6 +46,12 @@ import {
   type PanelApi,
   type PanelRecord,
 } from '../agent/panels.js';
+import {
+  MAX_CARD_DESC_CHARS,
+  MAX_CARD_TITLE_CHARS,
+  buildCard,
+  renderCardLine,
+} from '../agent/cards.js';
 import { renderHandoff, shouldRotateThread, writeHandoff } from '../agent/thread.js';
 import { kindPack } from '../agent/kinds.js';
 import { matchGoalCommand } from '../agent/commands.js';
@@ -1654,6 +1660,92 @@ async function main(): Promise<void> {
       () => true,
     );
     check('specific 却没给对象直接报错', noTarget);
+  }
+
+  console.log('\n[27] 图文卡片（msg_type=8）');
+  {
+    const built = buildCard({
+      title: `${'标题'.repeat(30)}\n第二行`,
+      description: '说明'.repeat(150),
+      url: 'https://github.com/mico-v/campus-nav-3d/pull/38',
+      picUrl: 'https://avatars.githubusercontent.com/u/232133607',
+    });
+    const card = 'card' in built ? built.card : undefined;
+    check('造得出 tuwen 卡片', card?.type === 'tuwen');
+    check(
+      '标题裁到 50 字以内且不留换行',
+      (card?.content.title.length ?? 999) <= MAX_CARD_TITLE_CHARS && !(card?.content.title ?? '').includes('\n'),
+    );
+    check('说明裁到 200 字以内', (card?.content.description.length ?? 999) <= MAX_CARD_DESC_CHARS);
+    check(
+      '字段名按平台口径（pic_url 不是 picUrl）',
+      card !== undefined &&
+        typeof card.content.pic_url === 'string' &&
+        card.content.url === 'https://github.com/mico-v/campus-nav-3d/pull/38',
+    );
+    check(
+      'http 链接被拦下',
+      'error' in buildCard({ title: 't', description: 'd', url: 'http://x.y', picUrl: 'https://x.y/p.png' }),
+    );
+    check(
+      '超长链接被拦下',
+      'error' in
+        buildCard({
+          title: 't',
+          description: 'd',
+          url: `https://x.y/${'a'.repeat(1100)}`,
+          picUrl: 'https://x.y/p.png',
+        }),
+    );
+    check(
+      '缺标题/说明就整张不发',
+      'error' in buildCard({ title: '  ', description: 'd', url: 'https://x.y', picUrl: 'https://x.y/p.png' }),
+    );
+    check('配图必须是 https', 'error' in buildCard({ title: 't', description: 'd', url: 'https://x.y', picUrl: '' }));
+    check('回执行带标题与链接', card !== undefined && renderCardLine(card).includes('pull/38'));
+
+    const withCard = JSON.stringify(toolDefinitionsFor(OWNER_CAPS, undefined, { canSendCard: true }));
+    const withoutCard = JSON.stringify(toolDefinitionsFor(OWNER_CAPS));
+    check('开发档看得到 send_card', withCard.includes('send_card'));
+    check('没注入就不露 send_card', !withoutCard.includes('send_card'));
+
+    const ctxCardBase = { dataRoot: '/tmp', log: quietLogger } as unknown as Parameters<typeof executeTool>[2];
+    check(
+      '没能力时拒绝发卡片',
+      (await executeTool(
+        'send_card',
+        '{"title":"t","description":"d","url":"https://x.y","pic_url":"https://x.y/p.png"}',
+        ctxCardBase,
+      )).includes('发不了'),
+    );
+    let sent: { title: string; url: string } | undefined;
+    const ctxCard = {
+      ...ctxCardBase,
+      sendCard: async (input: { title: string; url: string }) => {
+        sent = input;
+        return '已发出';
+      },
+    } as unknown as Parameters<typeof executeTool>[2];
+    check(
+      '合法参数发得出去',
+      (await executeTool(
+        'send_card',
+        '{"title":"PR #38","description":"双模入口","url":"https://github.com/mico-v/campus-nav-3d/pull/38","pic_url":"https://x.y/p.png"}',
+        ctxCard,
+      )) === '已发出',
+    );
+    check('卡片内容原样交给发送层', sent?.title === 'PR #38' && (sent?.url ?? '').includes('pull/38'));
+    sent = undefined;
+    check(
+      '非法链接不发',
+      (await executeTool(
+        'send_card',
+        '{"title":"t","description":"d","url":"http://x.y","pic_url":"https://x.y/p.png"}',
+        ctxCard,
+      )).includes('https'),
+    );
+    check('非法链接时没调发送层', sent === undefined);
+    check('人格里写了卡片口径', PERSONA.includes('send_card') && PERSONA.includes('≤200 字'));
   }
 
   console.log(failures === 0 ? '\n全部通过\n' : `\n${failures} 项失败\n`);

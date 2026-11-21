@@ -47,6 +47,7 @@ import {
   type ChoiceOption,
   type PendingChoice,
 } from './choices.js';
+import { buildCard, renderCardLine, type CardInput } from './cards.js';
 
 import { Workspace } from './workspace.js';
 import { appendFile, mkdir } from 'node:fs/promises';
@@ -835,6 +836,8 @@ export class ChatAgent {
       onConvo?: (convo: ChatMessage[], text: string) => void;
       /** 发选项卡片（主人档才有）；不传就是没这个能力。 */
       askChoice?: (input: { question: string; options: ChoiceOption[] }) => Promise<string>;
+      /** 发图文卡片（开发档以上才有）。 */
+      sendCard?: (input: CardInput) => Promise<string>;
     } = {
       tier: 'guest',
       speaker: '',
@@ -857,6 +860,7 @@ export class ChatAgent {
       : undefined;
     const tools = toolDefinitionsFor(caps, goalForKind?.kind, {
       canAskChoice: access.tier === 'owner' && access.askChoice !== undefined,
+      canSendCard: caps.repoRead && access.sendCard !== undefined,
     });
     const ctx: ToolContext = {
       dataRoot: this.config.dataRoot,
@@ -876,6 +880,7 @@ export class ChatAgent {
       speaker: access.speaker,
       reviewSlice: (input) => this.reviewSlice(input),
       ...(access.askChoice ? { askChoice: access.askChoice } : {}),
+      ...(access.sendCard ? { sendCard: access.sendCard } : {}),
     };
 
     const deadline = Date.now() + this.config.turnBudgetMs;
@@ -2201,6 +2206,37 @@ export class ChatAgent {
       return `已发出选项卡片（${options.length} 个按钮，token ${token}）。主人点按钮后会以新消息进来；本轮只回一句很短的话，不要重复选项内容。`;
     };
 
+    // 成组的信息发成图文卡片：PR / issue 交付、构建结果。开发档以上才有
+    const sendCard = async (input: CardInput): Promise<string> => {
+      if (tier === 'guest') {
+        return '当前身份发不了图文卡片：把结论写成文字就行。';
+      }
+      const built = buildCard(input);
+      if ('error' in built) {
+        return built.error;
+      }
+      try {
+        await bot.pushCard(scope.replyTarget, built.card);
+      } catch (error) {
+        this.log.warn('图文卡片发送失败', { conversationId: scope.conversationId, error });
+        const reason = error instanceof Error ? error.message.slice(0, 120) : '';
+        return `卡片没发出去（${reason || '接口报错'}）：换个国内可达的 https 配图，或者把结论写成文字。`;
+      }
+      if (!scope.isDirect) {
+        this.buffer.push(scope.conversationId, {
+          senderName: this.config.botUsernames[0] ?? 'Kei',
+          text: renderCardLine(built.card),
+          timestamp: Date.now(),
+          isSelf: true,
+        });
+      }
+      this.log.info('发出图文卡片', {
+        conversationId: scope.conversationId,
+        title: built.card.content.title,
+      });
+      return `已发出图文卡片「${built.card.content.title}」。本轮补一句结论就行，不要把卡片内容再贴一遍。`;
+    };
+
     try {
       const reply = await this.converse(buildMessages(userText, true), opts, chatId, this.config.toolRounds, {
         tier,
@@ -2208,6 +2244,7 @@ export class ChatAgent {
         onProgress,
         onConvo: remember,
         askChoice,
+        sendCard,
       });
       await send(reply);
       // 回合结束：还有目标就安排下一轮自动续跑（人一插话就会被取消）
@@ -2237,6 +2274,7 @@ export class ChatAgent {
           onProgress,
           onConvo: remember,
           askChoice,
+          sendCard,
         });
         await send(reply);
       } catch (retryError) {

@@ -25,9 +25,13 @@ import {
   type UploadMediaResponse,
 } from '@tencent-connect/qqbot-nodejs';
 import { createHash } from 'node:crypto';
+import type { MessageCard } from './agent/cards.js';
 import { ChatStore } from './chat-log.js';
 import type { BotConfig } from './config.js';
 import { createLogger, type AppLogger } from './logger.js';
+
+/** 图文卡片的消息类型码：SDK 枚举还没收录，按平台文档透传。 */
+const MSG_TYPE_CARD = 8 as unknown as MsgType;
 
 export type MessageHandler = (message: QQBotInboundMessage, bot: Bot) => unknown | Promise<unknown>;
 export type InteractionHandler = (
@@ -245,6 +249,21 @@ export class Bot {
       msgType: MsgType.MARKDOWN,
       markdown: { content },
       ...(keyboard === undefined ? {} : { keyboard }),
+    });
+  }
+
+  /**
+   * 主动推一条图文卡片（`msg_type=8`），丢掉 msgId。
+   *
+   * SDK 的 `MsgType` 枚举只到 7，卡片靠 `extra` 透传 `card` 字段发出去。
+   */
+  pushCard(target: ReplyTarget, card: MessageCard): Promise<MessageResponse> {
+    const copy = { ...(target as unknown as Record<string, unknown>) };
+    delete copy.msgId;
+    return this.client.send({
+      target: copy as unknown as ReplyTarget,
+      msgType: MSG_TYPE_CARD,
+      extra: { card },
     });
   }
 
