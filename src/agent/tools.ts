@@ -1346,6 +1346,7 @@ async function executeToolInner(name: string, rawArgs: string, ctx: ToolContext)
           `「${heavy}」不在本地跑：验收看 PR 里 NPC 贴的输出 + ci_status / cnb pulls check-status；` +
           '要复现只跑定向用例（`npx vitest run tests/xxx.test.ts`，几秒）。';
         if (heavyMode === 'block' && args.force !== true) {
+          ctx.log.info('拦下本地重活', { cmd: cmd.slice(0, 120), heavy });
           return `${tip}\n确实必须本地跑（比如 CI 挂了要复现），把 force 设成 true。`;
         }
         ctx.log.warn('本地跑了重活', { cmd: cmd.slice(0, 100), mode: heavyMode });
