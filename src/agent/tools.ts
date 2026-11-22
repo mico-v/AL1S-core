@@ -329,10 +329,15 @@ const GOAL_TOOLS: unknown[] = [
     type: 'function',
     function: {
       name: 'goal_block',
-      description: '卡住了就明说：缺权限、等主人拍板、等 NPC 回话。写清卡在谁身上，自动续跑会停。',
+      description:
+        '卡住了就明说：缺权限、等主人拍板、等 NPC 回话。写清卡在谁身上，自动续跑会停。' +
+        '同一卡点要连续 3 轮才允许停；确实必须现在停就带 force: true。',
       parameters: {
         type: 'object',
-        properties: { reason: { type: 'string', description: '卡点 + 卡在谁身上' } },
+        properties: {
+          reason: { type: 'string', description: '卡点 + 卡在谁身上' },
+          force: { type: 'boolean', description: '没到三轮也强行停' },
+        },
         required: ['reason'],
       },
     },
@@ -635,6 +640,32 @@ const CARD_TOOLS: unknown[] = [
 ];
 
 /** 按能力集挑工具：模型看不到它用不了的工具，就不会去试。 */
+/** 只读、无副作用、可以同轮并行的工具。
+ *
+ * 表放这里而不是 index.ts：工具的定义与「能不能并行」写在一个文件里，
+ * 新增工具时看得见（参考 Codex 的 `supports_parallel`，那边是每个工具自己声明）。
+ * 没登记的默认串行，不会误并发。
+ */
+export const PARALLEL_TOOLS: ReadonlySet<string> = new Set([
+  'read_file',
+  'list_dir',
+  'grep_files',
+  'repo_status',
+  'ci_status',
+  'memory_query',
+  'memory_status',
+  'search_messages',
+  'search_topics',
+  'recent_digests',
+  'member_profile',
+  'chat_stats',
+  'goal_status',
+  'cnb_issue_list',
+  'cnb_issue_get',
+  'cnb_pull_list',
+  'cnb_guide',
+]);
+
 export function toolDefinitionsFor(
   caps: Capabilities,
   kind?: GoalKind,
@@ -1177,7 +1208,7 @@ async function executeToolInner(name: string, rawArgs: string, ctx: ToolContext)
       if (!ctx.goals || !ctx.capabilities?.memoryWrite) {
         return '当前身份不能改目标。';
       }
-      return await ctx.goals.block(asString(args.reason), ctx.speaker);
+      return await ctx.goals.block(asString(args.reason), ctx.speaker, { force: args.force === true });
     }
     if (name === 'cnb_issue_list' || name === 'cnb_pull_list' || name === 'cnb_issue_get') {
       if (!ctx.cnb || !ctx.capabilities?.repoRead) {

@@ -60,6 +60,8 @@ export interface StatusInput {
   modes?: { drop: number; store: number; process: number };
   /** 配额摘要 */
   quota?: string;
+  /** 会话状态事件：恢复/打断/状态跳变（取最近几条） */
+  events?: Array<{ at: string; kind: string; text: string }>;
 }
 
 function fmtNum(value: number): string {
@@ -171,5 +173,19 @@ export async function renderStatus(input: StatusInput): Promise<string> {
       : []),
     ...(input.quota ? [input.quota] : []),
     `已连续运行 ${fmtDuration(Date.now() - input.startedAt)}`,
+    ...renderRecovery(input.events),
   ].join('\n');
+}
+
+/** 恢复相关的那几行：只报跟「为什么停了 / 怎么又续上」有关的事。 */
+function renderRecovery(events: StatusInput['events']): string[] {
+  if (!events || events.length === 0) {
+    return [];
+  }
+  const interrupted = events.filter((event) => event.kind === 'interrupted').length;
+  const last = events[events.length - 1];
+  const lines = [
+    `恢复 被打断 ${interrupted} 次 · 最近事件 ${last ? `${fmtDay(last.at)} ${last.text.slice(0, 40)}` : '—'}`,
+  ];
+  return lines;
 }

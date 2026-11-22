@@ -59,7 +59,7 @@ import { cleanQQText } from '../agent/text.js';
 import { matchCommand, renderStatus } from '../agent/commands.js';
 import { DigestEngine, DRIFT_THRESHOLD, topicDrift } from '../agent/digest.js';
 import { MessageIndex, renderHits } from '../agent/search.js';
-import { executeTool, expandQuery, toolDefinitionsFor } from '../agent/tools.js';
+import { PARALLEL_TOOLS, executeTool, expandQuery, toolDefinitionsFor } from '../agent/tools.js';
 import { captionForSha, captionStorePath, digestAttachments, flushCaptionStore, loadImageParts, looksLikeImage, prepareImage, rememberCaption, sniffImageType, sniffVideo, useCaptionStore } from '../agent/vision.js';
 import { buildProactiveMessages, judgeProactive, parseProactive } from '../agent/proactive.js';
 import { learnSystem } from '../agent/updater.js';
@@ -1223,11 +1223,32 @@ async function main(): Promise<void> {
       renewed ? canContinue(renewed, { maxRounds: 1, maxWallMs: 3_600_000 }).ok : false,
     );
     await blockedStore.create({ objective: '等主人拍板', criteria: ['确认'], slices: ['问主人'] }, { maxRounds: 3, maxWallMs: 60_000 });
+    check('第一轮就说卡住会被拒', (await blockedStore.block('等主人拍板')).includes('还没到'));
+    check('拒卡住时状态不动', (await blockedStore.read())?.status === 'active');
+    await blockedStore.tick({ maxRounds: 3, maxWallMs: 60_000 });
+    await blockedStore.tick({ maxRounds: 3, maxWallMs: 60_000 });
     check(
-      '卡住后自动续跑停',
+      '同一卡点第三轮才停',
       (await blockedStore.block('等主人拍板')).includes('卡住') && (await blockedStore.read())?.status === 'blocked',
     );
     check('blocked 不再续跑', (await blockedStore.tick({ maxRounds: 5, maxWallMs: 60_000 }))?.ok === false);
+    check(
+      '带 force 能直接停',
+      (await (async () => {
+        const quick = new GoalStore(goalTmp, 'G8');
+        await quick.create({ objective: '急停', criteria: ['x'], slices: ['y'] }, { maxRounds: 3, maxWallMs: 60_000 });
+        return (await quick.block('要主人拍板', undefined, { force: true })).includes('卡住');
+      })()),
+    );
+    // 预算用尽是终态 budget_limited，不是 paused（paused 只给主人要求停）
+    const limitStore = new GoalStore(goalTmp, 'G10');
+    await limitStore.create({ objective: '预算用尽', criteria: ['x'], slices: ['y'] }, { maxRounds: 1, maxWallMs: 3_600_000 });
+    await limitStore.tick({ maxRounds: 1, maxWallMs: 3_600_000 });
+    check('预算用尽转 budget_limited', (await limitStore.limit('自动续跑用满 1 轮')) === true && (await limitStore.read())?.status === 'budget_limited');
+    check('budget_limited 不是 paused', (await limitStore.read())?.status !== 'paused');
+    const limited = await limitStore.read();
+    check('budget_limited 提示怎么续', limited ? String(canContinue(limited, { maxRounds: 9, maxWallMs: 3_600_000 }).reason).includes('/goal resume') : false);
+    check('resume 能从 budget_limited 续上', (await limitStore.resume()).includes('已恢复') && (await limitStore.read())?.status === 'active');
 
     // 等 NPC 交货：探针只在指纹变化时叫醒
     const watchStore = new GoalStore(goalTmp, 'G3');
@@ -2046,6 +2067,20 @@ async function main(): Promise<void> {
     } finally {
       await rm(closedTmp, { recursive: true, force: true });
     }
+  }
+
+  console.log('\n[32] 工具并行声明');
+  {
+    const all = toolDefinitionsFor(OWNER_CAPS, 'code', { canAskChoice: true, canSendCard: true });
+    const names = new Set(
+      all.map((tool) => (tool as { function?: { name?: string } }).function?.name).filter((name): name is string => Boolean(name)),
+    );
+    const missing = [...PARALLEL_TOOLS].filter((name) => !names.has(name));
+    check('并行表里的工具都真实存在', missing.length === 0, missing.join(','));
+    check('并行表不少于 10 项', PARALLEL_TOOLS.size >= 10);
+    const writes = ['run_command', 'write_file', 'apply_patch', 'goal_step', 'goal_finish', 'send_card', 'cnb_issue_close'];
+    check('写类工具不在并行表', writes.every((name) => !PARALLEL_TOOLS.has(name)));
+    check('只读工具在并行表', PARALLEL_TOOLS.has('read_file') && PARALLEL_TOOLS.has('grep_files'));
   }
 
   console.log(failures === 0 ? '\n全部通过\n' : `\n${failures} 项失败\n`);

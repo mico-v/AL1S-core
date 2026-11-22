@@ -20,7 +20,7 @@ import { isGoalKind, kindPack, type GoalKind } from './kinds.js';
 export const SLICE_STATUSES = ['todo', 'doing', 'review', 'done', 'blocked', 'dropped'] as const;
 export type SliceStatus = (typeof SLICE_STATUSES)[number];
 
-export const GOAL_STATUSES = ['active', 'paused', 'done', 'blocked', 'cancelled'] as const;
+export const GOAL_STATUSES = ['active', 'paused', 'blocked', 'budget_limited', 'done', 'cancelled'] as const;
 export type GoalStatus = (typeof GOAL_STATUSES)[number];
 
 export const MAX_OBJECTIVE_CHARS = 4000;
@@ -164,6 +164,9 @@ export function canContinue(
           .map((slice) => slice.id)
           .join('/')}）—— /goal resume 能续上`,
       };
+    }
+    if (goal.status === 'budget_limited') {
+      return { ok: false, reason: '预算用尽（budget_limited）—— /goal resume 重置预算就能接着干' };
     }
     return { ok: false, reason: `目标状态是 ${goal.status}` };
   }
@@ -585,17 +588,42 @@ export class GoalStore {
     return `目标已收尾。${goal.recap}${warn}${dropped}`;
   }
 
-  async block(reason: string, by?: string): Promise<string> {
+  async block(reason: string, by?: string, options: { force?: boolean } = {}): Promise<string> {
     const goal = await this.read();
     if (!goal) {
       return '这个群还没有目标。';
     }
     const body = clip(reason, 400);
+    // 卡住要连续 3 轮同一卡点才停（参考 Codex 的 blocked audit）：
+    // 「难」「慢」「还缺确认」都不算卡住，一遇阻就停就是把活丢掉。
+    const stalled = goal.budget.roundsSinceProgress ?? 0;
+    if (stalled < 2 && !options.force) {
+      return (
+        `这一轮还没到「卡住」的门槛（连续无进展 ${stalled} 轮，要 3 轮）—— 先接着做：` +
+        '能自己查的先查、能派给 NPC 的先派，把卡点写进 note。确实要现在停就带 force: true。'
+      );
+    }
     goal.status = 'blocked';
     goal.updatedAt = nowIso();
     goal.log.push({ at: goal.updatedAt, text: `卡住：${body}`, ...(by ? { by } : {}) });
     await this.save(goal);
+    await this.noteEvent('blocked', `卡住：${clip(body, 80)}`);
     return `目标标记为卡住：${body}。自动续跑已停，等人接手。`;
+  }
+
+  /** 预算用尽：终态而不是 paused —— paused 是主人要求停，两者不能混。 */
+  async limit(reason: string): Promise<boolean> {
+    const goal = await this.read();
+    if (!goal || goal.status !== 'active') {
+      return false;
+    }
+    goal.status = 'budget_limited';
+    goal.updatedAt = nowIso();
+    goal.log.push({ at: goal.updatedAt, text: `预算用尽：${clip(reason, 200)}` });
+    goal.log = goal.log.slice(-80);
+    await this.save(goal);
+    await this.noteEvent('limited', `预算用尽：${clip(reason, 80)}`);
+    return true;
   }
 
   async cancel(reason: string): Promise<string> {
@@ -664,6 +692,7 @@ export class GoalStore {
     });
     goal.log = goal.log.slice(-80);
     await this.save(goal);
+    await this.noteEvent('resumed', revived ? '恢复推进（仍有未收口切片）' : '恢复推进（预算重置）');
     return revived
       ? `已恢复（还有 ${unfinished.map((slice) => slice.id).join('/')} 未收口），预算重置。`
       : '已恢复，预算重置。';

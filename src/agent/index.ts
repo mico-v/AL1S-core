@@ -49,7 +49,7 @@ import { cleanQQText } from './text.js';
 import { parseBlacklist, parseHeavyMode, runCommand } from './exec.js';
 import { kindPack } from './kinds.js';
 import { renderHandoff, handoffPath, shouldRotateThread, writeHandoff } from './thread.js';
-import { executeTool, toolDefinitionsFor, type ToolContext } from './tools.js';
+import { PARALLEL_TOOLS, executeTool, toolDefinitionsFor, type ToolContext } from './tools.js';
 import {
   ChoiceStore,
   MAX_CHOICE_OPTIONS,
@@ -338,28 +338,6 @@ export function clipToolOutput(text: string, maxChars: number): string {
   }`;
 }
 
-/** 只读、无副作用，可以同一轮并行跑的工具。 */
-const PARALLEL_SAFE_TOOLS = new Set([
-  'read_file',
-  'list_dir',
-  'grep_files',
-  'search_files',
-  'repo_status',
-  'ci_status',
-  'memory_query',
-  'memory_status',
-  'search_messages',
-  'search_topics',
-  'recent_digests',
-  'member_profile',
-  'chat_stats',
-  'goal_status',
-  'cnb_issue_list',
-  'cnb_issue_get',
-  'cnb_pull_list',
-  'cnb_guide',
-]);
-
 /** 跨回合会话链：system 之外的完整消息，追加式推进。 */
 export interface ThreadState {
   /** 建链时的 system（人格/身份/工作区），一变就重建。 */
@@ -430,7 +408,6 @@ const PROGRESS_VERBS: Record<string, string> = {
   read_file: '读文件',
   write_file: '写文件',
   list_dir: '看目录',
-  search_files: '搜文件',
   repo_status: '看仓库',
   ci_status: '查 CI',
   memory_query: '翻记忆',
@@ -1154,7 +1131,7 @@ export class ChatAgent {
     };
     for (let index = 0; index < calls.length; index += 1) {
       const call = calls[index];
-      if (call && PARALLEL_SAFE_TOOLS.has(call.function.name)) {
+      if (call && PARALLEL_TOOLS.has(call.function.name)) {
         batch.push(index);
         continue;
       }
@@ -1408,10 +1385,11 @@ export class ChatAgent {
         this.log.info('不续跑', { conversationId: chatId, reason: verdict.reason, stalled });
         this.goalStopReason.set(chatId, verdict.reason ?? '');
       }
-      // 没进展才停：留在 active 会被巡检每 2 分钟捞起来空转，日志看着像在干活
+      // 没进展才停：留在 active 会被巡检每 2 分钟捞起来空转，日志看着像在干活。
+      // 停的原因是预算用尽，所以落 budget_limited（终态），不占 paused —— paused 只给主人要求停
       if (exhausted) {
-        await store.pause(`连续 ${stalled} 轮没有新进展（${verdict.reason}）`).catch((error) => {
-          this.log.warn('目标转 paused 失败', { conversationId: chatId, error });
+        await store.limit(`${verdict.reason}${stalled > 0 ? `，连续 ${stalled} 轮没进展` : ''}`).catch((error) => {
+          this.log.warn('目标转 budget_limited 失败', { conversationId: chatId, error });
         });
       }
       // 必须说一句 —— 不然群里看到的就是「干到一半人没了」
@@ -1421,7 +1399,8 @@ export class ChatAgent {
           .deliver(
             bot,
             scope.replyTarget,
-            `⏸ 连续 ${stalled} 轮没有新进展（${verdict.reason}），先停在这。回 /goal resume 我就续上（预算重置）；要换方向就 goal_step 改切片。`,
+            `⏸ ${verdict.reason}${stalled > 0 ? `，连续 ${stalled} 轮没进展` : ''}，已停在 budget_limited。` +
+              '回 /goal resume 重置预算就能接着干；要换方向就 goal_step 改切片。',
           )
           .catch((error) => this.log.warn('停跑提示发送失败', { conversationId: chatId, error }));
       }
@@ -1899,6 +1878,9 @@ export class ChatAgent {
         startedAt: this.startedAt,
         modes: this.modes,
         quota: renderQuota(await currentQuota(this.config.llm, this.log)),
+        events: await this.goalStoreFor(scope.conversationId)
+          .events()
+          .catch(() => []),
       });
       await this.deliver(bot, scope.replyTarget, body);
       this.log.info('指令', { command, conversationId: scope.conversationId });
