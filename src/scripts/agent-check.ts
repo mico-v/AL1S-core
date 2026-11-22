@@ -60,7 +60,7 @@ import { matchCommand, renderStatus } from '../agent/commands.js';
 import { DigestEngine, DRIFT_THRESHOLD, topicDrift } from '../agent/digest.js';
 import { MessageIndex, renderHits } from '../agent/search.js';
 import { PARALLEL_TOOLS, executeTool, expandQuery, toolDefinitionsFor } from '../agent/tools.js';
-import { captionForSha, captionStorePath, digestAttachments, flushCaptionStore, loadImageParts, looksLikeImage, prepareImage, rememberCaption, sniffImageType, sniffVideo, useCaptionStore } from '../agent/vision.js';
+import { SUMMARY_PREFIX, buildCompactedHistory, compactThreshold, compactionPrompt, renderForSummary, shouldCompact } from '../agent/compact.js';import { captionForSha, captionStorePath, digestAttachments, flushCaptionStore, loadImageParts, looksLikeImage, prepareImage, rememberCaption, sniffImageType, sniffVideo, useCaptionStore } from '../agent/vision.js';
 import { buildProactiveMessages, judgeProactive, parseProactive } from '../agent/proactive.js';
 import { learnSystem } from '../agent/updater.js';
 import { buildRecord, summarize } from '../agent/telemetry.js';
@@ -2081,6 +2081,41 @@ async function main(): Promise<void> {
     const writes = ['run_command', 'write_file', 'apply_patch', 'goal_step', 'goal_finish', 'send_card', 'cnb_issue_close'];
     check('写类工具不在并行表', writes.every((name) => !PARALLEL_TOOLS.has(name)));
     check('只读工具在并行表', PARALLEL_TOOLS.has('read_file') && PARALLEL_TOOLS.has('grep_files'));
+  }
+
+  console.log('\n[33] 上下文压缩（摘要替换，不丢决策）');
+  {
+    const convo: ChatMessage[] = [
+      { role: 'system', content: 'SYS' },
+      { role: 'user', content: 'u0 最早的请求' },
+      { role: 'tool', tool_call_id: 'c0', content: 't0 工具输出' },
+      { role: 'user', content: 'u1 很早的请求' },
+      { role: 'assistant', content: 'a1 回答' },
+      { role: 'tool', tool_call_id: 'c1', content: 't1 工具输出' },
+      { role: 'user', content: 'u2 中间的请求' },
+      { role: 'assistant', content: 'a2 回答' },
+      { role: 'tool', tool_call_id: 'c2', content: 't2 工具输出' },
+      { role: 'tool', tool_call_id: 'c3', content: 't3 工具输出' },
+      { role: 'user', content: 'u3 当前请求' },
+    ];
+    const compacted = buildCompactedHistory(convo, '摘要正文', { contextWindow: 100_000 });
+    check('压缩后保留 system', compacted[0]?.content === 'SYS');
+    check('摘要紧跟在 system 后', String(compacted[1]?.content).startsWith(SUMMARY_PREFIX));
+    check('摘要内容在', String(compacted[1]?.content).includes('摘要正文'));
+    check('最后一条是当前请求', compacted[compacted.length - 1]?.content === 'u3 当前请求');
+    check('保留最近用户消息', compacted.some((message) => message.content === 'u2 中间的请求'));
+    check('丢掉很早的用户消息', !compacted.some((message) => message.content === 'u0 最早的请求'));
+    check('保留最近工具输出', compacted.some((message) => message.content === 't3 工具输出'));
+    check('丢掉最早的工具输出', !compacted.some((message) => message.content === 't0 工具输出'));
+    check('压缩后消息数明显变少', compacted.length < convo.length);
+    check('摘要能被认出来（不再重摘）', buildCompactedHistory(convo, 'x', { contextWindow: 1 }).length > 0);
+
+    check('水位按绝对 token 算', compactThreshold({ contextWindow: 1_000_000, maxTokens: 60_000 }) === 60_000);
+    check('没给绝对水位就按百分比', compactThreshold({ contextWindow: 100_000 }) === 75_000);
+    check('没到水位不压', !shouldCompact(1_000, { contextWindow: 100_000 }));
+    check('到水位就压', shouldCompact(80_000, { contextWindow: 100_000 }));
+    check('压缩提示词从文件读', compactionPrompt().includes('CHECKPOINT'));
+    check('摘要输入会截断超长工具输出', renderForSummary(convo).length < 40_001);
   }
 
   console.log(failures === 0 ? '\n全部通过\n' : `\n${failures} 项失败\n`);

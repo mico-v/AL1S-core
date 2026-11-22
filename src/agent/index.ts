@@ -28,6 +28,7 @@ import {
   type ToolCall,
 } from './llm.js';
 import { GroupMemory } from './memory.js';
+import { SUMMARY_PREFIX, buildCompactedHistory, compactionPrompt, compactThreshold, renderForSummary, shouldCompact, type CompactOptions } from './compact.js';
 import { CONTEXT_FOOTER, CONTEXT_HEADER, resolvePersona } from './persona.js';
 import { capabilitiesFor, describeTier, resolveTier, type PolicyConfig, type Tier } from './policy.js';
 import { RecordStore } from './records.js';
@@ -975,6 +976,8 @@ export class ChatAgent {
       ...(access.sendCard ? { sendCard: access.sendCard } : {}),
     };
 
+    // 上一轮攒下的长链：先压再干活，别带着 80k 的旧历史开场
+    convo = await this.maybeCompact(convo, opts);
     const deadline = Date.now() + this.config.turnBudgetMs;
     // 同一组调用重复出现 = 模型在原地打转，再给工具也是空转
     const repeats = new Map<string, number>();
@@ -1058,6 +1061,8 @@ export class ChatAgent {
       });
       // 上下文瘦身：老的整段输出折成一行，别让 17 轮命令回显把 prompt 塞到 70k
       convo = pruneToolResults(convo, this.config.toolOutput, this.log, opts.conversationId);
+      // 链内减重：快顶到窗口就压成交接摘要（换链是最后手段，不拿它当日常）
+      convo = await this.maybeCompact(convo, opts);
     }
 
     // 轮数用完还没收敛：要一次纯文本，别把 tool_calls 暴露给群友
@@ -1151,8 +1156,48 @@ export class ChatAgent {
    * 拿到的就是空正文，`chatComplete` 抛错，整条消息就吐不出来了（2026-11-19 真事）。
    * 现在明确告诉它工具阶段结束，并关掉思考 —— 只要文本。
    */
-  private async wrapUp(convo: ChatMessage[], opts: LlmOptions): Promise<string> {
-    const nudge: ChatMessage = {
+  /**
+   * 链内压缩：按 token 水位触发，摘要 + 保留最近用户消息与工具输出（参考 Codex）。
+   *
+   * 失败不阻事：拿不到摘要就原样返回，下一轮接着试（换链那边还有兵底）。
+   */
+  private async maybeCompact(convo: ChatMessage[], opts: LlmOptions): Promise<ChatMessage[]> {
+    const options: CompactOptions = {
+      contextWindow: this.config.callLog.contextWindow,
+      maxTokens: this.config.thread.maxTokens,
+    };
+    const tokens = approxTokens(convo);
+    if (!shouldCompact(tokens, options)) {
+      return convo;
+    }
+    try {
+      const summary = await this.complete(
+        [
+          { role: 'system', content: compactionPrompt() },
+          { role: 'user', content: renderForSummary(convo) },
+        ],
+        { ...opts, tools: undefined, disableThinking: true, maxTokens: 1_200 },
+        1,
+      );
+      if (!summary.trim()) {
+        this.log.warn('压缩摘要为空，保持原链', { conversationId: opts.conversationId, tokens });
+        return convo;
+      }
+      const next = buildCompactedHistory(convo, summary, options);
+      this.log.info('上下文已压缩', {
+        conversationId: opts.conversationId,
+        before: tokens,
+        after: approxTokens(next),
+        threshold: compactThreshold(options),
+      });
+      return next;
+    } catch (error) {
+      this.log.warn('压缩失败，下一轮再试', { conversationId: opts.conversationId, error });
+      return convo;
+    }
+  }
+
+  private async wrapUp(convo: ChatMessage[], opts: LlmOptions): Promise<string> {    const nudge: ChatMessage = {
       role: 'user',
       content: '（系统）工具调用阶段结束。现在只用一两句话给结论：做到哪一步、已经确认了什么、下一步建议怎么做。不要再调用任何工具。',
     };
@@ -2266,10 +2311,11 @@ export class ChatAgent {
         };
       }
       const tokens = approxTokens(next.messages);
-      if (tokens > this.config.thread.maxTokens) {
+      // 硬兵底：压缩一直失败时也不能把请求撑爆（正常路径是下一轮开头先压一次）
+      if (tokens > this.config.thread.maxTokens * 3) {
         const kept = next.messages.slice(-6);
         next = { ...next, messages: [{ role: 'user', content: COMPACT_NOTE }, ...kept] };
-        this.log.info('对话链压缩', {
+        this.log.warn('对话链超硬顶，丢掉旧段', {
           conversationId: threadKey,
           tokens,
           kept: kept.length,
