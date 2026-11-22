@@ -1976,6 +1976,17 @@ async function main(): Promise<void> {
       await store.endTurn(turnId);
       check('正常收尾后标记清掉', (await store.pendingTurn()) === undefined);
 
+      // 判成被打断：清回合标记、留一条交代，下一轮只说一次
+      const killed = await store.beginTurn('goal');
+      const mark2 = await store.pendingTurn();
+      await store.markInterrupted(mark2 ?? { id: killed, startedAt: new Date().toISOString(), kind: 'goal' });
+      check('打断后回合标记清掉', (await store.pendingTurn()) === undefined);
+      const taken = await store.takeInterrupted();
+      check('打断交代能取出', Boolean(taken?.at));
+      check('打断交代只说一次', (await store.takeInterrupted()) === undefined);
+      await store.noteEvent('resumed', 'x');
+      check('事件记进 thread', (await store.events()).some((event) => event.kind === 'resumed'));
+
       // 目标也写在同一份文件里，且不碍回合留痕
       await store.create(
         { objective: 'thread 文件同时装 goal 与 turn', criteria: ['能跑'], slices: ['一片'] },

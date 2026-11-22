@@ -55,6 +55,10 @@ export interface ThreadFile {
   conversationId: string;
   goal?: Goal;
   turn?: TurnMark;
+  /** 上一轮被重启打断：下一轮要把它告诉模型（参考 Codex 的 <turn_aborted>）。 */
+  interrupted?: { at: string; kind: TurnMark['kind'] };
+  /** 最近发生的事：恢复、打断、状态跳变。只留最近几十条。 */
+  events?: Array<{ at: string; kind: string; text: string }>;
 }
 
 export interface GoalBudget {
@@ -308,6 +312,12 @@ export class GoalStore {
     if (raw.turn && raw.turn.id && raw.turn.startedAt) {
       thread.turn = raw.turn;
     }
+    if (raw.interrupted && raw.interrupted.at) {
+      thread.interrupted = raw.interrupted;
+    }
+    if (Array.isArray(raw.events)) {
+      thread.events = raw.events.filter((event) => event && typeof event.at === 'string').slice(-40);
+    }
     return thread;
   }
 
@@ -349,6 +359,44 @@ export class GoalStore {
   /** 残留的回合标记：有就说明上一轮没跑完就没了。 */
   async pendingTurn(): Promise<TurnMark | undefined> {
     return (await this.readThread()).turn;
+  }
+
+  /** 判成被打断：清回合标记，留一条 interrupted，等下一轮告诉模型。 */
+  async markInterrupted(mark: TurnMark): Promise<void> {
+    const thread = await this.readThread();
+    delete thread.turn;
+    thread.interrupted = { at: mark.startedAt, kind: mark.kind };
+    this.pushEvent(thread, 'interrupted', `上一轮（${describeTurn(mark)}）被重启打断`);
+    await this.writeThread(thread);
+  }
+
+  /** 取走「上一轮被打断」的交代：只说一次。 */
+  async takeInterrupted(): Promise<{ at: string; kind: TurnMark['kind'] } | undefined> {
+    const thread = await this.readThread();
+    if (!thread.interrupted) {
+      return undefined;
+    }
+    const interrupted = thread.interrupted;
+    delete thread.interrupted;
+    await this.writeThread(thread);
+    return interrupted;
+  }
+
+  /** 记一条事件（恢复/打断/状态跳变），只留最近 40 条。 */
+  async noteEvent(kind: string, text: string): Promise<void> {
+    const thread = await this.readThread();
+    this.pushEvent(thread, kind, text);
+    await this.writeThread(thread);
+  }
+
+  async events(): Promise<Array<{ at: string; kind: string; text: string }>> {
+    return (await this.readThread()).events ?? [];
+  }
+
+  private pushEvent(thread: ThreadFile, kind: string, text: string): void {
+    const events = thread.events ?? [];
+    events.push({ at: new Date().toISOString(), kind, text });
+    thread.events = events.slice(-40);
   }
 
   async create(input: GoalCreateInput, defaults: { maxRounds: number; maxWallMs: number }): Promise<string> {

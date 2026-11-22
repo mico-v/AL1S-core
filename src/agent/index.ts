@@ -1501,7 +1501,13 @@ export class ChatAgent {
     await this.runGoalTick(scope, bot, `NPC 那边有变化：\n${probe.summary}`);
   }
 
-  /** 启动/巡检兜底：有 active 目标的群把续跑接上（重启不丢线）。 */
+  /**
+   * 启动/巡检兜底：恢复只有一个入口。
+   *
+   * 以前这里是两套逻辑（只认 active 的续跑 + 只看残留标记的恢复），任一处漏判就是
+   * 「干到一半人没了」。现在一个会话一次 reconcile：先判被打断，再决定续不续，
+   * 两件事共用同一份 thread 状态（参考 Codex 的 resume：重放状态，而不是补一段逻辑）。
+   */
   async runGoalSweep(bot: Bot, chatIds: string[]): Promise<number> {
     if (!this.config.goals.enabled || !this.config.goals.auto) {
       return 0;
@@ -1511,106 +1517,97 @@ export class ChatAgent {
       if (!this.config.policy.devGroups.includes(chatId)) {
         continue;
       }
-      if (this.goalTimers.has(chatId) || this.goalRunning.has(chatId)) {
+      // 正在跑的会话不碰（巡检每 2 分钟一次，会撞上正常回合）
+      if (this.goalTimers.has(chatId) || this.goalRunning.has(chatId) || (this.turnDepth.get(chatId) ?? 0) > 0) {
         continue;
       }
-      const goal = await this.goalStoreFor(chatId)
-        .read()
-        .catch(() => undefined);
-      if (!goal || goal.status !== 'active') {
-        continue;
-      }
-      const scope: Scope = {
-        conversationId: chatId,
-        memoryKey: chatId,
-        isDirect: false,
-        replyTarget: { scope: 'group', targetId: chatId },
-      };
-      // 只有真排上定时器才算接上；预算已用满的群在这里返回 false，不再假报「已接上」
-      if (await this.scheduleGoalTick(scope, bot)) {
+      if (await this.reconcile(bot, chatId)) {
         resumed += 1;
       }
     }
-    resumed += await this.recoverInterrupted(bot, chatIds);
     return resumed;
   }
 
-  /**
-   * 上一轮被打断的收尾：标记文件还在，就说明有回合没跑完就没了。
-   *
-   * 以前这种情况完全静默 —— 回复没发出去、续跑没排上，目标若是 done 巡检也不放行，
-   * 群里看着就是「干到一半人没了」（2026-11-22 静默三小时）。现在必须出声，能续的直接续。
-   */
-  private async recoverInterrupted(bot: Bot, chatIds: string[]): Promise<number> {
-    let resumed = 0;
-    for (const chatId of chatIds) {
-      // 正在跑的会话不是残留（巡检每 2 分钟一次，会撞上正常回合）
-      if ((this.turnDepth.get(chatId) ?? 0) > 0) {
-        continue;
-      }
-      const store = this.goalStoreFor(chatId);
-      const mark = await store.pendingTurn().catch(() => undefined);
-      if (!mark) {
-        continue;
-      }
-      // 先清标记：后面哪怕提示发失败，也不会每次巡检都重跑一遍
-      await store.endTurn().catch(() => undefined);
-      const when = describeTurn(mark);
-      if (!this.config.policy.devGroups.includes(chatId)) {
-        this.log.warn('上一轮被重启打断（非工程群，只清标记）', { conversationId: chatId, startedAt: mark.startedAt });
-        continue;
-      }
-      const scope: Scope = {
-        conversationId: chatId,
-        memoryKey: chatId,
-        isDirect: false,
-        replyTarget: { scope: 'group', targetId: chatId },
-      };
-      const say = (text: string): void => {
-        void this
-          .deliver(bot, scope.replyTarget, text)
-          .catch((error) => this.log.warn('中断恢复提示发送失败', { conversationId: chatId, error }));
-      };
-      let goal = await store.read().catch(() => undefined);
+  /** 一个会话的恢复：判打断 → 能续就续 → 状态有变才出声。 */
+  private async reconcile(bot: Bot, chatId: string): Promise<boolean> {
+    const store = this.goalStoreFor(chatId);
+    const mark = await store.pendingTurn().catch(() => undefined);
+    const scope: Scope = {
+      conversationId: chatId,
+      memoryKey: chatId,
+      isDirect: false,
+      replyTarget: { scope: 'group', targetId: chatId },
+    };
+    const say = (text: string): void => {
+      void this
+        .deliver(bot, scope.replyTarget, text)
+        .catch((error) => this.log.warn('恢复提示发送失败', { conversationId: chatId, error }));
+    };
+    let interrupted: string | undefined;
+    if (mark) {
+      // 先落「被打断」再清回合标记：哪怕后面发送失败，也不会每次巡检重跑一遍
+      await store.markInterrupted(mark).catch(() => undefined);
+      interrupted = describeTurn(mark);
       this.log.warn('上一轮被重启打断', {
         conversationId: chatId,
         startedAt: mark.startedAt,
         kind: mark.kind,
-        status: goal?.status,
       });
-      if (!goal) {
-        say(`♻ 我上一轮（${when}）被重启打断了，那次的回复没发出去。当时没有进行中的目标，要接着干什么说一声。`);
-        continue;
+    }
+    let goal = await store.read().catch(() => undefined);
+    if (!goal) {
+      if (interrupted) {
+        say(`♻ 我上一轮（${interrupted}）被重启打断了，那次的回复没发出去。当时没有进行中的目标，要接着干什么说一声。`);
       }
-      const unfinished = goal.slices.filter((slice) => slice.status !== 'done' && slice.status !== 'dropped');
-      // done 却还有没收口的片 = 那一轮本来还在干活，被重启打断才没标完：接上，别等人来问
-      if (goal.status === 'done' && unfinished.length > 0) {
-        await store.resume().catch(() => '');
-        goal = (await store.read().catch(() => undefined)) ?? goal;
-        this.log.warn('上一轮被打断，目标续上', {
-          conversationId: chatId,
-          unfinished: unfinished.map((slice) => slice.id),
-        });
-      }
-      if (await this.scheduleGoalTick(scope, bot)) {
-        resumed += 1;
-        const slice = nextSlice(goal);
+      return false;
+    }
+    const unfinished = goal.slices.filter((slice) => slice.status !== 'done' && slice.status !== 'dropped');
+    // done 却还有没收口的片 = 那一轮本来还在干活，被重启打断才没标完：接上，别等人来问
+    if (goal.status === 'done' && unfinished.length > 0) {
+      await store.resume().catch(() => '');
+      goal = (await store.read().catch(() => undefined)) ?? goal;
+      this.log.warn('上一轮被打断，目标续上', {
+        conversationId: chatId,
+        unfinished: unfinished.map((slice) => slice.id),
+      });
+    }
+    if (await this.scheduleGoalTick(scope, bot)) {
+      const slice = nextSlice(goal);
+      if (interrupted) {
         say(
-          `♻ 我上一轮（${when}）被重启打断了，回复没发出去。已经接上了，接着推${slice ? ` ${slice.id} ${slice.title}` : '目标'}。`,
+          `♻ 我上一轮（${interrupted}）被重启打断了，回复没发出去。已经接上了，接着推${slice ? ` ${slice.id} ${slice.title}` : '目标'}。`,
         );
-        continue;
       }
+      return true;
+    }
+    if (interrupted) {
       const verdict = canContinue(goal, {
         maxRounds: this.config.goals.maxRounds,
         maxWallMs: this.config.goals.maxWallMs,
       });
       say(
-        `⚠ 我上一轮（${when}）被重启打断了，现在续不上：${verdict.reason ?? '没有待推进的切片'}。` +
+        `⚠ 我上一轮（${interrupted}）被重启打断了，现在续不上：${verdict.reason ?? '没有待推进的切片'}。` +
           '要接着干就回 /goal resume，或者 goal_create 开新目标。',
       );
     }
-    return resumed;
+    return false;
   }
+
+  /** 上一轮被打断的交代：取走一次，附在下一轮的开头（参考 Codex 的 <turn_aborted>）。 */
+  private async interruptedNotice(chatId: string): Promise<string> {
+    const mark = await this.goalStoreFor(chatId)
+      .takeInterrupted()
+      .catch(() => undefined);
+    if (!mark) {
+      return '';
+    }
+    return (
+      `[上一轮被打断 · ${describeTurn({ id: 'x', startedAt: mark.at, kind: mark.kind })}] ` +
+      '那个回合跑到一半进程重启了：工具可能只执行了一部分，回复也没发出去。' +
+      '先看当前实际状态（文件、PR、CI），别把已完成的动作再做一遍。\n\n'
+    );
+  }
+
 
   /** 跑一轮自动续跑：记预算 → 把「继续推下一片」当成一条消息走完整回合。 */
   private async runGoalTick(scope: Scope, bot: Bot, notice?: string): Promise<void> {
@@ -2199,6 +2196,10 @@ export class ChatAgent {
       ? `${CONTEXT_HEADER}\n${history}\n${CONTEXT_FOOTER}\n\n${tailBlock}${memoryBlock}${current}`
       : `${tailBlock}${memoryBlock}${current}`;
 
+    // 上一轮被重启打断就只说一次：告诉模型工具可能只跑了一半，先看实际状态
+    // （参考 Codex 的 <turn_aborted>；不这样它会把已完成的动作再做一遍）
+    const abortedNotice = await this.interruptedNotice(scope.conversationId);
+
     const buildMessages = (body: string, withImages: boolean): ChatMessage[] => [
       { role: 'system', content: system },
       ...prior,
@@ -2206,8 +2207,8 @@ export class ChatAgent {
         role: 'user',
         content:
           withImages && imageParts.length > 0
-            ? [{ type: 'text' as const, text: body }, ...imageParts]
-            : body,
+            ? [{ type: 'text' as const, text: `${abortedNotice}${body}` }, ...imageParts]
+            : `${abortedNotice}${body}`,
       },
     ];
 
