@@ -20,6 +20,7 @@ import { backgroundPauseUntil, currentQuota, renderQuota } from './quota.js';
 import {
   chatComplete,
   chatCompleteRaw,
+  reviewOptions,
   type ChatMessage,
   type ChatResponse,
   type ContentPart,
@@ -1550,12 +1551,17 @@ export class ChatAgent {
       '证据不足以证明本片判据满足时一律 FAIL。' +
       '只输出两行：第一行 PASS 或 FAIL，第二行一句理由（指出缺哪条证据）。';
     try {
+      // 关思考 + 压 maxTokens：这段只要两行 PASS/FAIL，实测同一批切片开着思考结论完全一致，
+      // 却多烧 10 倍 completion（401 vs 43 token）；11-21 有三次单条跑 66~85 秒（45 秒超时被中断后重试），
+      // 复核卡住时整轮都停在这里。
       const raw = await this.complete(
         [
           { role: 'system', content: system },
           { role: 'user', content: payload },
         ],
-        { ...this.config.llm, purpose: 'review', temperature: 0 },
+        {
+          ...reviewOptions(this.config.llm),
+        },
         1,
       );
       const lines = raw

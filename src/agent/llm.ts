@@ -319,6 +319,24 @@ export async function chatCompleteRaw(
   throw lastError instanceof Error ? lastError : new LlmError(String(lastError));
 }
 
+/**
+ * 复核调用的参数：只要两行 PASS/FAIL。
+ *
+ * 关思考 + 压 maxTokens + 短超时。实测同一批切片（s1/s2/s4/s6）开着思考结论完全一致，
+ * 却多烧 10 倍 completion（401 vs 43 token）、慢 2–4 倍；11-21 还有三次跑到 45 秒超时被中断后重试，
+ * 单条 66–85 秒 —— 复核卡住时整轮都停在这里。
+ */
+export function reviewOptions(base: LlmOptions): LlmOptions {
+  return {
+    ...base,
+    purpose: 'review',
+    temperature: 0,
+    disableThinking: true,
+    maxTokens: 300,
+    timeoutMs: 25_000,
+  };
+}
+
 /** 只取文本的调用方（看图、归纳、纯文本闲聊）用这个。 */
 export async function chatComplete(
   messages: ChatMessage[],
