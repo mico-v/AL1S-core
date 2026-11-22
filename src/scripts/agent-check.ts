@@ -18,11 +18,11 @@ import { GroupMemory, applyProfileChanges, readNewRecordsFrom } from '../agent/m
 import { parseBraveHtml, renderHits as renderWebHits } from '../agent/web.js';
 import { blockingWindow, renderQuota } from '../agent/quota.js';
 import { QuoteResolver } from '../agent/quote.js';
-import { buildRequestBody, quotaPauseFrom } from '../agent/llm.js';
+import { buildRequestBody, quotaPauseFrom, reviewOptions } from '../agent/llm.js';
 import { parseNativeToolCalls } from '../agent/dsml.js';
 import { PERSONA, resolvePersona } from '../agent/persona.js';
 import { capabilitiesFor, resolveTier, GUEST_CAPS, OWNER_CAPS } from '../agent/policy.js';
-import { checkCommand, heavyLocalHint, parseBlacklist, parseHeavyMode } from '../agent/exec.js';
+import { checkCommand, heavyLocalHint, parseBlacklist, parseHeavyMode, waitLocalHint } from '../agent/exec.js';
 import { RecordStore } from '../agent/records.js';
 import { GoalStore, canContinue, goalBrief, nextSlice, renderGoal, shouldSelfCheck } from '../agent/goals.js';
 import { readCnbConfig, buildProbeSignature, renderIssues, renderPulls } from '../agent/cnb.js';
@@ -1848,10 +1848,32 @@ async function main(): Promise<void> {
     check('定向用例放行', heavyLocalHint('npx vitest run tests/landing.test.ts') === undefined);
     check('-t 过滤放行', heavyLocalHint('npx vitest run -t landing') === undefined);
     check('全量构建认得出', heavyLocalHint('npm run build') === '全量构建/测试');
-    check('类型检查认得出', heavyLocalHint('npx tsc --noEmit') === '全量构建/类型检查');
     check('普通命令不误伤', heavyLocalHint('git status --short') === undefined);
     check('搜 vitest 不误伤', heavyLocalHint('grep -rn vitest tests/ | head') === undefined);
     check('读文件不误伤', heavyLocalHint('sed -n 1,80p src/main.ts') === undefined);
+
+    // 11-22 按段判：这四条都是 11-21 真实误伤过的写法（拦下后模型改用 force 重跑，白烧 25 分钟）
+    check('src 下定向用例放行', heavyLocalHint('npx vitest run src/data/adapter.test.ts') === undefined);
+    check('多个用例文件放行', heavyLocalHint('npx vitest run a.test.ts b.spec.ts --reporter=dot') === undefined);
+    check('类型检查放行', heavyLocalHint('npx tsc --noEmit') === undefined);
+    check('复合命令里的定向段不误伤', heavyLocalHint('cd x && npx tsc --noEmit; npx vitest run tests/a.test.ts') === undefined);
+    check('复合命令里的全量段仍拦', heavyLocalHint('git status --short; npx vitest run') === '全量单测');
+    check('看版本不算跑测试', heavyLocalHint('npx vitest --version') === undefined);
+    check('全量构建仍拦', heavyLocalHint('npx vite build') === '全量构建');
+
+    // 原地 sleep 等 CI：11-19 到 11-21 共 31 条，光 sleep 就 48 分钟
+    check('认得出 sleep 等 CI', waitLocalHint('sleep 240; gh pr checks 31') === 240);
+    check('分钟单位换算', waitLocalHint('sleep 3m && gh run list') === 180);
+    check('短 sleep 放行', waitLocalHint('sleep 5; gh pr checks 31') === undefined);
+    check('不误伤别的命令', waitLocalHint('grep -n sleep src/a.ts') === undefined);
+
+    // 复核参数：只要两行 PASS/FAIL，关思考 + 压 maxTokens（实测结论不变、快 2–4 倍、省 10 倍 completion）
+    const rv = reviewOptions({ model: 'm', apiKey: 'k', baseUrl: 'http://x' });
+    check('复核关思考', rv.disableThinking === true);
+    check('复核压 maxTokens', rv.maxTokens === 300);
+    check('复核短超时', (rv.timeoutMs ?? 0) <= 30_000);
+    check('复核温度 0', rv.temperature === 0);
+    check('复核用途标 review', rv.purpose === 'review');
 
     check('模式默认 block', parseHeavyMode(undefined) === 'block');
     check('模式认 warn', parseHeavyMode('warn') === 'warn');
@@ -1886,6 +1908,14 @@ async function main(): Promise<void> {
       ctxHeavy,
     );
     check('定向用例不被拦', !allowed.includes('不在本地跑'));
+    const slept = await executeTool(
+      'run_command',
+      JSON.stringify({ cmd: 'sleep 240; gh pr checks 31' }),
+      ctxHeavy,
+    );
+    check('原地等被拦下', slept.includes('不在工具里原地等'));
+    check('拦下时指向 goal_watch', slept.includes('goal_watch'));
+    check('原地等没真去跑', !ran);
   }
 
   console.log('\n[30] 会话链续接（锚点丢了不整条重建）');

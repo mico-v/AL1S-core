@@ -11,7 +11,7 @@ import type { AppLogger } from '../logger.js';
 import type { ChatMessage, LlmOptions } from './llm.js';
 import { MessageIndex, renderHits } from './search.js';
 import { renderHits as renderWebHits, searchWeb } from './web.js';
-import { heavyLocalHint, renderRunResult, runCommand, type HeavyMode } from './exec.js';
+import { heavyLocalHint, renderRunResult, runCommand, waitLocalHint, type HeavyMode } from './exec.js';
 import type { Capabilities, Tier } from './policy.js';
 import { isKind, isStatus, type RecordStore } from './records.js';
 import { isSliceStatus, renderGoal, type Goal, type GoalSlice, type GoalStore } from './goals.js';
@@ -537,8 +537,9 @@ const REPO_READ_TOOLS: unknown[] = [
       name: 'run_command',
       description:
         '在工作区里跑一条命令。黑名单模式：npm / git / gh / node 等常规开发命令都放行，cwd 锁在工作区内，超时默认 120 秒。' +
-        '**全量测试与构建（npx vitest run、npm run build、tsc --noEmit）默认被拦**：那是 CI 和 NPC 的活，本机跑一次几分钟、输出还吃 token。' +
-        '验收看 PR 里 NPC 贴的输出 + ci_status / cnb pulls check-status；要复现只跑定向用例（npx vitest run tests/xxx.test.ts）。确实必须本地跑就带 force。',
+        '**全量测试与构建（npx vitest run、npm run build、vite build）默认被拦**：那是 CI 和 NPC 的活，本机跑一次几分钟、输出还吃 token。' +
+        '验收看 PR 里 NPC 贴的输出 + ci_status / cnb pulls check-status；要复现只跑定向用例（npx vitest run tests/xxx.test.ts 或 src/x.test.ts，tsc --noEmit 也放行）。' +
+        '**命令里别写 sleep 等 CI**（超 20 秒会被拦）：等 NPC 交货用 goal_watch 挂探针，它一动就叫醒，不烧回合。确实必须本地跑/等就带 force。',
       parameters: {
         type: 'object',
         properties: {
@@ -547,7 +548,7 @@ const REPO_READ_TOOLS: unknown[] = [
           timeout_ms: { type: 'number', description: '超时，默认 120000，最大 300000' },
           force: {
             type: 'boolean',
-            description: '确认要在本地跑全量测试/构建（比如 CI 挂了要复现），默认 false',
+            description: '确认要在本地跑全量测试/构建，或确实要 sleep 等（比如 CI 挂了要复现），默认 false',
           },
         },
         required: ['cmd'],
@@ -1350,6 +1351,16 @@ async function executeToolInner(name: string, rawArgs: string, ctx: ToolContext)
           return `${tip}\n确实必须本地跑（比如 CI 挂了要复现），把 force 设成 true。`;
         }
         ctx.log.warn('本地跑了重活', { cmd: cmd.slice(0, 100), mode: heavyMode });
+      }
+      // 原地 sleep 等 CI：一轮就卡这么久，期间什么都干不了
+      const wait = waitLocalHint(cmd);
+      if (wait && args.force !== true) {
+        ctx.log.info('拦下原地等待', { cmd: cmd.slice(0, 120), secs: wait });
+        return (
+          `命令里有 sleep ${wait} 秒 —— 不在工具里原地等 CI/PR：这几分钟你什么都干不了。\n` +
+          '要等 NPC 交货或 CI 结果，就用 goal_watch 挂探针，那边一动就叫醒你、不烧回合；' +
+          '先把不依赖它的活干完，回来再看。确实要跑就把 force 设成 true。'
+        );
       }
       const timeout = Math.min(Math.max(asNumber(args.timeout_ms) ?? 120_000, 5_000), 300_000);
       const result = await runCommand({

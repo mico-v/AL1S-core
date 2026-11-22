@@ -58,29 +58,73 @@ export function parseHeavyMode(raw: string | undefined): HeavyMode {
 }
 
 /**
- * 这条命令是不是「CI 的活」：全量单测 / 全量构建 / 全量类型检查。
+ * 命令里真会跑东西的那几段：按 `;` `&&` `||` `|` 换行切开。
+ * 只看版本的段（`--version` / `-v` / `--help`）不算，那是探路不是跑测试。
+ */
+function segments(cmd: string): string[] {
+  return cmd
+    .split(/;|&&|\|\||\||\n/)
+    .map((part) => collapsed(part))
+    .filter(Boolean)
+    .filter((part) => !/(?:^|\s)(?:--version|--help|-v)(?:\s|$)/.test(part));
+}
+
+/** 明确点名了用例文件：`src/a.test.ts`、`tests/x.spec.ts`、`tests/` 目录。 */
+const TEST_TARGET = /\.(?:test|spec)\.[cm]?[jt]sx?\b|(?:^|\s)(?:tests?|__tests__)\//;
+
+/**
+ * 这条命令是不是「CI 的活」：全量单测 / 全量构建。
  *
  * 2026-11-21 口径：Kei 是指挥，不是施工队。一次 `npx vitest run` 在本机要 167 秒，
  * 输出还得吃几千 token；这活本来就该 NPC 在 PR 里跑、CI 在云端跑。
- * 带文件或用例过滤的定向测试不算重活（几秒），留给自己复现用。
+ *
+ * 2026-11-22 改按段判：11-21 共拦下 52 次，其中 9 次是误伤 —— `npx vitest run src/data/adapter.test.ts`
+ * 这种点名单个用例的（几秒），以及「`tsc --noEmit`; 定向用例」拼起来的复合命令，
+ * 被整条当成全量拦掉；模型于是改用 force 重跑，49 次强制重活合计 25 分钟，还白烧轮数。
+ * 所以：定向用例放行；`tsc --noEmit` 也不再算重活（实测 campus-nav-3d 全量类型检查 17.9 秒，
+ * 是标 done 前的常规证据，拦它换来的是一轮重试，更贵）。
  */
 export function heavyLocalHint(cmd: string): string | undefined {
-  const text = collapsed(cmd);
-  if (!text) {
-    return undefined;
-  }
-  const targetedTest =
-    /(vitest|jest)\s+(run\s+)?[^|;&]*\btests?\/[\w./-]*/.test(text) || /--testNamePattern|\s-t\s/.test(text);
-  if (/\b(vitest|jest)\b/.test(text) && !targetedTest) {
-    return '全量单测';
-  }
-  if (/\b(npm|pnpm|yarn)\s+(run\s+)?(build|test)\b/.test(text)) {
-    return '全量构建/测试';
-  }
-  if (/\b(vite|tsc|astro|rollup)\b[^|;&]*(?:\bbuild\b|--noEmit)/.test(text)) {
-    return '全量构建/类型检查';
+  for (const part of segments(cmd)) {
+    if (/\b(vitest|jest)\b/.test(part)) {
+      const targeted = TEST_TARGET.test(part) || /--testNamePattern|(?:^|\s)-t\s/.test(part);
+      if (!targeted) {
+        return '全量单测';
+      }
+      continue;
+    }
+    if (/\b(npm|pnpm|yarn)\s+(run\s+)?(build|test)\b/.test(part)) {
+      return '全量构建/测试';
+    }
+    if (/\b(vite|astro|rollup)\b.*\bbuild\b/.test(part)) {
+      return '全量构建';
+    }
   }
   return undefined;
+}
+
+/**
+ * 命令里是不是在「原地等」：`sleep N` 超过 20 秒。
+ *
+ * 11-19 到 11-21 共 31 条这种命令，光 sleep 就占 48 分钟，而且整轮卡在里面 ——
+ * 等 CI 的几分钟里它什么都干不了，主人那边也看不到任何进展。
+ * 等 NPC/CI 应该挂探针（goal_watch），那边一动就叫醒，不烧回合。
+ */
+export function waitLocalHint(cmd: string): number | undefined {
+  let longest: number | undefined;
+  for (const part of segments(cmd)) {
+    const match = /\bsleep\s+(\d+(?:\.\d+)?)\s*([smh])?\b/.exec(part);
+    if (!match) {
+      continue;
+    }
+    const amount = Number(match[1]);
+    const unit = match[2] ?? 's';
+    const secs = unit === 'm' ? amount * 60 : unit === 'h' ? amount * 3600 : amount;
+    if (secs >= 20 && (longest === undefined || secs > longest)) {
+      longest = secs;
+    }
+  }
+  return longest;
 }
 
 export interface CheckResult {
