@@ -140,3 +140,9 @@ AGENT_CNB_API_BASE=https://api.cnb.cool
 `pnpm agent:check` 的 `[21] 持续目标`、`[22] CNB issue 协作通道` 与 `[28] 派发闭环` 三段覆盖：
 判据缺失、并发目标、切片状态流转、轮数/墙钟闸门、收尾警告、令牌缺失、渲染与工具可见性、
 裸评论升级成派工（不落 CLI）、`note:` 前缀走普通评论、探针等太久触发自查。
+
+## 后续：重启恢复与状态机
+
+2026-11-22 之后的设计（一个群一个 thread 文件、恢复只留一个 `reconcile()`、
+状态机对齐 Codex 的 `complete / budget_limited` 终态）见 `docs/goal-durability.md`。
+本文描述的是 M1 之前的账本形态；`data/inflight/` 标记是临时补丁，M1 会并进 thread 文件。
