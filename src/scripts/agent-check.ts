@@ -7,7 +7,7 @@
  */
 
 import { existsSync } from 'node:fs';
-import { mkdir, mkdtemp, rm, utimes, appendFile, writeFile } from 'node:fs/promises';
+import { mkdir, mkdtemp, rm, utimes, appendFile, readFile, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 import { ChatAgent, approxTokens, clipToolOutput, describeProgress, digestOf, isBotMentioned, linesAfter, MAX_REPLY_CHARS, MAX_REPLY_CHUNKS, pruneToolResults, readAgentConfig, repeatedOpener, selfCheckNotice, splitReply } from '../agent/index.js';
@@ -24,7 +24,7 @@ import { PERSONA, resolvePersona } from '../agent/persona.js';
 import { capabilitiesFor, resolveTier, GUEST_CAPS, OWNER_CAPS } from '../agent/policy.js';
 import { checkCommand, heavyLocalHint, parseBlacklist, parseHeavyMode, waitLocalHint } from '../agent/exec.js';
 import { RecordStore } from '../agent/records.js';
-import { GoalStore, canContinue, goalBrief, nextSlice, renderGoal, shouldSelfCheck } from '../agent/goals.js';
+import { GoalStore, canContinue, describeTurn, goalBrief, nextSlice, renderGoal, shouldSelfCheck } from '../agent/goals.js';
 import { readCnbConfig, buildProbeSignature, renderIssues, renderPulls } from '../agent/cnb.js';
 import { checkCnbArgs, ensureBuddyMention, listCnbGuide, readCnbCliConfig, readCnbGuide, renderCnbRun, routeIssueComment, searchCnbGuide } from '../agent/cnbcli.js';
 import {
@@ -53,7 +53,6 @@ import {
   renderCardLine,
 } from '../agent/cards.js';
 import { renderHandoff, shouldRotateThread, writeHandoff } from '../agent/thread.js';
-import { clearInflight, describeInterrupted, inflightDir, listInflight, markInflight } from '../agent/inflight.js';
 import { kindPack } from '../agent/kinds.js';
 import { matchGoalCommand } from '../agent/commands.js';
 import { cleanQQText } from '../agent/text.js';
@@ -1956,24 +1955,72 @@ async function main(): Promise<void> {
     check('时间戳相同的旧行不重折', ids(linesAfter(lines, { lastAt: 2000 })) === 'm3');
   }
 
-  console.log('\n[31] 回合留痕（重启打断后不哑火）');
+  console.log('\n[31] 会话即真相（goal 与回合留痕一个文件）');
   {
-    const inflightTmp = await mkdtemp(path.join(tmpdir(), 'inflight-'));
+    const threadTmp = await mkdtemp(path.join(tmpdir(), 'threads-'));
     try {
       const chatId = 'FD8B6A9A576D123B17C4489367C019CB';
-      await markInflight(inflightTmp, { chatId, startedAt: '2026-11-22T00:06:36.000Z', kind: 'chat' });
-      const marks = await listInflight(inflightTmp);
-      check('标记落盘', marks.length === 1 && marks[0]?.chatId === chatId);
-      check('标记带开始时间', marks[0]?.startedAt === '2026-11-22T00:06:36.000Z');
-      check('标记带触发方', marks[0]?.kind === 'chat');
-      check('残留能读出人看的时间', describeInterrupted(marks[0]!) !== '上一轮');
-      await clearInflight(inflightTmp, chatId);
-      check('正常收尾后标记清掉', (await listInflight(inflightTmp)).length === 0);
-      await writeFile(path.join(inflightDir(inflightTmp), 'broken.json'), '{不是 json');
-      check('坏标记不拖累巡检', (await listInflight(inflightTmp)).length === 0);
-      check('坏标记顺手删掉', !existsSync(path.join(inflightDir(inflightTmp), 'broken.json')));
+      const store = new GoalStore(threadTmp, chatId);
+      check('空会话没有目标', (await store.read()) === undefined);
+      check('空会话没有回合残留', (await store.pendingTurn()) === undefined);
+
+      // 回合留痕与目标同一个文件：重启后只有一份真相
+      const turnId = await store.beginTurn('goal');
+      const mark = await store.pendingTurn();
+      check('回合标记落盘', mark?.id === turnId && mark?.kind === 'goal');
+      check('标记带开始时间', (mark?.startedAt ?? '').length > 10);
+      check('残留能读出人看的时间', mark ? describeTurn(mark) !== '上一轮' : false);
+      check('thread 文件在 data/threads 下', existsSync(path.join(threadTmp, 'threads', `${chatId}.json`)));
+      await store.endTurn('别人的回合');
+      check('别人的回合清不掉我的标记', (await store.pendingTurn())?.id === turnId);
+      await store.endTurn(turnId);
+      check('正常收尾后标记清掉', (await store.pendingTurn()) === undefined);
+
+      // 目标也写在同一份文件里，且不碍回合留痕
+      await store.create(
+        { objective: 'thread 文件同时装 goal 与 turn', criteria: ['能跑'], slices: ['一片'] },
+        { maxRounds: 3, maxWallMs: 3_600_000 },
+      );
+      const again = await store.beginTurn('chat');
+      check('目标与回合共存', (await store.read())?.slices.length === 1 && (await store.pendingTurn())?.id === again);
+      const raw = JSON.parse(await readFile(path.join(threadTmp, 'threads', `${chatId}.json`), 'utf8')) as {
+        goal?: { objective?: string };
+        turn?: { id?: string };
+      };
+      check('一份文件装两样', raw.goal?.objective !== undefined && raw.turn?.id === again);
+
+      // 旧账本一次性搬家，搬完不留两份真相
+      const legacyTmp = await mkdtemp(path.join(tmpdir(), 'threads-legacy-'));
+      try {
+        const legacyId = '2735F7F55B6B1D1B0D47D8BD8F315E49';
+        await mkdir(path.join(legacyTmp, 'goals'), { recursive: true });
+        await writeFile(
+          path.join(legacyTmp, 'goals', `${legacyId}.json`),
+          JSON.stringify({
+            id: 'g1',
+            objective: '旧账本',
+            criteria: ['x'],
+            slices: [{ id: 's1', title: 'a', status: 'todo' }],
+            status: 'active',
+            createdAt: '2026-11-21T00:00:00.000Z',
+            updatedAt: '2026-11-21T00:00:00.000Z',
+            budget: { rounds: 0, maxRounds: 3, startedAt: '2026-11-21T00:00:00.000Z', maxWallMs: 1 },
+            log: [],
+          }),
+        );
+        const migrated = new GoalStore(legacyTmp, legacyId);
+        check('旧账本读得到', (await migrated.read())?.objective === '旧账本');
+        check('搬家后写进 threads', existsSync(path.join(legacyTmp, 'threads', `${legacyId}.json`)));
+        check('旧文件改名不留两份', !existsSync(path.join(legacyTmp, 'goals', `${legacyId}.json`)));
+      } finally {
+        await rm(legacyTmp, { recursive: true, force: true });
+      }
+
+      // 坏文件不能把巡检拖死
+      await writeFile(path.join(threadTmp, 'threads', 'broken.json'), '{不是 json');
+      check('坏 thread 文件当空会话', (await new GoalStore(threadTmp, 'broken').read()) === undefined);
     } finally {
-      await rm(inflightTmp, { recursive: true, force: true });
+      await rm(threadTmp, { recursive: true, force: true });
     }
 
     // done + 全部收口：resume 不再复活，避免把已经交付的目标重新拉起来烧额度

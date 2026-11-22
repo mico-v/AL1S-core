@@ -42,6 +42,21 @@ export interface GoalLogEntry {
   by?: string;
 }
 
+/** 回合留痕：进程被杀/重启后，靠它知道上一轮没跑完。 */
+export interface TurnMark {
+  id: string;
+  startedAt: string;
+  /** 谁触发的这一轮。 */
+  kind: 'goal' | 'chat';
+}
+
+/** 一个会话的持久状态：目标 + 回合留痕，一个文件一个真相。 */
+export interface ThreadFile {
+  conversationId: string;
+  goal?: Goal;
+  turn?: TurnMark;
+}
+
 export interface GoalBudget {
   /** 已经自动续跑了几轮。 */
   rounds: number;
@@ -228,32 +243,112 @@ export interface GoalCreateInput {
 export class GoalStore {
   readonly file: string;
   readonly groupId: string;
+  /** M1 之前的账本位置：读到就搬进 thread 文件，只当迁移源。 */
+  private readonly legacyFile: string;
 
   constructor(dataRoot: string, groupId: string) {
     this.groupId = safeGroup(groupId);
-    this.file = path.join(dataRoot, 'goals', `${this.groupId}.json`);
+    this.file = path.join(dataRoot, 'threads', `${this.groupId}.json`);
+    this.legacyFile = path.join(dataRoot, 'goals', `${this.groupId}.json`);
   }
 
-  async read(): Promise<Goal | undefined> {
+  /**
+   * 一个会话的持久状态：目标 + 回合留痕。
+   *
+   * 进程内状态都只是缓存 —— 重启后靠这份文件重放，不再有第二个真相源
+   * （参考 Codex：goal 按 thread 持久化，`turn` 是它的一部分）。
+   */
+  async readThread(): Promise<ThreadFile> {
     if (!existsSync(this.file)) {
+      const migrated = await this.migrateLegacy();
+      if (migrated) {
+        return migrated;
+      }
+      return { conversationId: this.groupId };
+    }
+    try {
+      const raw = JSON.parse(await readFile(this.file, 'utf8')) as ThreadFile;
+      return this.normalize(raw);
+    } catch {
+      return { conversationId: this.groupId };
+    }
+  }
+
+  async writeThread(thread: ThreadFile): Promise<void> {
+    await mkdir(path.dirname(this.file), { recursive: true });
+    const tmp = `${this.file}.${process.pid}.tmp`;
+    await writeFile(tmp, `${JSON.stringify(thread, null, 2)}\n`, 'utf8');
+    await rename(tmp, this.file);
+  }
+
+  /** 旧账本（data/goals/<群>.json）一次性搬家：搬完改名，不留两份真相。 */
+  private async migrateLegacy(): Promise<ThreadFile | undefined> {
+    if (!existsSync(this.legacyFile)) {
       return undefined;
     }
     try {
-      const raw = JSON.parse(await readFile(this.file, 'utf8')) as Goal;
-      if (!raw || typeof raw.objective !== 'string' || !Array.isArray(raw.slices)) {
+      const goal = JSON.parse(await readFile(this.legacyFile, 'utf8')) as Goal;
+      if (!goal || typeof goal.objective !== 'string' || !Array.isArray(goal.slices)) {
         return undefined;
       }
-      return raw;
+      const thread: ThreadFile = { conversationId: this.groupId, goal };
+      await this.writeThread(thread);
+      await rename(this.legacyFile, `${this.legacyFile}.migrated`).catch(() => undefined);
+      return thread;
     } catch {
       return undefined;
     }
   }
 
+  private normalize(raw: ThreadFile): ThreadFile {
+    const thread: ThreadFile = { conversationId: raw.conversationId || this.groupId };
+    if (raw.goal && typeof raw.goal.objective === 'string' && Array.isArray(raw.goal.slices)) {
+      thread.goal = raw.goal;
+    }
+    if (raw.turn && raw.turn.id && raw.turn.startedAt) {
+      thread.turn = raw.turn;
+    }
+    return thread;
+  }
+
+  async read(): Promise<Goal | undefined> {
+    return (await this.readThread()).goal;
+  }
+
   private async save(goal: Goal): Promise<void> {
-    await mkdir(path.dirname(this.file), { recursive: true });
-    const tmp = `${this.file}.${process.pid}.tmp`;
-    await writeFile(tmp, `${JSON.stringify(goal, null, 2)}\n`, 'utf8');
-    await rename(tmp, this.file);
+    const thread = await this.readThread();
+    thread.goal = goal;
+    await this.writeThread(thread);
+  }
+
+  /**
+   * 回合开始：记一笔。这一轮如果被重启/杀掉打断，回来时从 turn 残留就能看出来。
+   * 返回这一轮的 id，收尾时对一下，避免嵌套回合互相清标记。
+   */
+  async beginTurn(kind: TurnMark['kind'] = 'chat'): Promise<string> {
+    const thread = await this.readThread();
+    const id = `t${Date.now().toString(36)}${Math.random().toString(36).slice(2, 6)}`;
+    thread.turn = { id, startedAt: new Date().toISOString(), kind };
+    await this.writeThread(thread);
+    return id;
+  }
+
+  /** 回合结束：只清自己那一笔。 */
+  async endTurn(id?: string): Promise<void> {
+    const thread = await this.readThread();
+    if (!thread.turn) {
+      return;
+    }
+    if (id && thread.turn.id !== id) {
+      return;
+    }
+    delete thread.turn;
+    await this.writeThread(thread);
+  }
+
+  /** 残留的回合标记：有就说明上一轮没跑完就没了。 */
+  async pendingTurn(): Promise<TurnMark | undefined> {
+    return (await this.readThread()).turn;
   }
 
   async create(input: GoalCreateInput, defaults: { maxRounds: number; maxWallMs: number }): Promise<string> {
@@ -545,6 +640,16 @@ export class GoalStore {
     await this.save(goal);
     return { goal, ok: true };
   }
+}
+
+/** 给人看的回合时间：11-22 08:06。 */
+export function describeTurn(mark: TurnMark): string {
+  const at = new Date(mark.startedAt);
+  if (Number.isNaN(at.getTime())) {
+    return '上一轮';
+  }
+  const pad = (value: number): string => String(value).padStart(2, '0');
+  return `${pad(at.getMonth() + 1)}-${pad(at.getDate())} ${pad(at.getHours())}:${pad(at.getMinutes())}`;
 }
 
 /** 在等 NPC 的一句话：带已等时长，超过阈值就明说会自查。 */

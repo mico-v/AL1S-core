@@ -126,13 +126,20 @@ try {
       const timer = setInterval(() => {
         void (async () => {
           try {
-            const dir = path.join(agentConfig.dataRoot, 'goals');
-            const files = await readdir(dir).catch(() => [] as string[]);
-            const chats = files.filter((file) => file.endsWith('.json')).map((file) => file.slice(0, -5));
-            if (chats.length === 0) {
+            const dirs = ['threads', 'goals'];
+            const chats = new Set<string>();
+            for (const name of dirs) {
+              const files = await readdir(path.join(agentConfig.dataRoot, name)).catch(() => [] as string[]);
+              for (const file of files) {
+                if (file.endsWith('.json')) {
+                  chats.add(file.slice(0, -5));
+                }
+              }
+            }
+            if (chats.size === 0) {
               return;
             }
-            const resumed = await agent.runGoalSweep(bot, chats);
+            const resumed = await agent.runGoalSweep(bot, [...chats]);
             if (resumed > 0) {
               log.info('目标续跑巡检：已接上', { groups: resumed });
             }

@@ -28,13 +28,13 @@ import {
   type ToolCall,
 } from './llm.js';
 import { GroupMemory } from './memory.js';
-import { clearInflight, describeInterrupted, listInflight, markInflight } from './inflight.js';
 import { CONTEXT_FOOTER, CONTEXT_HEADER, resolvePersona } from './persona.js';
 import { capabilitiesFor, describeTier, resolveTier, type PolicyConfig, type Tier } from './policy.js';
 import { RecordStore } from './records.js';
 import {
   GoalStore,
   canContinue,
+  describeTurn,
   goalBrief,
   nextSlice,
   renderGoal,
@@ -717,8 +717,10 @@ export class ChatAgent {
   private readonly goalTimers = new Map<string, NodeJS.Timeout>();
   /** 正在跑自动续跑的群，防止重入。 */
   private readonly goalRunning = new Set<string>();
-  /** 每个会话正在跑几个回合：>0 说明有活干，重启留下的标记不算残留。 */
+  /** 每个会话正在跑几个回合：>0 说明有活干，残留标记不算被打断。 */
   private readonly turnDepth = new Map<string, number>();
+  /** 每个会话最外层回合的 id：收尾时只清自己那一笔。 */
+  private readonly turnIds = new Map<string, string>();
   /** 上次不续跑的原因：同一条理由不重复刷日志。 */
   private readonly goalStopReason = new Map<string, string>();
   /** 已经发过「预算用满」提示的目标，一个目标只说一次。 */
@@ -909,12 +911,15 @@ export class ChatAgent {
   private async beginTurn(chatId: string): Promise<void> {
     const depth = (this.turnDepth.get(chatId) ?? 0) + 1;
     this.turnDepth.set(chatId, depth);
-    if (depth === 1) {
-      await markInflight(this.config.dataRoot, {
-        chatId,
-        startedAt: new Date().toISOString(),
-        kind: this.goalRunning.has(chatId) ? 'goal' : 'chat',
-      });
+    if (depth > 1) {
+      return;
+    }
+    const kind = this.goalRunning.has(chatId) ? 'goal' : 'chat';
+    const id = await this.goalStoreFor(chatId)
+      .beginTurn(kind)
+      .catch(() => undefined);
+    if (id) {
+      this.turnIds.set(chatId, id);
     }
   }
 
@@ -925,7 +930,11 @@ export class ChatAgent {
       return;
     }
     this.turnDepth.delete(chatId);
-    await clearInflight(this.config.dataRoot, chatId);
+    const id = this.turnIds.get(chatId);
+    this.turnIds.delete(chatId);
+    await this.goalStoreFor(chatId)
+      .endTurn(id)
+      .catch(() => undefined);
   }
 
   private async converseRounds(
@@ -1533,17 +1542,21 @@ export class ChatAgent {
    * 群里看着就是「干到一半人没了」（2026-11-22 静默三小时）。现在必须出声，能续的直接续。
    */
   private async recoverInterrupted(bot: Bot, chatIds: string[]): Promise<number> {
-    const marks = await listInflight(this.config.dataRoot);
     let resumed = 0;
-    for (const mark of marks) {
+    for (const chatId of chatIds) {
       // 正在跑的会话不是残留（巡检每 2 分钟一次，会撞上正常回合）
-      if ((this.turnDepth.get(mark.chatId) ?? 0) > 0) {
+      if ((this.turnDepth.get(chatId) ?? 0) > 0) {
         continue;
       }
-      await clearInflight(this.config.dataRoot, mark.chatId);
-      const chatId = mark.chatId;
-      const when = describeInterrupted(mark);
-      if (!chatIds.includes(chatId) || !this.config.policy.devGroups.includes(chatId)) {
+      const store = this.goalStoreFor(chatId);
+      const mark = await store.pendingTurn().catch(() => undefined);
+      if (!mark) {
+        continue;
+      }
+      // 先清标记：后面哪怕提示发失败，也不会每次巡检都重跑一遍
+      await store.endTurn().catch(() => undefined);
+      const when = describeTurn(mark);
+      if (!this.config.policy.devGroups.includes(chatId)) {
         this.log.warn('上一轮被重启打断（非工程群，只清标记）', { conversationId: chatId, startedAt: mark.startedAt });
         continue;
       }
@@ -1558,7 +1571,6 @@ export class ChatAgent {
           .deliver(bot, scope.replyTarget, text)
           .catch((error) => this.log.warn('中断恢复提示发送失败', { conversationId: chatId, error }));
       };
-      const store = this.goalStoreFor(chatId);
       let goal = await store.read().catch(() => undefined);
       this.log.warn('上一轮被重启打断', {
         conversationId: chatId,
