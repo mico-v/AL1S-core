@@ -136,6 +136,16 @@ export function canContinue(
   options: { now?: number; maxRounds?: number; maxWallMs?: number } = {},
 ): { ok: boolean; reason?: string } {
   if (goal.status !== 'active') {
+    const unfinished = goal.slices.filter((slice) => slice.status !== 'done' && slice.status !== 'dropped');
+    // done 却还有没收口的片 = 账本自相矛盾（2026-11-22 就这样静默了三小时）：说清楚能怎么续
+    if (goal.status === 'done' && unfinished.length > 0) {
+      return {
+        ok: false,
+        reason: `目标记成了 done，但还有 ${unfinished.length} 片没收口（${unfinished
+          .map((slice) => slice.id)
+          .join('/')}）—— /goal resume 能续上`,
+      };
+    }
     return { ok: false, reason: `目标状态是 ${goal.status}` };
   }
   const maxRounds = options.maxRounds ?? goal.budget.maxRounds;
@@ -403,12 +413,19 @@ export class GoalStore {
     return `已记录到目标日志：${body}`;
   }
 
-  async finish(recap: string, by?: string): Promise<string> {
+  async finish(recap: string, by?: string, options: { force?: boolean } = {}): Promise<string> {
     const goal = await this.read();
     if (!goal) {
       return '这个群还没有目标。';
     }
     const remaining = goal.slices.filter((slice) => slice.status !== 'done' && slice.status !== 'dropped');
+    // 收尾与切片不一致 = 之后续跑闸门永远不放行、也没人再叫醒它。宁可拒绝，让它先收口。
+    if (remaining.length > 0 && !options.force) {
+      return (
+        `还有 ${remaining.length} 片没收口（${remaining.map((slice) => `${slice.id}:${slice.status}`).join(' / ')}）：` +
+        '验过的用 goal_step 标 done，不做的标 dropped；确实要带着它们收尾就带 force: true。'
+      );
+    }
     goal.status = 'done';
     goal.recap = clip(recap, 800);
     // 收尾就把探针拆了：done 的目标不会再被续跑叫醒，留着只会变成「静默停摆」
@@ -485,16 +502,28 @@ export class GoalStore {
     if (!goal) {
       return '这个群还没有目标。';
     }
-    if (goal.status === 'done') {
+    const unfinished = goal.slices.filter((slice) => slice.status !== 'done' && slice.status !== 'dropped');
+    if (goal.status === 'done' && unfinished.length === 0) {
       return '这个目标已经收尾了；要接着做就开新目标。';
     }
+    // 收尾了却还有没收口的片：账本对不上，但主人说「继续」就是接着干，别拿 done 当铁门
+    const revived = goal.status === 'done';
     goal.status = 'active';
     goal.budget.startedAt = nowIso();
     goal.budget.rounds = 0;
+    goal.budget.roundsSinceProgress = 0;
     goal.updatedAt = nowIso();
-    goal.log.push({ at: goal.updatedAt, text: '恢复推进（预算重置）' });
+    goal.log.push({
+      at: goal.updatedAt,
+      text: revived
+        ? `恢复推进（目标曾收尾，仍有 ${unfinished.length} 片未收口：${unfinished.map((slice) => slice.id).join('/')}），预算重置`
+        : '恢复推进（预算重置）',
+    });
+    goal.log = goal.log.slice(-80);
     await this.save(goal);
-    return '已恢复，预算重置。';
+    return revived
+      ? `已恢复（还有 ${unfinished.map((slice) => slice.id).join('/')} 未收口），预算重置。`
+      : '已恢复，预算重置。';
   }
 
   /** 记一轮自动续跑，并回报是否还允许继续。 */

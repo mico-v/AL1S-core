@@ -53,6 +53,7 @@ import {
   renderCardLine,
 } from '../agent/cards.js';
 import { renderHandoff, shouldRotateThread, writeHandoff } from '../agent/thread.js';
+import { clearInflight, describeInterrupted, inflightDir, listInflight, markInflight } from '../agent/inflight.js';
 import { kindPack } from '../agent/kinds.js';
 import { matchGoalCommand } from '../agent/commands.js';
 import { cleanQQText } from '../agent/text.js';
@@ -1170,10 +1171,22 @@ async function main(): Promise<void> {
     check('简报含下一片', live ? goalBrief(live).includes('下一片') : false);
     check('视图列出每片状态', live ? renderGoal(live).includes('s2 楼层渲染') : false);
 
-    const finished = await store.finish('做完两片');
-    check('收尾提醒未完成切片', finished.includes('没标完成'), finished.slice(0, 40));
+    // 收尾与切片不一致 = 之后续跑闸门永远不放行、也没人再叫醒它，所以直接拒
+    const refused = await store.finish('做完两片');
+    check('还有切片没收口就拒收尾', refused.includes('没收口'), refused.slice(0, 40));
+    check('拒收尾时状态不动', (await store.read())?.status === 'active');
+    const forced = await store.finish('做完两片', undefined, { force: true });
+    check('force 收尾会提醒未完成切片', forced.includes('没标完成'), forced.slice(0, 40));
     check('收尾后状态是 done', (await store.read())?.status === 'done');
     check('done 后不再续跑', (await store.tick({ maxRounds: 5, maxWallMs: 3_600_000 }))?.ok === false);
+    const doneGoal = await store.read();
+    check(
+      'done 且还有未收口切片时说明怎么续',
+      doneGoal ? !canContinue(doneGoal).ok && String(canContinue(doneGoal).reason).includes('/goal resume') : false,
+      String(doneGoal ? canContinue(doneGoal).reason : ''),
+    );
+    check('done 且还有未收口切片能 resume', (await store.resume()).includes('已恢复'));
+    check('resume 后回到 active', (await store.read())?.status === 'active');
 
     const blockedStore = new GoalStore(goalTmp, 'G2');
     // 预算用尽要转 paused：留在 active 会被巡检每 2 分钟捞起来空转，日志看着像在干活
@@ -1246,7 +1259,7 @@ async function main(): Promise<void> {
       { maxRounds: 5, maxWallMs: 3_600_000 },
     );
     await orphanStore.watch(25, 'sig-9', '等 NPC 交货');
-    const closed = await orphanStore.finish('收尾');
+    const closed = await orphanStore.finish('收尾', undefined, { force: true });
     check('收尾顺手拆探针', closed.includes('拆了 #25') && (await orphanStore.read())?.awaiting === undefined);
     const refusedWatch = await orphanStore.watch(26, 'sig-10', '再挂一个');
     check('done 目标挂探针被拒', refusedWatch.includes('不会叫醒'), refusedWatch.slice(0, 40));
@@ -1934,6 +1947,40 @@ async function main(): Promise<void> {
     check('私聊空缓冲不重建', linesAfter([], { lastMessageId: 'm3', lastAt: 3000 }).length === 0);
     check('折过一轮不重复折', linesAfter(lines, { lastAt: 3000 }).length === 0);
     check('时间戳相同的旧行不重折', ids(linesAfter(lines, { lastAt: 2000 })) === 'm3');
+  }
+
+  console.log('\n[31] 回合留痕（重启打断后不哑火）');
+  {
+    const inflightTmp = await mkdtemp(path.join(tmpdir(), 'inflight-'));
+    try {
+      const chatId = 'FD8B6A9A576D123B17C4489367C019CB';
+      await markInflight(inflightTmp, { chatId, startedAt: '2026-11-22T00:06:36.000Z', kind: 'chat' });
+      const marks = await listInflight(inflightTmp);
+      check('标记落盘', marks.length === 1 && marks[0]?.chatId === chatId);
+      check('标记带开始时间', marks[0]?.startedAt === '2026-11-22T00:06:36.000Z');
+      check('标记带触发方', marks[0]?.kind === 'chat');
+      check('残留能读出人看的时间', describeInterrupted(marks[0]!) !== '上一轮');
+      await clearInflight(inflightTmp, chatId);
+      check('正常收尾后标记清掉', (await listInflight(inflightTmp)).length === 0);
+      await writeFile(path.join(inflightDir(inflightTmp), 'broken.json'), '{不是 json');
+      check('坏标记不拖累巡检', (await listInflight(inflightTmp)).length === 0);
+      check('坏标记顺手删掉', !existsSync(path.join(inflightDir(inflightTmp), 'broken.json')));
+    } finally {
+      await rm(inflightTmp, { recursive: true, force: true });
+    }
+
+    // done + 全部收口：resume 不再复活，避免把已经交付的目标重新拉起来烧额度
+    const closedTmp = await mkdtemp(path.join(tmpdir(), 'goals-closed-'));
+    try {
+      const store = new GoalStore(closedTmp, 'G9');
+      await store.create({ objective: '全收口', criteria: ['跑完'], slices: ['一片'] }, { maxRounds: 3, maxWallMs: 3_600_000 });
+      await store.step('s1', 'done', { note: '验过' });
+      await store.finish('全部交付');
+      check('全收口后 resume 不复活', (await store.resume()).includes('已经收尾'));
+      check('全收口后仍是 done', (await store.read())?.status === 'done');
+    } finally {
+      await rm(closedTmp, { recursive: true, force: true });
+    }
   }
 
   console.log(failures === 0 ? '\n全部通过\n' : `\n${failures} 项失败\n`);

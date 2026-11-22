@@ -28,6 +28,7 @@ import {
   type ToolCall,
 } from './llm.js';
 import { GroupMemory } from './memory.js';
+import { clearInflight, describeInterrupted, listInflight, markInflight } from './inflight.js';
 import { CONTEXT_FOOTER, CONTEXT_HEADER, resolvePersona } from './persona.js';
 import { capabilitiesFor, describeTier, resolveTier, type PolicyConfig, type Tier } from './policy.js';
 import { RecordStore } from './records.js';
@@ -716,6 +717,8 @@ export class ChatAgent {
   private readonly goalTimers = new Map<string, NodeJS.Timeout>();
   /** 正在跑自动续跑的群，防止重入。 */
   private readonly goalRunning = new Set<string>();
+  /** 每个会话正在跑几个回合：>0 说明有活干，重启留下的标记不算残留。 */
+  private readonly turnDepth = new Map<string, number>();
   /** 上次不续跑的原因：同一条理由不重复刷日志。 */
   private readonly goalStopReason = new Map<string, string>();
   /** 已经发过「预算用满」提示的目标，一个目标只说一次。 */
@@ -870,6 +873,62 @@ export class ChatAgent {
    * 两个都得有个头：不然一条群消息能把队列堵一下午。
    */
   private async converse(
+    messages: ChatMessage[],
+    opts: LlmOptions,
+    chatId?: string,
+    maxRounds = 40,
+    access: {
+      tier: Tier;
+      speaker: string;
+      onProgress?: (line: string) => void | Promise<void>;
+      /** 回合结束后把完整对话交回去，供跨回合续用（前缀缓存靠它）。 */
+      onConvo?: (convo: ChatMessage[], text: string) => void;
+      /** 发选项卡片（主人档才有）；不传就是没这个能力。 */
+      askChoice?: (input: { question: string; options: ChoiceOption[] }) => Promise<string>;
+      /** 发图文卡片（开发档以上才有）。 */
+      sendCard?: (input: CardInput) => Promise<string>;
+    } = {
+      tier: 'guest',
+      speaker: '',
+    },
+  ): Promise<string> {
+    // 留痕：这一轮如果被重启打断，回来时才知道有活没干完（否则群里就是干到一半人没了）
+    if (chatId) {
+      await this.beginTurn(chatId);
+    }
+    try {
+      return await this.converseRounds(messages, opts, chatId, maxRounds, access);
+    } finally {
+      if (chatId) {
+        await this.endTurn(chatId);
+      }
+    }
+  }
+
+  /** 回合开始：同一个会话嵌套/并行时只在最外层落标记。 */
+  private async beginTurn(chatId: string): Promise<void> {
+    const depth = (this.turnDepth.get(chatId) ?? 0) + 1;
+    this.turnDepth.set(chatId, depth);
+    if (depth === 1) {
+      await markInflight(this.config.dataRoot, {
+        chatId,
+        startedAt: new Date().toISOString(),
+        kind: this.goalRunning.has(chatId) ? 'goal' : 'chat',
+      });
+    }
+  }
+
+  private async endTurn(chatId: string): Promise<void> {
+    const depth = (this.turnDepth.get(chatId) ?? 1) - 1;
+    if (depth > 0) {
+      this.turnDepth.set(chatId, depth);
+      return;
+    }
+    this.turnDepth.delete(chatId);
+    await clearInflight(this.config.dataRoot, chatId);
+  }
+
+  private async converseRounds(
     messages: ChatMessage[],
     opts: LlmOptions,
     chatId?: string,
@@ -1462,6 +1521,81 @@ export class ChatAgent {
       if (await this.scheduleGoalTick(scope, bot)) {
         resumed += 1;
       }
+    }
+    resumed += await this.recoverInterrupted(bot, chatIds);
+    return resumed;
+  }
+
+  /**
+   * 上一轮被打断的收尾：标记文件还在，就说明有回合没跑完就没了。
+   *
+   * 以前这种情况完全静默 —— 回复没发出去、续跑没排上，目标若是 done 巡检也不放行，
+   * 群里看着就是「干到一半人没了」（2026-11-22 静默三小时）。现在必须出声，能续的直接续。
+   */
+  private async recoverInterrupted(bot: Bot, chatIds: string[]): Promise<number> {
+    const marks = await listInflight(this.config.dataRoot);
+    let resumed = 0;
+    for (const mark of marks) {
+      // 正在跑的会话不是残留（巡检每 2 分钟一次，会撞上正常回合）
+      if ((this.turnDepth.get(mark.chatId) ?? 0) > 0) {
+        continue;
+      }
+      await clearInflight(this.config.dataRoot, mark.chatId);
+      const chatId = mark.chatId;
+      const when = describeInterrupted(mark);
+      if (!chatIds.includes(chatId) || !this.config.policy.devGroups.includes(chatId)) {
+        this.log.warn('上一轮被重启打断（非工程群，只清标记）', { conversationId: chatId, startedAt: mark.startedAt });
+        continue;
+      }
+      const scope: Scope = {
+        conversationId: chatId,
+        memoryKey: chatId,
+        isDirect: false,
+        replyTarget: { scope: 'group', targetId: chatId },
+      };
+      const say = (text: string): void => {
+        void this
+          .deliver(bot, scope.replyTarget, text)
+          .catch((error) => this.log.warn('中断恢复提示发送失败', { conversationId: chatId, error }));
+      };
+      const store = this.goalStoreFor(chatId);
+      let goal = await store.read().catch(() => undefined);
+      this.log.warn('上一轮被重启打断', {
+        conversationId: chatId,
+        startedAt: mark.startedAt,
+        kind: mark.kind,
+        status: goal?.status,
+      });
+      if (!goal) {
+        say(`♻ 我上一轮（${when}）被重启打断了，那次的回复没发出去。当时没有进行中的目标，要接着干什么说一声。`);
+        continue;
+      }
+      const unfinished = goal.slices.filter((slice) => slice.status !== 'done' && slice.status !== 'dropped');
+      // done 却还有没收口的片 = 那一轮本来还在干活，被重启打断才没标完：接上，别等人来问
+      if (goal.status === 'done' && unfinished.length > 0) {
+        await store.resume().catch(() => '');
+        goal = (await store.read().catch(() => undefined)) ?? goal;
+        this.log.warn('上一轮被打断，目标续上', {
+          conversationId: chatId,
+          unfinished: unfinished.map((slice) => slice.id),
+        });
+      }
+      if (await this.scheduleGoalTick(scope, bot)) {
+        resumed += 1;
+        const slice = nextSlice(goal);
+        say(
+          `♻ 我上一轮（${when}）被重启打断了，回复没发出去。已经接上了，接着推${slice ? ` ${slice.id} ${slice.title}` : '目标'}。`,
+        );
+        continue;
+      }
+      const verdict = canContinue(goal, {
+        maxRounds: this.config.goals.maxRounds,
+        maxWallMs: this.config.goals.maxWallMs,
+      });
+      say(
+        `⚠ 我上一轮（${when}）被重启打断了，现在续不上：${verdict.reason ?? '没有待推进的切片'}。` +
+          '要接着干就回 /goal resume，或者 goal_create 开新目标。',
+      );
     }
     return resumed;
   }

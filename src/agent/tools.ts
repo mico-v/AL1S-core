@@ -312,10 +312,15 @@ const GOAL_TOOLS: unknown[] = [
     type: 'function',
     function: {
       name: 'goal_finish',
-      description: '目标收尾：所有切片都验过了才调。recap 写清最终交付了什么、判据怎么验的。',
+      description:
+        '目标收尾：所有切片都验过了才调。recap 写清最终交付了什么、判据怎么验的。' +
+        '还有切片没标 done/dropped 会被拒；确实要带着它们收尾就带 force: true。',
       parameters: {
         type: 'object',
-        properties: { recap: { type: 'string', description: '交付结论与验证方式' } },
+        properties: {
+          recap: { type: 'string', description: '交付结论与验证方式' },
+          force: { type: 'boolean', description: '仍有未收口切片也强行收尾' },
+        },
         required: ['recap'],
       },
     },
@@ -1166,7 +1171,7 @@ async function executeToolInner(name: string, rawArgs: string, ctx: ToolContext)
       if (!ctx.goals || !ctx.capabilities?.memoryWrite) {
         return '当前身份不能收尾目标。';
       }
-      return await ctx.goals.finish(asString(args.recap), ctx.speaker);
+      return await ctx.goals.finish(asString(args.recap), ctx.speaker, { force: args.force === true });
     }
     if (name === 'goal_block') {
       if (!ctx.goals || !ctx.capabilities?.memoryWrite) {
