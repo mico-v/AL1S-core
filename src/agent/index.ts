@@ -28,6 +28,7 @@ import {
   type ToolCall,
 } from './llm.js';
 import { GroupMemory } from './memory.js';
+import { readPrompt, renderPrompt } from './prompts.js';
 import { SUMMARY_PREFIX, buildCompactedHistory, compactionPrompt, compactThreshold, renderForSummary, shouldCompact, type CompactOptions } from './compact.js';
 import { CONTEXT_FOOTER, CONTEXT_HEADER, resolvePersona } from './persona.js';
 import { capabilitiesFor, describeTier, resolveTier, type PolicyConfig, type Tier } from './policy.js';
@@ -50,7 +51,7 @@ import { cleanQQText } from './text.js';
 import { parseBlacklist, parseHeavyMode, runCommand } from './exec.js';
 import { kindPack } from './kinds.js';
 import { renderHandoff, handoffPath, shouldRotateThread, writeHandoff } from './thread.js';
-import { PARALLEL_TOOLS, executeTool, toolDefinitionsFor, type ToolContext } from './tools.js';
+import { PARALLEL_TOOLS, abortedToolOutput, executeTool, toolDefinitionsFor, type ToolContext } from './tools.js';
 import {
   ChoiceStore,
   MAX_CHOICE_OPTIONS,
@@ -403,6 +404,12 @@ export function linesAfter<T extends { messageId?: string; timestamp?: number }>
   }
   return [];
 }
+
+/** 续跑提示：仓库 prompts/continuation.md，读不到就用内置兵底。 */
+const CONTINUATION_PROMPT = readPrompt(
+  'continuation',
+  '（自动续跑 {{round}}/{{max_rounds}}）接着推目标：{{objective}}\n\n这一轮只做一片 —— {{slice}}。做完就 goal_step 标进度，全部验过再 goal_finish，卡住就 goal_block。\n\n{{notice}}',
+);
 
 const PROGRESS_VERBS: Record<string, string> = {
   run_command: '跑命令',
@@ -1130,7 +1137,13 @@ export class ChatAgent {
           if (!call) {
             return;
           }
-          results[index] = await executeTool(call.function.name, call.function.arguments, ctx);
+          try {
+            results[index] = await executeTool(call.function.name, call.function.arguments, ctx);
+          } catch (error) {
+            // 单个工具挂掉不能带走整批：给一条显式中止产物，模型下一轮知道先看状态
+            ctx.log.warn('工具执行中断', { name: call.function.name, error });
+            results[index] = abortedToolOutput(call.function.name, '执行报错');
+          }
         }),
       );
     };
@@ -1142,10 +1155,22 @@ export class ChatAgent {
       }
       await flush();
       if (call) {
-        results[index] = await executeTool(call.function.name, call.function.arguments, ctx);
+        try {
+          results[index] = await executeTool(call.function.name, call.function.arguments, ctx);
+        } catch (error) {
+          ctx.log.warn('工具执行中断', { name: call.function.name, error });
+          results[index] = abortedToolOutput(call.function.name, '执行报错');
+        }
       }
     }
     await flush();
+    // 任何一条没拿到输出都补一条显式中止：空串会让模型以为它什么都没做
+    for (let index = 0; index < calls.length; index += 1) {
+      if (!results[index]) {
+        const name = calls[index]?.function.name ?? '工具';
+        results[index] = abortedToolOutput(name, '没有拿到输出');
+      }
+    }
     return results;
   }
 
@@ -1656,17 +1681,14 @@ export class ChatAgent {
       }
       const goal = tick.goal;
       const slice = nextSlice(goal);
-      const text = [
-        notice ?? '',
-        `（自动续跑 ${goal.budget.rounds}/${goal.budget.maxRounds}）接着推目标：${goal.objective.slice(0, 120)}`,
-        `这一轮只做一片 —— ${slice ? `${slice.id} ${slice.title}` : '没有待办切片'}。` +
-          '你的活是**指挥与验收**，不是搬砖：需求拆成切片派给 NPC（cnb_issue_dispatch），' +
-          '验收看 PR 里 NPC 贴的输出 + ci_status / cnb pulls check-status，**别在本地跑全量测试与构建**' +
-          '（要复现只跑定向用例，几秒的那种）。互不碰目录的片一次派 2~3 个并行跑，派完 goal_watch 挂探针。' +
-          '做完就 goal_step 标进度，全部验过再 goal_finish，卡住就 goal_block。',
-      ]
-        .filter(Boolean)
-        .join('\n');
+      // 续跑口径单独放 prompts/continuation.md：人格归人格，续跑提示归提示
+      const text = renderPrompt(CONTINUATION_PROMPT, {
+        round: goal.budget.rounds,
+        max_rounds: goal.budget.maxRounds,
+        objective: goal.objective.slice(0, 120),
+        slice: slice ? `${slice.id} ${slice.title}` : '没有待办切片',
+        notice: notice ?? '',
+      }).replace(/\n{3,}/g, '\n\n');
       // 用主人的身份跑，否则降成 guest 就什么工具都没了
       const synthetic = {
         kind: 'group',

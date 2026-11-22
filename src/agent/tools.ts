@@ -987,6 +987,14 @@ export async function expandQuery(ctx: ToolContext, query: string): Promise<stri
   }
 }
 
+/** 工具没跑完时的显式产物：空字符串会让模型以为「什么都没发生」，下一轮就重复劳动。 */
+export function abortedToolOutput(name: string, reason: string): string {
+  return (
+    `[已中止] ${name} 没跑完（${reason}）：可能已经部分执行，` +
+    '下一轮先确认实际状态（文件 / PR / CI），再决定要不要重试，别直接再跑一遍。'
+  );
+}
+
 export async function executeTool(name: string, rawArgs: string, ctx: ToolContext): Promise<string> {
   const startedAt = Date.now();
   const output = await executeToolInner(name, rawArgs, ctx);

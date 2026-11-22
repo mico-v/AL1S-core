@@ -12,6 +12,7 @@
 
 import { readFileSync } from 'node:fs';
 import type { ChatMessage } from './llm.js';
+import { readPrompt } from './prompts.js';
 
 /** 摘要固定前缀：认得出这是压缩产物，不再当原始对话摘一遍。 */
 export const SUMMARY_PREFIX =
@@ -22,11 +23,10 @@ const HERE = new URL('../../prompts/', import.meta.url);
 
 /** 压缩提示词放仓库 prompts/ 下（和 personas/ 一个待遇）：口径要能单独改，不埋在代码字符串中。 */
 export function compactionPrompt(): string {
-  try {
-    return readFileSync(new URL('compaction.md', HERE), 'utf8').trim();
-  } catch {
-    return 'Create a handoff summary for another LLM that will resume this task: progress, decisions, constraints, what remains.';
-  }
+  return readPrompt(
+    'compaction',
+    'Create a handoff summary for another LLM that will resume this task: progress, decisions, constraints, what remains.',
+  );
 }
 
 export interface CompactOptions {

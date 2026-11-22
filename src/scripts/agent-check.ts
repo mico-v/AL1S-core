@@ -59,7 +59,8 @@ import { cleanQQText } from '../agent/text.js';
 import { matchCommand, renderStatus } from '../agent/commands.js';
 import { DigestEngine, DRIFT_THRESHOLD, topicDrift } from '../agent/digest.js';
 import { MessageIndex, renderHits } from '../agent/search.js';
-import { PARALLEL_TOOLS, executeTool, expandQuery, toolDefinitionsFor } from '../agent/tools.js';
+import { PARALLEL_TOOLS, abortedToolOutput, executeTool, expandQuery, toolDefinitionsFor } from '../agent/tools.js';
+import { readPrompt, renderPrompt } from '../agent/prompts.js';
 import { SUMMARY_PREFIX, buildCompactedHistory, compactThreshold, compactionPrompt, renderForSummary, shouldCompact } from '../agent/compact.js';import { captionForSha, captionStorePath, digestAttachments, flushCaptionStore, loadImageParts, looksLikeImage, prepareImage, rememberCaption, sniffImageType, sniffVideo, useCaptionStore } from '../agent/vision.js';
 import { buildProactiveMessages, judgeProactive, parseProactive } from '../agent/proactive.js';
 import { learnSystem } from '../agent/updater.js';
@@ -2116,6 +2117,29 @@ async function main(): Promise<void> {
     check('到水位就压', shouldCompact(80_000, { contextWindow: 100_000 }));
     check('压缩提示词从文件读', compactionPrompt().includes('CHECKPOINT'));
     check('摘要输入会截断超长工具输出', renderForSummary(convo).length < 40_001);
+  }
+
+  console.log('\n[34] 提示词外置与工具中止产物');
+  {
+    const continuation = readPrompt('continuation');
+    check('续跑提示词从文件读', continuation.includes('{{round}}') && continuation.includes('{{slice}}'));
+    check('续跑提示词写着指挥不是搬砖', continuation.includes('指挥与验收'));
+    const rendered = renderPrompt(continuation, {
+      round: 3,
+      max_rounds: 12,
+      objective: '把导航做完',
+      slice: 's2 楼层层渲染',
+      notice: '',
+    });
+    check('模板变量被替掉', rendered.includes('3/12') && rendered.includes('s2 楼层层渲染'));
+    check('模板不留占位符', !/\{\{\s*\w+\s*\}\}/.test(rendered));
+    check('缺变量留空不报错', renderPrompt('a{{nope}}b', {}) === 'ab');
+    check('读不到的提示词走兵底', readPrompt('__missing__', 'fallback') === 'fallback');
+
+    const aborted = abortedToolOutput('run_command', '执行报错');
+    check('中止产物有标记', aborted.startsWith('[已中止]'));
+    check('中止产物说可能部分执行', aborted.includes('可能已经部分执行'));
+    check('中止产物叫人先看状态', aborted.includes('先确认实际状态'));
   }
 
   console.log(failures === 0 ? '\n全部通过\n' : `\n${failures} 项失败\n`);
