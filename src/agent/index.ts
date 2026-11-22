@@ -365,6 +365,8 @@ export interface ThreadState {
   messages: ChatMessage[];
   /** 已经追进链里的最后一条群消息 id，下次只追加它之后的。 */
   lastMessageId?: string;
+  /** 同一条消息的时间戳锚点：id 被 100 行窗口挤掉时按它续，不整条重建。 */
+  lastAt?: number;
   turns: number;
   /** 建链时间：到了 maxAgeMs 就交接换链。 */
   bornAt: number;
@@ -399,15 +401,26 @@ export function approxTokens(messages: ChatMessage[]): number {
 const COMPACT_NOTE =
   '（此前对话已归档到此。接着按记录本、当前目标与仓库现状往下推，别重问我上面已经说过的事；缺信息就去看文件或翻记录本。）';
 
-/** 只抽 pending 里 lastMessageId 之后的新行；找不到（窗口滚出去了）就当没有新的。 */
-/** 只抽 pending 里 lastMessageId 之后的新行；找不到（窗口滚出去了）返回 undefined = 整条重建。 */
-function linesAfter<T extends { messageId?: string }>(lines: T[], lastMessageId?: string): T[] | undefined {
-  if (!lastMessageId) {
-    return lines;
+/**
+ * 只抽 pending 里还没折进链里的新行。
+ *
+ * 锚点先按 messageId 精确找（一条不多一条不少）；被 100 行窗口挤掉了就退回时间戳 ——
+ * 这时候链里本来就装着更早的发言，按 id 找不到就整条重建等于把一两万 token 重发一遍全冷，
+ * 而且工具结果、上一轮的结论全丢，模型要重新摸一遍（2026-11-21 实测 53 次/两天）。
+ * 两个锚点都没有（老线程）就当作没有新行：链比缓冲更全。
+ */
+export function linesAfter<T extends { messageId?: string; timestamp?: number }>(
+  lines: T[],
+  thread: { lastMessageId?: string; lastAt?: number },
+): T[] {
+  const index = thread.lastMessageId ? lines.findIndex((line) => line.messageId === thread.lastMessageId) : -1;
+  if (index >= 0) {
+    return lines.slice(index + 1);
   }
-  const index = lines.findIndex((line) => line.messageId === lastMessageId);
-  // 窗口已经滚过这一条：发言丢失不可接受，宁可整条重建（最多多吃一次缓存未命中）
-  return index >= 0 ? lines.slice(index + 1) : undefined;
+  if (thread.lastAt) {
+    return lines.filter((line) => (line.timestamp ?? 0) > (thread.lastAt ?? 0));
+  }
+  return [];
 }
 
 const PROGRESS_VERBS: Record<string, string> = {
@@ -2004,12 +2017,10 @@ export class ChatAgent {
     // 前缀一字不差才能命中 provider 的 KV 缓存（Codex 的 history 也是 append-only）。
     const threadKey = scope.conversationId;
     const cachedThread = this.threads.get(threadKey);
-    const cachedUsable = cachedThread && cachedThread.system === system ? cachedThread : undefined;
-    const delta = cachedUsable ? linesAfter(pending, cachedUsable.lastMessageId) : undefined;
-    // delta === undefined 说明要么没链、要么窗口滚过了旧锚点：这一轮重建
-    const usable = delta === undefined ? undefined : cachedUsable;
+    const usable = cachedThread && cachedThread.system === system ? cachedThread : undefined;
+    // 有链就接着链走：锚点滚出窗口时只补时间戳之后的新行，不再把整条链丢掉重发
     const prior = usable ? usable.messages : [];
-    const deltaLines = delta ?? pending;
+    const deltaLines = usable ? linesAfter(pending, usable) : pending;
     const history = renderBuffer(deltaLines);
 
     // 记录本 / 目标 / 成员档案每轮都贴一遍，等于每轮白烧 1.5~2k 未命中的 token，
@@ -2051,12 +2062,23 @@ export class ChatAgent {
     // 回合结束后把整条串存回去，下一轮接在尾巴上（只追加，不改前文）
     const lastMessageId =
       (pending.length > 0 ? pending[pending.length - 1]?.messageId : undefined) ?? message.messageId;
+    // 时间戳锚点取「这一轮已经折进去的最新一条」：当前这条也算（它的行就在缓冲里，
+    // 不能留到下一轮再折一次）；这一轮中途进来的消息时间戳更大，下一轮照旧折进去。
+    const selfLine = scope.isDirect
+      ? undefined
+      : this.buffer.peek(scope.conversationId).find((line) => line.messageId === message.messageId);
+    const lastAt = Math.max(
+      usable?.lastAt ?? 0,
+      ...pending.map((line) => line.timestamp ?? 0),
+      selfLine?.timestamp ?? 0,
+    );
     const remember = (convo: ChatMessage[]): void => {
       const rest = convo[0]?.role === 'system' ? convo.slice(1) : convo;
       let next: ThreadState = {
         system,
         messages: rest,
         lastMessageId,
+        lastAt,
         turns: (usable?.turns ?? 0) + 1,
         bornAt: usable?.bornAt ?? Date.now(),
         tailSig,
@@ -2103,6 +2125,7 @@ export class ChatAgent {
           system,
           messages: [{ role: 'user', content: note }],
           lastMessageId,
+          lastAt,
           turns: 0,
           bornAt: at.getTime(),
         };

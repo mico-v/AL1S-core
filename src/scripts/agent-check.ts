@@ -10,7 +10,7 @@ import { existsSync } from 'node:fs';
 import { mkdir, mkdtemp, rm, utimes, appendFile, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
-import { ChatAgent, approxTokens, clipToolOutput, describeProgress, digestOf, isBotMentioned, MAX_REPLY_CHARS, MAX_REPLY_CHUNKS, pruneToolResults, readAgentConfig, repeatedOpener, selfCheckNotice, splitReply } from '../agent/index.js';
+import { ChatAgent, approxTokens, clipToolOutput, describeProgress, digestOf, isBotMentioned, linesAfter, MAX_REPLY_CHARS, MAX_REPLY_CHUNKS, pruneToolResults, readAgentConfig, repeatedOpener, selfCheckNotice, splitReply } from '../agent/index.js';
 import { pruneMediaCache } from '../chat-log.js';
 import type { ChatMessage } from '../agent/llm.js';
 import { GroupBuffer, renderBuffer } from '../agent/context.js';
@@ -1886,6 +1886,24 @@ async function main(): Promise<void> {
       ctxHeavy,
     );
     check('定向用例不被拦', !allowed.includes('不在本地跑'));
+  }
+
+  console.log('\n[30] 会话链续接（锚点丢了不整条重建）');
+  {
+    const lines = [
+      { messageId: 'm1', timestamp: 1000, text: 'a' },
+      { messageId: 'm2', timestamp: 2000, text: 'b' },
+      { messageId: 'm3', timestamp: 3000, text: 'c' },
+    ];
+    const ids = (picked: Array<{ messageId?: string }>): string => picked.map((line) => line.messageId).join(',');
+    check('按 id 精确续', ids(linesAfter(lines, { lastMessageId: 'm1' })) === 'm2,m3');
+    check('锚点是最后一条时没新行', linesAfter(lines, { lastMessageId: 'm3' }).length === 0);
+    check('窗口挤掉锚点按时间戳续', ids(linesAfter(lines, { lastMessageId: 'gone', lastAt: 1500 })) === 'm2,m3');
+    check('挤掉锚点也不返回 undefined', Array.isArray(linesAfter(lines, { lastMessageId: 'gone' })));
+    check('两个锚点都没有当没新行', linesAfter(lines, {}).length === 0);
+    check('私聊空缓冲不重建', linesAfter([], { lastMessageId: 'm3', lastAt: 3000 }).length === 0);
+    check('折过一轮不重复折', linesAfter(lines, { lastAt: 3000 }).length === 0);
+    check('时间戳相同的旧行不重折', ids(linesAfter(lines, { lastAt: 2000 })) === 'm3');
   }
 
   console.log(failures === 0 ? '\n全部通过\n' : `\n${failures} 项失败\n`);
