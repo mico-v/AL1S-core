@@ -1874,6 +1874,13 @@ async function main(): Promise<void> {
     check('看版本不算跑测试', heavyLocalHint('npx vitest --version') === undefined);
     check('全量构建仍拦', heavyLocalHint('npx vite build') === '全量构建');
 
+    // 11-22 实测误伤：命令里出现 vitest 字样（只是看配置/搜关键字）被当成全量单测拦下
+    check('看测试配置不误伤', heavyLocalHint('git show HEAD:vitest.config.ts') === undefined);
+    check('git log 提到 vitest 不误伤', heavyLocalHint('git log --oneline -5; git show HEAD:vitest.config.ts') === undefined);
+    check('搜 vitest 关键字不误伤', heavyLocalHint('git status -sb; grep -n vitest vitest.config.ts') === undefined);
+    check('裸跑 vitest 仍拦', heavyLocalHint('cd x && vitest') === '全量单测');
+    check('npx 跑 jest 仍拦', heavyLocalHint('npx jest') === '全量单测');
+
     // 原地 sleep 等 CI：11-19 到 11-21 共 31 条，光 sleep 就 48 分钟
     check('认得出 sleep 等 CI', waitLocalHint('sleep 240; gh pr checks 31') === 240);
     check('分钟单位换算', waitLocalHint('sleep 3m && gh run list') === 180);

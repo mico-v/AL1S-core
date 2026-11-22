@@ -72,6 +72,13 @@ function segments(cmd: string): string[] {
 /** 明确点名了用例文件：`src/a.test.ts`、`tests/x.spec.ts`、`tests/` 目录。 */
 const TEST_TARGET = /\.(?:test|spec)\.[cm]?[jt]sx?\b|(?:^|\s)(?:tests?|__tests__)\//;
 
+/** 真去跑测试的写法：vitest/jest 在命令位（前面只有 npx/pnpm 这类启动器与 env 赋值）。 */
+const TEST_RUNNER =
+  /^(?:[A-Za-z_][A-Za-z0-9_]*=\S*\s+)*(?:(?:npx|pnpm|npm|yarn|bun|corepack|node|time)\s+)*(?:vitest|jest)\b/;
+
+/** 只读查看：命令里提到 vitest 不代表要跑它。 */
+const READ_ONLY = /^(?:git|grep|rg|cat|ls|head|tail|sed|awk|wc|find|diff|jq|echo)\b/;
+
 /**
  * 这条命令是不是「CI 的活」：全量单测 / 全量构建。
  *
@@ -86,17 +93,26 @@ const TEST_TARGET = /\.(?:test|spec)\.[cm]?[jt]sx?\b|(?:^|\s)(?:tests?|__tests__
  */
 export function heavyLocalHint(cmd: string): string | undefined {
   for (const part of segments(cmd)) {
-    if (/\b(vitest|jest)\b/.test(part)) {
-      const targeted = TEST_TARGET.test(part) || /--testNamePattern|(?:^|\s)-t\s/.test(part);
+    const trimmed = part.trim();
+    if (!trimmed) {
+      continue;
+    }
+    // 只读查看不算重活：`git show HEAD:vitest.config.ts`、`grep -n vitest src/` 都只是看字，
+    // 却曾因「出现 vitest 字样」被拦下，模型改用 force 重跑（2026-11-22 实测一次白烧两分钟）
+    if (READ_ONLY.test(trimmed)) {
+      continue;
+    }
+    if (TEST_RUNNER.test(trimmed)) {
+      const targeted = TEST_TARGET.test(trimmed) || /--testNamePattern|(?:^|\s)-t\s/.test(trimmed);
       if (!targeted) {
         return '全量单测';
       }
       continue;
     }
-    if (/\b(npm|pnpm|yarn)\s+(run\s+)?(build|test)\b/.test(part)) {
+    if (/\b(npm|pnpm|yarn)\s+(run\s+)?(build|test)\b/.test(trimmed)) {
       return '全量构建/测试';
     }
-    if (/\b(vite|astro|rollup)\b.*\bbuild\b/.test(part)) {
+    if (/\b(vite|astro|rollup)\b.*\bbuild\b/.test(trimmed)) {
       return '全量构建';
     }
   }
