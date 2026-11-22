@@ -104,6 +104,8 @@ active ──主人要求──> paused
 
 ## 四、落地顺序（每步可单独回滚）
 
+状态（2026-11-22）：M1–M6 已全部落地并推 main（CI 绿，Kei 已重启）。
+
 1. **M1 状态源合并**：`goals.ts` → `threads.ts`，goal / plan / probe / turn 一个文件；
    删掉 `inflight.ts`；自检 [21][31] 改断言。行为不变，纯搬家 —— 先让真相只有一个。
 2. **M2 恢复唯一入口**：`reconcile()` 取代 `runGoalSweep` + `recoverInterrupted`；接入 `<turn_aborted>` 注入。
