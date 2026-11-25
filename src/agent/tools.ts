@@ -10,7 +10,7 @@ import path from 'node:path';
 import type { AppLogger } from '../logger.js';
 import type { ChatMessage, LlmOptions } from './llm.js';
 import { MessageIndex, renderHits } from './search.js';
-import { renderHits as renderWebHits, searchWeb } from './web.js';
+import { fetchPage, renderHits as renderWebHits, renderPage, searchWeb } from './web.js';
 import { heavyLocalHint, renderRunResult, runCommand, waitLocalHint, type HeavyMode } from './exec.js';
 import type { Capabilities, Tier } from './policy.js';
 import { isKind, isStatus, type RecordStore } from './records.js';
@@ -112,6 +112,25 @@ const CHAT_TOOLS: unknown[] = [
           limit: { type: 'number', description: '返回条数，默认 5，最多 8' },
         },
         required: ['query'],
+      },
+    },
+  },
+  {
+    type: 'function',
+    function: {
+      name: 'web_fetch',
+      description:
+        '打开一个网页读正文。搜索结果只给两三行摘要，要看文档、issue、公告、文章的实际内容就用它 —— 拿到链接先读再下结论，别凭标题猜。',
+      parameters: {
+        type: 'object',
+        properties: {
+          url: { type: 'string', description: 'http(s) 链接，整条贴进来，不要省略' },
+          max_chars: {
+            type: 'number',
+            description: '最多读多少字，默认 8000，最大 30000；被截断时调大重读一次',
+          },
+        },
+        required: ['url'],
       },
     },
   },
@@ -655,6 +674,8 @@ export const PARALLEL_TOOLS: ReadonlySet<string> = new Set([
   'memory_query',
   'memory_status',
   'search_messages',
+  'web_search',
+  'web_fetch',
   'search_topics',
   'recent_digests',
   'member_profile',
@@ -1090,6 +1111,18 @@ async function executeToolInner(name: string, rawArgs: string, ctx: ToolContext)
       }
       const hits = await searchWeb(query, asNumber(args.limit) ?? 5, ctx.log);
       return renderWebHits(query, hits);
+    }
+    if (name === 'web_fetch') {
+      const url = asString(args.url).trim();
+      if (!url) {
+        return '需要提供链接。';
+      }
+      try {
+        const page = await fetchPage(url, ctx.log, asNumber(args.max_chars) ?? 8_000);
+        return renderPage(page);
+      } catch (error) {
+        return `没读到这个页面：${(error as Error).message}。可以换个地址，或先用 web_search 找别的来源；没读到的内容不许当成读到了。`;
+      }
     }
     if (name === 'member_profile') {
       return await memberProfile(ctx, asString(args.name));

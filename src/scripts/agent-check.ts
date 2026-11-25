@@ -15,7 +15,7 @@ import { pruneMediaCache } from '../chat-log.js';
 import type { ChatMessage } from '../agent/llm.js';
 import { GroupBuffer, renderBuffer } from '../agent/context.js';
 import { GroupMemory, applyProfileChanges, readNewRecordsFrom } from '../agent/memory.js';
-import { parseBraveHtml, renderHits as renderWebHits } from '../agent/web.js';
+import { parseBraveHtml, parseHtmlText, renderHits as renderWebHits, renderPage } from '../agent/web.js';
 import { blockingWindow, renderQuota } from '../agent/quota.js';
 import { QuoteResolver } from '../agent/quote.js';
 import { buildRequestBody, quotaPauseFrom, reviewOptions } from '../agent/llm.js';
@@ -2123,7 +2123,8 @@ async function main(): Promise<void> {
   {
     const continuation = readPrompt('continuation');
     check('续跑提示词从文件读', continuation.includes('{{round}}') && continuation.includes('{{slice}}'));
-    check('续跑提示词写着指挥不是搬砖', continuation.includes('指挥与验收'));
+    check('续跑提示词要求把这一片做成', continuation.includes('把这一片做成'));
+    check('续跑提示词禁拿状态当成果', continuation.includes('别拿「CI 全绿」'));
     const rendered = renderPrompt(continuation, {
       round: 3,
       max_rounds: 12,
@@ -2140,6 +2141,40 @@ async function main(): Promise<void> {
     check('中止产物有标记', aborted.startsWith('[已中止]'));
     check('中止产物说可能部分执行', aborted.includes('可能已经部分执行'));
     check('中止产物叫人先看状态', aborted.includes('先确认实际状态'));
+  }
+
+  console.log('\n[35] 读网页正文');
+  {
+    const html = [
+      '<html><head><title>  M3 设计说明  </title>',
+      '<style>body{color:red}</style><script>var x = 1;</script></head>',
+      '<body><nav>导航导航</nav>',
+      '<article><h1>扇区</h1><p>面上靠 tonal 分层。</p>',
+      '<ul><li>细边框</li><li>密度紧</li></ul>',
+      '<p>点击不留蓝底 &amp; 选中用暖调。</p></article></body></html>',
+    ].join('');
+    const parsed = parseHtmlText(html);
+    check('标题抽得出来', parsed.title === 'M3 设计说明', parsed.title);
+    check('正文里没有样式与脚本', !parsed.text.includes('color:red') && !parsed.text.includes('var x = 1'));
+    check('段落按行分开', parsed.text.includes('面上靠 tonal 分层。') && parsed.text.split('\n').length >= 4);
+    check('列表项带前缀', parsed.text.includes('· 细边框'));
+    check('实体被解码', parsed.text.includes('点击不留蓝底 & 选中用暖调。'), parsed.text);
+
+    const page = { url: 'https://x.test/a', finalUrl: 'https://x.test/a', title: '看板', text: '正文', truncated: true };
+    const rendered = renderPage(page);
+    check('渲染带标题与地址', rendered.includes('「看板」') && rendered.includes('https://x.test/a'));
+    check('截断时告诉模型调大', rendered.includes('max_chars'));
+    check('空页面不乱编', renderPage({ ...page, text: '   ' }).includes('空'));
+
+    const names = new Set(
+      toolDefinitionsFor(OWNER_CAPS, 'code', { canAskChoice: true, canSendCard: true })
+        .map((tool) => (tool as { function?: { name?: string } }).function?.name)
+        .filter((name): name is string => Boolean(name)),
+    );
+    check('web_fetch 是给模型的工具', names.has('web_fetch'));
+    check('web_fetch 可并行', PARALLEL_TOOLS.has('web_fetch'));
+    check('调研包也带着 web_fetch', Boolean(kindPack('research').tools?.includes('web_fetch')));
+    check('评审包也带着 web_fetch', Boolean(kindPack('review').tools?.includes('web_fetch')));
   }
 
   console.log(failures === 0 ? '\n全部通过\n' : `\n${failures} 项失败\n`);

@@ -28,6 +28,7 @@ export interface KindPack {
 const READ_ONLY = [
   'search_messages',
   'web_search',
+  'web_fetch',
   'member_profile',
   'search_topics',
   'recent_digests',
