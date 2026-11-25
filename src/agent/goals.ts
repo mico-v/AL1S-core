@@ -588,6 +588,39 @@ export class GoalStore {
     return `目标已收尾。${goal.recap}${warn}${dropped}`;
   }
 
+  /**
+   * 切片全收口了、目标却还挂 active → 续跑闸门只会说「没有待推进的切片」，
+   * 日志看着像干完了，群里看到的是「人没了」。这个形状 2026-11-25 实测停了 10 小时
+   * （三片全 done，无人调 goal_finish）。finish() 本来就只要求「全片收口」，
+   * 所以闸门判到没活干时替模型补这一脚，用切片的 note/ref 自动写 recap。
+   *
+   * 只处理「确实全收口」这一种；还有未收口的片、或账本里根本没切片，都不碰。
+   * 返回 recap（收尾成功）或 undefined（不该收尾 / 已收过）。
+   */
+  async autoFinish(by?: string): Promise<string | undefined> {
+    const goal = await this.read();
+    if (!goal || goal.status !== 'active' || goal.slices.length === 0) {
+      return undefined;
+    }
+    const unfinished = goal.slices.filter((slice) => slice.status !== 'done' && slice.status !== 'dropped');
+    if (unfinished.length > 0) {
+      return undefined;
+    }
+    const parts = goal.slices.map((slice) => {
+      const tail = [slice.ref, slice.note].filter(Boolean).join(' · ');
+      return `${slice.id}${tail ? ` ${clip(tail, 120)}` : ''}`;
+    });
+    const watched = goal.awaiting?.issue;
+    goal.status = 'done';
+    goal.recap = clip(`切片全收口，自动收尾：${parts.join('；')}`, 800);
+    delete goal.awaiting;
+    goal.updatedAt = nowIso();
+    goal.log.push({ at: goal.updatedAt, text: '收尾（自动）：切片全收口，没人调 goal_finish', ...(by ? { by } : {}) });
+    goal.log = goal.log.slice(-80);
+    await this.save(goal);
+    return `${goal.recap}${watched ? `\n顺手拆了 #${watched} 的探针。` : ''}`;
+  }
+
   async block(reason: string, by?: string, options: { force?: boolean } = {}): Promise<string> {
     const goal = await this.read();
     if (!goal) {

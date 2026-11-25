@@ -1188,6 +1188,39 @@ async function main(): Promise<void> {
     check('done 且还有未收口切片能 resume', (await store.resume()).includes('已恢复'));
     check('resume 后回到 active', (await store.read())?.status === 'active');
 
+    // 切片全 done 却还挂 active = 续跑只会说「没有待推进的切片」，群里看到的是「人没了」
+    //（2026-11-25 实测停了 10 小时）。闸门判到没活干时得有人补收尾。
+    const staleStore = new GoalStore(goalTmp, 'G5');
+    await staleStore.create(
+      { objective: '全片 done 的收尾', criteria: ['跑完'], slices: ['一', '二'] },
+      { maxRounds: 3, maxWallMs: 3_600_000 },
+    );
+    await staleStore.step('s1', 'done', { ref: 'PR #1' });
+    await staleStore.step('s2', 'done', { ref: 'PR #2' });
+    const staleTick = await staleStore.tick({ maxRounds: 3, maxWallMs: 3_600_000 });
+    check(
+      '全片 done 时续跑闸门停',
+      staleTick?.ok === false && staleTick.reason === '没有待推进的切片',
+      String(staleTick?.reason),
+    );
+    const autoRecap = await staleStore.autoFinish();
+    check('全片 done 能被自动收尾', Boolean(autoRecap), String(autoRecap).slice(0, 40));
+    const autoRead = await staleStore.read();
+    check('自动收尾后状态是 done', autoRead?.status === 'done');
+    check('自动收尾用切片的 ref 写 recap', (autoRead?.recap ?? '').includes('PR #2'), autoRead?.recap?.slice(0, 60));
+    check('自动收尾只做一次', (await staleStore.autoFinish()) === undefined);
+    check('收尾后不残留探针', autoRead?.awaiting === undefined);
+    const halfStore = new GoalStore(goalTmp, 'G6');
+    await halfStore.create(
+      { objective: '还没干完', criteria: ['跑完'], slices: ['一', '二'] },
+      { maxRounds: 3, maxWallMs: 3_600_000 },
+    );
+    await halfStore.step('s1', 'done');
+    check(
+      '还有未收口切片时不动手',
+      (await halfStore.autoFinish()) === undefined && (await halfStore.read())?.status === 'active',
+    );
+
     const blockedStore = new GoalStore(goalTmp, 'G2');
     // 预算用尽要转 paused：留在 active 会被巡检每 2 分钟捞起来空转，日志看着像在干活
     const pauseStore = new GoalStore(goalTmp, 'G4');

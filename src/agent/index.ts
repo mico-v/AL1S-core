@@ -1382,6 +1382,38 @@ export class ChatAgent {
   }
 
   /**
+   * 闸门判到「没活干」时顺手收尾。
+   *
+   * 切片全 done 却还挂 active 的账本，续跑每 90s 只会写一行「没有待推进的切片」，
+   * 群里看到的就是「干到一半人没了」（2026-11-25 实测停了 10 小时）。
+   * 收尾与否仍由 GoalStore.autoFinish 判：只有确实全收口才动。
+   */
+  private async autoFinishIfAllDone(
+    scope: Scope,
+    bot: Bot,
+    store: GoalStore,
+    goal: Goal,
+  ): Promise<boolean> {
+    const recap = await store.autoFinish('自动收尾').catch((error) => {
+      this.log.warn('自动收尾失败', { conversationId: scope.conversationId, error });
+      return undefined;
+    });
+    if (!recap) {
+      return false;
+    }
+    this.log.info('切片全收口，自动收尾', { conversationId: scope.conversationId, goal: goal.id });
+    void this
+      .deliver(
+        bot,
+        scope.replyTarget,
+        `✅ ${goal.id} 的切片都收口了，我按收尾记了一笔（不再自动续跑）：\n${recap}\n` +
+          '要接着干活就 /goal 看状态、或者让我立个新目标。',
+      )
+      .catch((error) => this.log.warn('自动收尾提示发送失败', { conversationId: scope.conversationId, error }));
+    return true;
+  }
+
+  /**
    * 回合结束后安排下一轮自动续跑。
    *
    * 四道闸门：开关、工程群、目标状态/预算、每群只排一个。
@@ -1409,6 +1441,10 @@ export class ChatAgent {
       maxWallMs: this.config.goals.maxWallMs,
     });
     if (!verdict.ok) {
+      // 全收口却还挂 active：替模型补收尾，别让它静默停摆
+      if (await this.autoFinishIfAllDone(scope, bot, store, goal)) {
+        return false;
+      }
       const exhausted = /用满|墙钟/.test(verdict.reason ?? '');
       const stalled = goal.budget.roundsSinceProgress ?? 0;
       // 探针挂在非 active 目标上 = 永远不会被叫醒（2026-11-20 实测停摆一小时）。
@@ -1677,6 +1713,7 @@ export class ChatAgent {
       }
       if (!tick.ok) {
         this.log.info('自动续跑停止', { conversationId: chatId, reason: tick.reason });
+        await this.autoFinishIfAllDone(scope, bot, store, tick.goal);
         return;
       }
       const goal = tick.goal;
