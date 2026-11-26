@@ -77,3 +77,28 @@
 
 不做：多层计时埋点（Codex 为多客户端与远程压缩做的，Kei 单进程不需要）、
 按 token 计预算（额度在 provider 侧，本地估不准）。
+
+## 四、2026-11-26 复查：水位原来是错的
+
+M6 落地后压缩**一次都没触发**（`logs/bot.log` 里 `上下文已压缩` 零条），而真实 prompt 已经跑到 149k
+（`AGENT_THREAD_MAX_TOKENS=60000`，设计上应该在 60k 就压）。原因有三层，全部实测确认：
+
+1. **字符粗估对中文错了一倍多**。老公式是「字符 ÷ 3」，那个比例只对英文成立。
+   实测 deepseek-v4.1-flash：中文 1.83 字/token、代码 2.9 字/token。中文为主的链被低估近两倍。
+2. **工具调用的 arguments 完全没进估算**。改文件的 `python3 - <<EOF` 一条就几千字，一轮 40 步里
+   累计十万字量级 —— 账本（`promptChars`）和 `approxTokens()` 都只数 `content`，这部分被漏干净。
+3. **压缩产物是非法形状**。`buildCompactedHistory()` 只留最近 3 条工具输出，那些 `role: 'tool'`
+   消息的父 assistant（带 `tool_calls`）被截掉了。真压一次就是上游 400，只是从来没压到，所以没暴露。
+
+改法（对应第四条的「不动预算」口径，只修判断和形状）：
+
+- `approxTokens()` 重写：CJK 按 1.8 字/token、其余按 2.9、每条消息 +4 结构开销、**工具 name/arguments 计入**；
+  `llm.ts` 的 `promptChars` 同口径。
+- **水位拿上游真值当锚**：每次成功调用把 `usage.prompt_tokens` 记进 `promptMarks`（连同当时的粗估与消息数），
+  下次判水位用「上轮真值 + 之后追加部分的粗估」。链被压过/换过（变短）自动作废锚，不会无限压缩。
+- **压缩留一段最近的尾巴**（`keepRecentMessages`，默认 8 条原始消息，含 assistant 与其工具结果），
+  不再只留 3 条工具输出；起点落在工具结果中间时往前推，永不产生孤儿 tool 消息。
+  自检 `[33]` 补 3 条：孤儿检测 / 截断点安全 / 默认留尾巴。
+
+验证：`buildCompactedHistory()` 的产物直接打真接口（11 条 / 粗估 2256 token，上游 200 接受）；
+`pnpm typecheck` + `pnpm agent:check` 全绿后 build + 重启（RSS 95MB）。

@@ -10,7 +10,7 @@ import { existsSync } from 'node:fs';
 import { mkdir, mkdtemp, rm, utimes, appendFile, readFile, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
-import { ChatAgent, approxTokens, clipToolOutput, describeProgress, digestOf, isBotMentioned, linesAfter, MAX_REPLY_CHARS, MAX_REPLY_CHUNKS, pruneToolResults, readAgentConfig, repeatedOpener, selfCheckNotice, splitReply } from '../agent/index.js';
+import { ChatAgent, approxTokens, clipToolOutput, describeProgress, digestOf, isBotMentioned, linesAfter, MAX_REPLY_CHARS, MAX_REPLY_CHUNKS, pruneToolResults, readAgentConfig, repeatedOpener, selfCheckNotice, splitReply, textTokens, watermarkTokens } from '../agent/index.js';
 import { pruneMediaCache } from '../chat-log.js';
 import type { ChatMessage } from '../agent/llm.js';
 import { GroupBuffer, renderBuffer } from '../agent/context.js';
@@ -61,7 +61,7 @@ import { DigestEngine, DRIFT_THRESHOLD, topicDrift } from '../agent/digest.js';
 import { MessageIndex, renderHits } from '../agent/search.js';
 import { PARALLEL_TOOLS, abortedToolOutput, executeTool, expandQuery, toolDefinitionsFor } from '../agent/tools.js';
 import { readPrompt, renderPrompt } from '../agent/prompts.js';
-import { SUMMARY_PREFIX, buildCompactedHistory, compactThreshold, compactionPrompt, renderForSummary, shouldCompact } from '../agent/compact.js';import { captionForSha, captionStorePath, digestAttachments, flushCaptionStore, loadImageParts, looksLikeImage, prepareImage, rememberCaption, sniffImageType, sniffVideo, useCaptionStore } from '../agent/vision.js';
+import { SUMMARY_PREFIX, buildCompactedHistory, compactThreshold, compactionPrompt, orphanToolMessages, renderForSummary, shouldCompact } from '../agent/compact.js';import { captionForSha, captionStorePath, digestAttachments, flushCaptionStore, loadImageParts, looksLikeImage, prepareImage, rememberCaption, sniffImageType, sniffVideo, useCaptionStore } from '../agent/vision.js';
 import { buildProactiveMessages, judgeProactive, parseProactive } from '../agent/proactive.js';
 import { learnSystem } from '../agent/updater.js';
 import { buildRecord, summarize } from '../agent/telemetry.js';
@@ -1030,7 +1030,21 @@ async function main(): Promise<void> {
   );
 
   console.log('\n[22] 追加式会话链（前缀缓存）');
-  check('token 粗估按字符量算', approxTokens([{ role: 'user', content: '一'.repeat(300) }]) === 100);
+  check(
+    '中文按字估（1.8 字/token），不按 3 字估',
+    Math.abs(approxTokens([{ role: 'user', content: '一'.repeat(300) }]) - (300 / 1.8 + 4)) <= 1,
+    String(approxTokens([{ role: 'user', content: '一'.repeat(300) }])),
+  );
+  check(
+    '工具调用参数算进 token',
+    approxTokens([
+      {
+        role: 'assistant',
+        content: '',
+        tool_calls: [{ id: 'c', type: 'function', function: { name: 'run_command', arguments: 'x'.repeat(600) } }],
+      },
+    ]) > 150,
+  );
   const seen: ChatMessage[][] = [];
   const threadTmp = await mkdtemp(path.join(tmpdir(), 'al1s-thread-'));
   const threadAgent = new ChatAgent(
@@ -2122,12 +2136,28 @@ async function main(): Promise<void> {
     const convo: ChatMessage[] = [
       { role: 'system', content: 'SYS' },
       { role: 'user', content: 'u0 最早的请求' },
+      {
+        role: 'assistant',
+        content: 'a0 回答',
+        tool_calls: [{ id: 'c0', type: 'function', function: { name: 'read_file', arguments: '{"path":"x"}' } }],
+      },
       { role: 'tool', tool_call_id: 'c0', content: 't0 工具输出' },
       { role: 'user', content: 'u1 很早的请求' },
-      { role: 'assistant', content: 'a1 回答' },
+      {
+        role: 'assistant',
+        content: 'a1 回答',
+        tool_calls: [{ id: 'c1', type: 'function', function: { name: 'read_file', arguments: '{"path":"y"}' } }],
+      },
       { role: 'tool', tool_call_id: 'c1', content: 't1 工具输出' },
       { role: 'user', content: 'u2 中间的请求' },
-      { role: 'assistant', content: 'a2 回答' },
+      {
+        role: 'assistant',
+        content: 'a2 回答',
+        tool_calls: [
+          { id: 'c2', type: 'function', function: { name: 'grep_files', arguments: '{"q":"a"}' } },
+          { id: 'c3', type: 'function', function: { name: 'read_file', arguments: '{"path":"z"}' } },
+        ],
+      },
       { role: 'tool', tool_call_id: 'c2', content: 't2 工具输出' },
       { role: 'tool', tool_call_id: 'c3', content: 't3 工具输出' },
       { role: 'user', content: 'u3 当前请求' },
@@ -2142,6 +2172,35 @@ async function main(): Promise<void> {
     check('保留最近工具输出', compacted.some((message) => message.content === 't3 工具输出'));
     check('丢掉最早的工具输出', !compacted.some((message) => message.content === 't0 工具输出'));
     check('压缩后消息数明显变少', compacted.length < convo.length);
+    check('压缩后没有孤儿 tool 消息', orphanToolMessages(compacted).length === 0, orphanToolMessages(compacted).join(','));
+    check('截断点落在工具结果中间也不留孤儿', (() => {
+      // 尾巴正好从一组工具结果的中间开始：孤儿必须被往前推掉
+      const cut: ChatMessage[] = [
+        { role: 'system', content: 'SYS' },
+        { role: 'user', content: '开工' },
+        {
+          role: 'assistant',
+          content: '',
+          tool_calls: [
+            { id: 'a1', type: 'function', function: { name: 'read_file', arguments: '{"path":"a"}' } },
+            { id: 'a2', type: 'function', function: { name: 'read_file', arguments: '{"path":"b"}' } },
+          ],
+        },
+        { role: 'tool', tool_call_id: 'a1', content: 'A 的内容' },
+        { role: 'tool', tool_call_id: 'a2', content: 'B 的内容' },
+        { role: 'user', content: '接着干' },
+      ];
+      const slim = buildCompactedHistory(cut, '摘要', { contextWindow: 1_000, keepRecentMessages: 4 });
+      return orphanToolMessages(slim).length === 0 && slim[slim.length - 1]?.content === '接着干';
+    })());    check('默认留一段最近的尾巴', (() => {
+      const long: ChatMessage[] = [{ role: 'system', content: 'SYS' }];
+      for (let i = 0; i < 20; i += 1) {
+        long.push({ role: 'user', content: `请求 ${i}` });
+        long.push({ role: 'assistant', content: `回答 ${i}` });
+      }
+      const slim = buildCompactedHistory(long, '摘要', { contextWindow: 1_000 });
+      return slim.some((m) => m.content === '回答 18') && !slim.some((m) => m.content === '回答 3');
+    })());
     check('摘要能被认出来（不再重摘）', buildCompactedHistory(convo, 'x', { contextWindow: 1 }).length > 0);
 
     check('水位按绝对 token 算', compactThreshold({ contextWindow: 1_000_000, maxTokens: 60_000 }) === 60_000);
@@ -2150,6 +2209,19 @@ async function main(): Promise<void> {
     check('到水位就压', shouldCompact(80_000, { contextWindow: 100_000 }));
     check('压缩提示词从文件读', compactionPrompt().includes('CHECKPOINT'));
     check('摘要输入会截断超长工具输出', renderForSummary(convo).length < 40_001);
+
+    // 水位：粗估可能偏，但上游报过的真值必须优先
+    check('没锚就用粗估', watermarkTokens(1_234, 10) === 1_234);
+    check(
+      '粗估比真值小时拿真值当底线',
+      watermarkTokens(50_000, 200, { promptTokens: 60_000, approx: 66_000, messages: 190 }) === 60_000,
+    );
+    check(
+      '粗估追上后取大的',
+      watermarkTokens(70_000, 200, { promptTokens: 60_000, approx: 66_000, messages: 190 }) === 70_000,
+    );
+    check('链变短（压缩/换链）锚作废', watermarkTokens(20_000, 8, { promptTokens: 149_000, approx: 120_000, messages: 500 }) === 20_000);
+    check('粗估骤降锚作废', watermarkTokens(20_000, 500, { promptTokens: 149_000, approx: 120_000, messages: 400 }) === 20_000);
   }
 
   console.log('\n[34] 提示词外置与工具中止产物');

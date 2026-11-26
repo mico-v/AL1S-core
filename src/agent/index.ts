@@ -362,22 +362,45 @@ export function digestOf(text: string): string {
 }
 
 /** 粗估 token：中文按 3 字/token 算，图按 2000 字等价。 */
+/**
+ * 中日韩字符（含全角标点）：实测 deepseek-v4.1-flash 上 1.83 字/token。
+ *
+ * 老的粗估是「字符÷ 3」——那个比例只对英文成立，中文会把水位压低近两倍，
+ * 结果是 `AGENT_THREAD_MAX_TOKENS=60000` 形同虚设（真实 prompt 已经跑到 149k，
+ * 日志里却一条「上下文已压缩」都没有）。2026-11-26 实测标定。
+ */
+const CJK_CHARS = /[\u2e80-\u303f\u3040-\u9fff\uf900-\ufaff\ufe30-\ufe4f\uff00-\uffef]/g;
+/** 中文 1.8 字/token，代码/JSON 2.9 字/token（同一批实测）。 */
+export function textTokens(text: string): number {
+  if (!text) {
+    return 0;
+  }
+  const cjk = text.match(CJK_CHARS)?.length ?? 0;
+  return cjk / 1.8 + (text.length - cjk) / 2.9;
+}
+
 export function approxTokens(messages: ChatMessage[]): number {
-  let chars = 0;
+  let tokens = 0;
   for (const message of messages) {
+    tokens += 4; // role / 分隔符这类结构开销
     const content = message.content;
     if (typeof content === 'string') {
-      chars += content.length;
+      tokens += textTokens(content);
     } else {
       for (const part of content) {
-        chars += part.type === 'text' ? part.text.length : 2_000;
+        tokens += part.type === 'text' ? textTokens(part.text) : 1_500;
       }
     }
     if (message.reasoning_content) {
-      chars += message.reasoning_content.length;
+      tokens += textTokens(message.reasoning_content);
+    }
+    // 工具调用的 name 与 arguments 是真实 payload：改文件的 heredoc 一条就几千字
+    for (const call of message.tool_calls ?? []) {
+      tokens += textTokens(call.function?.name ?? '');
+      tokens += textTokens(call.function?.arguments ?? '');
     }
   }
-  return Math.round(chars / 3);
+  return Math.round(tokens);
 }
 
 const COMPACT_NOTE =
@@ -670,6 +693,11 @@ export class ChatAgent {
   private readonly completeRaw: RawCompleteFn;
   private readonly digest: DigestEngine;
   private readonly startedAt = Date.now();
+  /**
+   * 上游自报的 prompt 度量锚：每次成功调用后记下「真实 prompt + 当时的粗估」，
+   * 下次判断水位就用「真值 + 新增量的粗估」，不全靠字符推算。
+   */
+  private readonly promptMarks = new Map<string, PromptMark>();
   /** 处理门分状态计数：drop / store / process */
   private readonly modes = { drop: 0, store: 0, process: 0 };
   /** 每个群上次主动发言的时间（冷却用） */
@@ -1025,6 +1053,7 @@ export class ChatAgent {
         { ...opts, tools, ...(thinkingOff ? { disableThinking: true } : {}) },
         1,
       );
+      this.rememberPromptMark(convo, response.usage, opts.conversationId);
       if (response.toolCalls.length === 0) {
         // 终回复也要留在串里，下一回合才能接着往下聊
         convo = [...convo, { role: 'assistant', content: response.content }];
@@ -1186,12 +1215,39 @@ export class ChatAgent {
    *
    * 失败不阻事：拿不到摘要就原样返回，下一轮接着试（换链那边还有兵底）。
    */
+  /** 记下上游报的真实 prompt：下次判水位拿它当锚，不让粗估把水压低。 */
+  private rememberPromptMark(
+    convo: ChatMessage[],
+    usage: ChatResponse['usage'],
+    conversationId?: string,
+  ): void {
+    if (!conversationId || !usage || usage.promptTokens <= 0) {
+      return;
+    }
+    this.promptMarks.set(conversationId, {
+      promptTokens: usage.promptTokens,
+      approx: approxTokens(convo),
+      messages: convo.length,
+    });
+  }
+
+  /**
+   * 当前链的真实占用水位。
+   *
+   * 有上游真值就用「真值 + 之后追加部分的粗估」；链被压过/换过（变短了）就当锚失效，
+   * 重新按粗估算 —— 否则刚压完又会被旧的真值判成超水位，无限压缩。
+   */
+  private contextWatermark(convo: ChatMessage[], conversationId?: string): number {
+    const mark = conversationId ? this.promptMarks.get(conversationId) : undefined;
+    return watermarkTokens(approxTokens(convo), convo.length, mark);
+  }
+
   private async maybeCompact(convo: ChatMessage[], opts: LlmOptions): Promise<ChatMessage[]> {
     const options: CompactOptions = {
       contextWindow: this.config.callLog.contextWindow,
       maxTokens: this.config.thread.maxTokens,
     };
-    const tokens = approxTokens(convo);
+    const tokens = this.contextWatermark(convo, opts.conversationId);
     if (!shouldCompact(tokens, options)) {
       return convo;
     }
@@ -1209,9 +1265,14 @@ export class ChatAgent {
         return convo;
       }
       const next = buildCompactedHistory(convo, summary, options);
+      if (opts.conversationId) {
+        // 锚是基于旧链的真值，压完就失效；不清掉会拿旧真值把新链再判成超水位
+        this.promptMarks.delete(opts.conversationId);
+      }
       this.log.info('上下文已压缩', {
         conversationId: opts.conversationId,
         before: tokens,
+        localEstimate: approxTokens(convo),
         after: approxTokens(next),
         threshold: compactThreshold(options),
       });
@@ -2638,4 +2699,28 @@ export class ChatAgent {
   memoryFor(groupOpenid: string): GroupMemory {
     return this.memory(groupOpenid);
   }
+}
+
+/** 上游报过的真实 prompt 度量锚（见 `ChatAgent.rememberPromptMark`）。 */
+export interface PromptMark {
+  promptTokens: number;
+  /** 记锚时链的粗估，用来算「之后又长了多少」。 */
+  approx: number;
+  /** 记锚时的消息条数：链变短说明压过/换过，锚作废。 */
+  messages: number;
+}
+
+/**
+ * 水位：有上游真值就用「真值 + 之后追加部分的粗估」，没有就纯按粗估。
+ *
+ * 链被压过 / 换过（消息变少或粗估骤降）时不能拿旧真值判，否则刚压完立刻又被判超水位，无限压缩。
+ */
+export function watermarkTokens(local: number, messages: number, mark?: PromptMark): number {
+  if (!mark || mark.promptTokens <= 0) {
+    return local;
+  }
+  if (messages < mark.messages || local < mark.approx * 0.6) {
+    return local;
+  }
+  return Math.max(local, mark.promptTokens + Math.max(0, local - mark.approx));
 }

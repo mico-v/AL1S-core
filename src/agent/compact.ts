@@ -38,8 +38,15 @@ export interface CompactOptions {
   threshold?: number;
   /** 保留几条最近的真实用户消息。 */
   keepUserMessages?: number;
-  /** 保留几条最近的工具输出。 */
+  /** 保留几条最近的工具输出（`keepRecentMessages=0` 时才按它数）。 */
   keepToolOutputs?: number;
+  /**
+   * 保留最近几条消息的尾巴（含 assistant 与其工具结果，默认 8）。
+   *
+   * 只留 3 条工具输出的话，压完当场就丢掉了「刚刚在改哪个文件」—— 模型只能重新摸一遍仓库，
+   * 白白再烧几轮。Codex 的压缩也是留一段最近的真实上下文，不是只留工具结果。
+   */
+  keepRecentMessages?: number;
 }
 
 export function compactThreshold(options: CompactOptions): number {
@@ -60,6 +67,43 @@ function isSummary(message: ChatMessage): boolean {
 }
 
 /**
+ * 找出「没有对应 assistant tool_calls」的工具消息。
+ *
+ * 这类消息发给上游就是 400：tool 角色的消息必须紧跟在发起调用的那条 assistant 后面。
+ * 切片式保留（只留最近几条工具输出）很容易造出孤儿，所以压缩前必须验一遍。
+ */
+export function orphanToolMessages(convo: ChatMessage[]): string[] {
+  const seen = new Set<string>();
+  const orphans: string[] = [];
+  for (const message of convo) {
+    if (message.role === 'assistant') {
+      for (const call of message.tool_calls ?? []) {
+        seen.add(call.id);
+      }
+      continue;
+    }
+    if (message.role === 'tool' && (!message.tool_call_id || !seen.has(message.tool_call_id))) {
+      orphans.push(message.tool_call_id ?? '(无 id)');
+    }
+  }
+  return orphans;
+}
+
+/**
+ * 尾巴的起点：不能落在工具结果中间。
+ *
+ * 从末尾往前留 N 条时，第 N 条可能正好是 tool 消息 —— 它爹（带 tool_calls 的 assistant）
+ * 被截在外面就是孤儿。往前推到第一条不是 tool 的位置，顺带把那几条无主结果丢掉。
+ */
+function tailStartIndex(rest: ChatMessage[], keepRecent: number): number {
+  let start = Math.max(0, rest.length - keepRecent);
+  while (start < rest.length && rest[start]?.role === 'tool') {
+    start += 1;
+  }
+  return start;
+}
+
+/**
  * 把旧对话换成交接摘要。
  *
  * 结构：[system] + [摘要（带前缀）] + [保留的最近用户消息] + [保留的最近工具输出] + [最新一条用户消息]
@@ -72,21 +116,35 @@ export function buildCompactedHistory(
 ): ChatMessage[] {
   const keepUsers = options.keepUserMessages ?? 2;
   const keepTools = options.keepToolOutputs ?? 3;
+  const keepRecent = options.keepRecentMessages ?? 8;
   const system = convo[0]?.role === 'system' ? convo[0] : undefined;
   const rest = system ? convo.slice(1) : convo;
 
   const users = rest.filter((message) => message.role === 'user' && !isSummary(message));
-  const tools = rest.filter((message) => message.role === 'tool');
   const latest = users[users.length - 1];
   const keptUsers = users.slice(-(keepUsers + 1), -1);
-  const keptTools = tools.slice(-keepTools);
 
+  const kept = new Set<ChatMessage>(keptUsers);
+  if (keepRecent > 0) {
+    for (const message of rest.slice(tailStartIndex(rest, keepRecent))) {
+      kept.add(message);
+    }
+  } else {
+    for (const message of rest.filter((item) => item.role === 'tool').slice(-keepTools)) {
+      kept.add(message);
+    }
+    if (latest) {
+      kept.add(latest);
+    }
+  }
+
+  // 按原顺序输出，顺便去重（最近用户消息可能已经在尾巴里）
+  const ordered = rest.filter((message) => kept.has(message));
   const summaryMessage: ChatMessage = {
     role: 'user',
     content: `${SUMMARY_PREFIX}\n\n${summary.trim()}`,
   };
-  const kept = [...keptUsers, ...keptTools, ...(latest ? [latest] : [])];
-  return [...(system ? [system] : []), summaryMessage, ...kept];
+  return [...(system ? [system] : []), summaryMessage, ...ordered];
 }
 
 /** 压缩用的输入：把旧对话压成一段可读文本（工具输出截断，避免摘要本身超长）。 */

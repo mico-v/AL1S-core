@@ -50,6 +50,13 @@ export interface ChatResponse {
   /** 思维链；带 tools 的下一轮要回传。 */
   reasoningContent?: string;
   finishReason?: string;
+  /**
+   * 上游自己报的 prompt 度量。
+   *
+   * 本地粗估（字符÷字数比）对中文与工具参数都会偏，压缩水位拿它当锚更靠得住：
+   * 上一轮真实 prompt + 之后新增的粗估 = 这一轮的真实水位。
+   */
+  usage?: { promptTokens: number; cachedTokens: number };
 }
 
 export interface LlmOptions {
@@ -177,9 +184,12 @@ export async function chatCompleteRaw(
   const stack = new Error().stack;
   const shape = {
     messages: messages.length,
+    // 工具调用的 arguments 也是真发出去的 token（改文件的 heredoc 动辄几千字），
+    // 不数进去账本就永远少报一截
     promptChars: messages.reduce((acc, m) => {
       const text = typeof m.content === 'string' ? m.content : JSON.stringify(m.content);
-      return acc + text.length;
+      const args = (m.tool_calls ?? []).reduce((sum, call) => sum + (call.function?.arguments?.length ?? 0), 0);
+      return acc + text.length + args;
     }, 0),
     images: messages.reduce((acc, m) => {
       if (!Array.isArray(m.content)) {
@@ -288,7 +298,16 @@ export async function chatCompleteRaw(
           contextWindow: opts.contextWindow,
         }),
       );
-      return { content: text.trim(), toolCalls, reasoningContent, finishReason: choice?.finish_reason };
+      return {
+        content: text.trim(),
+        toolCalls,
+        reasoningContent,
+        finishReason: choice?.finish_reason,
+        usage: {
+          promptTokens: Number(data.usage?.prompt_tokens ?? 0) || 0,
+          cachedTokens: Number(data.usage?.prompt_tokens_details?.cached_tokens ?? 0) || 0,
+        },
+      };
     } catch (error) {
       if (error instanceof LlmError && error.status && error.status < 500) {
         await recordFailure(error);
